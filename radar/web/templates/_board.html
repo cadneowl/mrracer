@@ -1,4 +1,23 @@
-{# Polled partial: team summary + the obligation board. #}
+{# Polled partial: people picker + team summary + the obligation board. #}
+<section class="people">
+  <span class="people-label">View:</span>
+  <a class="pill {% if not view_reviewer %}pill-active{% endif %}" href="/?view=">Team board</a>
+  {% for p in people %}
+  <a class="pill {% if view_reviewer == p.username %}pill-active{% endif %}"
+     href="/?view={{ p.username }}"
+     title="{{ p.waiting }} waiting on {{ p.username }}, {{ p.total }} total">
+    {{ p.username }}
+    {% if p.waiting %}<span class="pill-count">{{ p.waiting }}</span>{% endif %}
+  </a>
+  {% endfor %}
+</section>
+
+{% if view_reviewer %}
+<h2 class="view-title">MRs waiting on <strong>{{ view_reviewer }}</strong>
+  <a class="clear" href="/?view=">← back to team board</a>
+</h2>
+{% endif %}
+
 <section class="summary">
   <div class="stat stat-open"><span class="num">{{ open_mrs }}</span><span class="lbl">open MRs</span></div>
   <div class="stat stat-red"><span class="num">{{ summary.BREACHED }}</span><span class="lbl">breached</span></div>
@@ -33,11 +52,12 @@
       <td class="col-age muted">{{ row.age }}</td>
       <td class="col-obl">
         {% for o in row.obligations %}
-        <span class="chip chip-{{ o.chip_state|lower }}"
-              title="{{ o.status_text }} · {{ o.elapsed_hours }}h of {{ o.budget_hours }}h budget · tz {{ o.reviewer_tz }}{% if o.round > 1 %} · round {{ o.round }}{% endif %}">
+        <a class="chip chip-{{ o.chip_state|lower }}"
+           href="/?view={{ o.reviewer }}"
+           title="{{ o.status_text }} · {{ o.elapsed_hours }}h of {{ o.budget_hours }}h budget · tz {{ o.reviewer_tz }}{% if o.round > 1 %} · round {{ o.round }}{% endif %} · click for {{ o.reviewer }}'s MRs">
           <span class="chip-name">{{ o.reviewer }}</span>
           <span class="chip-time">{{ o.remaining_label }}</span>
-        </span>
+        </a>
         {% endfor %}
       </td>
     </tr>
@@ -46,7 +66,11 @@
 </table>
 {% else %}
 <div class="empty">
+  {% if view_reviewer %}
+  Nothing waiting on <strong>{{ view_reviewer }}</strong> right now. <a class="clear" href="/?view=">Back to team board</a>
+  {% else %}
   No open merge requests with review obligations. Run <code>radar poll-once</code> to fetch from GitLab.
+  {% endif %}
 </div>
 {% endif %}
 

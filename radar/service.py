@@ -77,21 +77,45 @@ def _obligation_view(o: ObligationState) -> dict:
     }
 
 
-def build_dashboard(db: Database, config: Config, now: datetime | None = None) -> dict:
-    now = now or datetime.now(UTC)
-    rows = []
-    summary = {chip: 0 for chip in _CHIP_ORDER}
+# Chip states that mean the reviewer is actively on the hook right now.
+_WAITING_STATES = frozenset({CHIP_BREACHED, CHIP_AT_RISK, CHIP_IN_SLA})
 
+
+def _row_min_urgency(obligations: list[dict]) -> float:
+    return min((o["urgency"] for o in obligations), default=math.inf)
+
+
+def _people_index(rows: list[dict]) -> list[dict]:
+    """Every reviewer with an open obligation, with how many are waiting on them."""
+    people: dict[str, dict] = {}
+    for row in rows:
+        for o in row["obligations"]:
+            name = o["reviewer"]
+            p = people.setdefault(name, {"username": name, "waiting": 0, "total": 0})
+            p["total"] += 1
+            if o["chip_state"] in _WAITING_STATES:
+                p["waiting"] += 1
+    return sorted(people.values(), key=lambda p: (-p["waiting"], p["username"]))
+
+
+def build_dashboard(
+    db: Database,
+    config: Config,
+    now: datetime | None = None,
+    reviewer: str | None = None,
+) -> dict:
+    """Assemble the board. If ``reviewer`` is set, filter to the MRs waiting on
+    that person (a personal view); otherwise show the whole team board."""
+    now = now or datetime.now(UTC)
+
+    all_rows: list[dict] = []
     for snap in db.open_snapshots():
         events = list(db.iter_events(snap["project_id"], snap["mr_iid"]))
         obligations = derive_mr(events, snap, config, now)
         if not obligations:
             continue
         views = [_obligation_view(o) for o in obligations]
-        for v in views:
-            summary[v["chip_state"]] = summary.get(v["chip_state"], 0) + 1
-        min_urgency = min((o.urgency for o in obligations), default=math.inf)
-        rows.append(
+        all_rows.append(
             {
                 "project_id": snap["project_id"],
                 "mr_iid": snap["mr_iid"],
@@ -103,9 +127,26 @@ def build_dashboard(db: Database, config: Config, now: datetime | None = None) -
                 "draft": snap["draft"],
                 "age": _wall_age(snap.get("created_at"), now),
                 "obligations": views,
-                "min_urgency": min_urgency,
+                "min_urgency": _row_min_urgency(views),
             }
         )
+
+    people = _people_index(all_rows)
+
+    # Filter to a single reviewer's obligations for the personal view.
+    if reviewer:
+        rows = []
+        for row in all_rows:
+            mine = [o for o in row["obligations"] if o["reviewer"] == reviewer]
+            if mine:
+                rows.append({**row, "obligations": mine, "min_urgency": _row_min_urgency(mine)})
+    else:
+        rows = all_rows
+
+    summary = {chip: 0 for chip in _CHIP_ORDER}
+    for row in rows:
+        for o in row["obligations"]:
+            summary[o["chip_state"]] = summary.get(o["chip_state"], 0) + 1
 
     rows.sort(key=lambda r: r["min_urgency"])
     return {
@@ -114,6 +155,8 @@ def build_dashboard(db: Database, config: Config, now: datetime | None = None) -
         "breached": summary.get(CHIP_BREACHED, 0),
         "at_risk": summary.get(CHIP_AT_RISK, 0),
         "open_mrs": len(rows),
+        "people": people,
+        "view_reviewer": reviewer,
         "generated_at": now,
     }
 

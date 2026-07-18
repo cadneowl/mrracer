@@ -33,6 +33,20 @@ body {
 
 main { padding: 18px 22px; }
 
+.people { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+.people-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; margin-right: 2px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 20px;
+  background: var(--panel); border: 1px solid var(--line); color: var(--text); text-decoration: none; font-size: 13px; }
+.pill:hover { border-color: var(--green); }
+.pill-active { background: var(--green); color: #0b0f17; border-color: var(--green); font-weight: 600; }
+.pill-count { background: rgba(0,0,0,.25); border-radius: 10px; padding: 0 6px; font-size: 11px; font-weight: 700; }
+.pill-active .pill-count { background: rgba(0,0,0,.18); }
+
+.view-title { font-size: 16px; font-weight: 600; margin: 0 0 14px; color: var(--text); }
+.view-title .clear { font-size: 13px; font-weight: 400; color: var(--muted); text-decoration: none; margin-left: 12px; }
+.view-title .clear:hover { color: var(--text); }
+.empty .clear { color: var(--green); text-decoration: none; }
+
 .summary { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
 .stat {
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
@@ -63,8 +77,9 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .chip {
   display: inline-flex; align-items: center; gap: 6px; margin: 2px 6px 2px 0;
   padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;
-  border: 1px solid transparent; color: #0b0f17;
+  border: 1px solid transparent; color: #0b0f17; text-decoration: none; cursor: pointer;
 }
+.chip:hover { filter: brightness(1.08); }
 .chip .chip-time { font-weight: 500; opacity: .85; }
 .chip-waived   { background: var(--blue);  color: #fff; }
 .chip-pending  { background: var(--grey);  }
