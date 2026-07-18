@@ -1,0 +1,57 @@
+# radar configuration.
+#
+# Secrets are NEVER stored here. The GitLab connection reads two environment
+# variables:
+#   GITLAB_URL    e.g. https://gitlab.example.com
+#   GITLAB_TOKEN  a personal access token with the read_api scope
+#
+# Copy this file to config.yaml and edit for your team.
+
+gitlab:
+  projects: # list of project paths (group/name) or numeric IDs to monitor
+    - group/hub-backend
+  poll_interval_minutes: 10
+
+# Where the append-only event store lives (SQLite). Relative to CWD.
+database:
+  path: radar.db
+
+# Work calendar. SLA business-hours math only consumes time inside these
+# windows. Weekends and off-hours never burn SLA budget.
+calendar:
+  workdays: [mon, tue, wed, thu, fri]
+  work_hours: { start: "09:00", end: "18:00" }
+  default_timezone: America/New_York
+  reviewer_timezones: # per-reviewer overrides; unmapped reviewers use the default
+    someuser: Asia/Jerusalem
+
+# SLA rules. First matching rule wins, evaluated top to bottom.
+# A `match` block may constrain by target_branch (glob) and/or labels
+# (obligation's MR must carry ALL listed labels). An empty match {} is the
+# catch-all default and should come last.
+slas:
+  - match: { target_branch: "release/*" }
+    first_response_business_hours: 4
+    approval_business_hours: 8
+  - match: { labels: ["hotfix"] }
+    first_response_business_hours: 4
+    approval_business_hours: 8
+  - match: {} # default
+    first_response_business_hours: 16 # 2 business days
+    approval_business_hours: 24
+
+# Obligations matching any of these conditions are WAIVED (excluded from
+# stats, shown blue on the board).
+waive:
+  draft: true
+  labels: ["blocked", "do-not-review"]
+
+# Gamification config is consumed in Phase 3; kept here so the file is stable.
+gamification:
+  points:
+    review_within_sla: 10
+    fast_first_response_bonus: 5 # first response within 25% of SLA budget
+    substantive_review_bonus: 5 # >= 2 discussion threads opened
+    orphan_pickup: 8 # reviewed an MR with no assigned reviewer
+    bare_approval: 2 # approval with zero comments — deliberately low
+  streak_bonus_per_day: 1

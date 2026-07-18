@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+uv.lock
+
+# radar runtime
+*.db
+*.db-wal
+*.db-shm
+radar.db*
+config.yaml
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
