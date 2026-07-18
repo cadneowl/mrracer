@@ -16,7 +16,7 @@ subtraction yields real elapsed seconds.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 __all__ = [
@@ -120,23 +120,27 @@ def business_seconds_between(
 
     Both ``start`` and ``end`` must be timezone-aware (any zone; they are
     compared as instants). Returns 0.0 if ``end <= start``.
+
+    All arithmetic is done on UTC instants. This matters across DST: two aware
+    datetimes that share the same ZoneInfo subtract by wall clock (Python
+    ignores the shared tzinfo), which would drop the gained/lost hour.
     """
     _require_aware("start", start)
     _require_aware("end", end)
     if end <= start:
         return 0.0
 
-    start_local = start.astimezone(tz)
-    end_local = end.astimezone(tz)
+    start_utc = start.astimezone(UTC)
+    end_utc = end.astimezone(UTC)
 
     total = 0.0
-    day = start_local.date()
-    last = end_local.date()
+    day = start.astimezone(tz).date()
+    last = end.astimezone(tz).date()
     while day <= last:
         if cal.is_workday(day.weekday()):
             open_dt, close_dt = _window_bounds(day, cal, tz)
-            lo = max(start, open_dt)
-            hi = min(end, close_dt)
+            lo = max(start_utc, open_dt.astimezone(UTC))
+            hi = min(end_utc, close_dt.astimezone(UTC))
             if hi > lo:
                 total += (hi - lo).total_seconds()
         day += timedelta(days=1)
@@ -170,21 +174,23 @@ def add_business_hours(
         raise ValueError("hours must be non-negative")
 
     remaining = hours * 3600.0
-    cursor = start.astimezone(tz)
-    day = cursor.date()
+    cursor_utc = start.astimezone(UTC)
+    day = start.astimezone(tz).date()
 
     for _ in range(_MAX_DAYS):
         if cal.is_workday(day.weekday()):
             open_dt, close_dt = _window_bounds(day, cal, tz)
-            seg_start = max(cursor, open_dt)
-            if seg_start < close_dt:
-                avail = (close_dt - seg_start).total_seconds()
+            open_utc = open_dt.astimezone(UTC)
+            close_utc = close_dt.astimezone(UTC)
+            seg_start = max(cursor_utc, open_utc)
+            if seg_start < close_utc:
+                avail = (close_utc - seg_start).total_seconds()
                 if avail >= remaining:
-                    return seg_start + timedelta(seconds=remaining)
+                    return (seg_start + timedelta(seconds=remaining)).astimezone(tz)
                 remaining -= avail
-        # advance to the start of the next calendar day in tz
+        # advance to the start of the next calendar day's window (in UTC)
         day += timedelta(days=1)
-        cursor = datetime.combine(day, cal.work_start, tzinfo=tz)
+        cursor_utc = _window_bounds(day, cal, tz)[0].astimezone(UTC)
 
     raise RuntimeError(
         f"could not consume {hours} business hours within {_MAX_DAYS} days; "

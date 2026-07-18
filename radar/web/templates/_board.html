@@ -1,0 +1,53 @@
+{# Polled partial: team summary + the obligation board. #}
+<section class="summary">
+  <div class="stat stat-open"><span class="num">{{ open_mrs }}</span><span class="lbl">open MRs</span></div>
+  <div class="stat stat-red"><span class="num">{{ summary.BREACHED }}</span><span class="lbl">breached</span></div>
+  <div class="stat stat-amber"><span class="num">{{ summary.AT_RISK }}</span><span class="lbl">at risk</span></div>
+  <div class="stat stat-green"><span class="num">{{ summary.IN_SLA }}</span><span class="lbl">in SLA</span></div>
+  <div class="stat stat-grey"><span class="num">{{ summary.PENDING }}</span><span class="lbl">paused / done</span></div>
+  <div class="stat stat-blue"><span class="num">{{ summary.WAIVED }}</span><span class="lbl">waived</span></div>
+</section>
+
+{% if rows %}
+<table class="board">
+  <thead>
+    <tr>
+      <th class="col-mr">Merge request</th>
+      <th>Author</th>
+      <th>Target</th>
+      <th class="col-age">Age</th>
+      <th class="col-obl">Review obligations (most overdue first)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td class="col-mr">
+        <a href="{{ row.web_url }}" target="_blank" rel="noopener">{{ row.title }}</a>
+        <span class="mrid">!{{ row.mr_iid }}</span>
+        {% if row.draft %}<span class="tag tag-draft">draft</span>{% endif %}
+        {% for label in row.labels %}<span class="tag">{{ label }}</span>{% endfor %}
+      </td>
+      <td class="muted">{{ row.author or "—" }}</td>
+      <td class="muted">{{ row.target_branch or "—" }}</td>
+      <td class="col-age muted">{{ row.age }}</td>
+      <td class="col-obl">
+        {% for o in row.obligations %}
+        <span class="chip chip-{{ o.chip_state|lower }}"
+              title="{{ o.status_text }} · {{ o.elapsed_hours }}h of {{ o.budget_hours }}h budget · tz {{ o.reviewer_tz }}{% if o.round > 1 %} · round {{ o.round }}{% endif %}">
+          <span class="chip-name">{{ o.reviewer }}</span>
+          <span class="chip-time">{{ o.remaining_label }}</span>
+        </span>
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">
+  No open merge requests with review obligations. Run <code>radar poll-once</code> to fetch from GitLab.
+</div>
+{% endif %}
+
+<p class="gen">generated {{ generated_at.strftime("%Y-%m-%d %H:%M:%S UTC") }}</p>

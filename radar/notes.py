@@ -15,7 +15,7 @@ re-polling the same note never produces a duplicate event.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .events import Event, EventType
 
@@ -44,8 +44,8 @@ def parse_gitlab_time(value: str) -> datetime:
         text = text[:-1] + "+00:00"
     dt = datetime.fromisoformat(text)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _key(project_id: int, mr_iid: int, note_id: object, suffix: str = "") -> str:

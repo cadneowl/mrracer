@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>radar — review SLA board</title>
+  <script src="/static/htmx.min.js"></script>
+  <link rel="stylesheet" href="/static/radar.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span> radar
+      <span class="subtitle">review SLA board</span>
+    </div>
+    <div class="meta">
+      auto-refresh 60s · poll every {{ poll_interval_minutes }}m
+    </div>
+  </header>
+
+  <main id="board"
+        hx-get="/partials/board"
+        hx-trigger="every 60s"
+        hx-swap="innerHTML">
+    {% include "_board.html" %}
+  </main>
+
+  <footer class="foot">
+    Breach data is shown at team level only. Per-reviewer breach detail lives behind the coach view (Phase 2).
+  </footer>
+</body>
+</html>

@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable, Iterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .events import Event
@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS obligations (
 
 
 def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class Database:
@@ -119,7 +119,7 @@ class Database:
                 e.project_id,
                 e.mr_iid,
                 e.event_type,
-                e.occurred_at.astimezone(timezone.utc).isoformat(),
+                e.occurred_at.astimezone(UTC).isoformat(),
                 e.actor,
                 e.reviewer,
                 e.payload_json(),
