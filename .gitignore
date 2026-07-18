@@ -21,3 +21,6 @@ config.yaml
 .vscode/
 .idea/
 .DS_Store
+
+# playwright scratch
+.playwright-mcp/
