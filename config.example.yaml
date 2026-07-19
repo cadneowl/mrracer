@@ -73,6 +73,16 @@ review:
   working_dir: null          # run the command here (e.g. a repo checkout); null = radar's CWD
   timeout_seconds: 600
 
+# Teams. Each team is a named set of GitLab usernames. The board's VIEW bar
+# then offers two filters per team: "<team> · authored" (MRs opened by a team
+# member) and "<team> · to review" (MRs where a team member is a requested
+# reviewer). List one or more teams; the chosen filter is remembered per browser.
+teams:
+  - name: backend
+    members: [dan, maya, ophira]
+  - name: platform
+    members: [sam, priya]
+
 # Jira association. radar recognises issue keys (PROJ-123) in each MR's branch,
 # title, and description, shows them as links on the board, and passes them to
 # the QA test-plan command. base_url builds the browse links; project_keys is

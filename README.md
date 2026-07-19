@@ -43,14 +43,25 @@ Rows are sorted **most-overdue first**, and the board auto-refreshes every 60s
 via htmx. Breach counts are surfaced at **team level only** — there is
 deliberately no per-person breach list on the main board.
 
-### Personal view (click-a-person)
+### Filters (personal & team)
 
-Click any reviewer — a name chip on the board, or a pill in the **VIEW** bar —
-to filter down to *the MRs waiting on them* (`/?view=<username>`). The choice is
-remembered in a `radar_view` cookie, so the board returns to that personal view
-on your next visit and across the 60s auto-refresh; **← back to team board**
-clears it. There is **no login**: the board holds no private data, so the cookie
-just stores a display preference, not an identity.
+The **VIEW** bar filters the board. The chosen filter is remembered in a
+`radar_view` cookie, so the board returns to it on your next visit and across
+the 60s auto-refresh; **All MRs** clears it. There is **no login** — the board
+holds no private data, so the cookie stores a display preference, not identity.
+
+- **Personal** — click any reviewer (a name chip on the board or a pill) to see
+  *the MRs waiting on them* (`/?view=<username>`).
+- **Team** — define teams in config (`teams:`), and each gets two pills:
+  - **`<team> · authored`** — MRs **opened by** a team member.
+  - **`<team> · to review`** — MRs where a team member is a **requested
+    reviewer** (obligations narrowed to that team's members).
+
+  ```yaml
+  teams:
+    - name: backend
+      members: [dan, maya, ophira]
+  ```
 
 ### Launch an AI code review from the board
 

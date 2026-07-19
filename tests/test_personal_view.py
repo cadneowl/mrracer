@@ -34,8 +34,9 @@ def test_filter_to_one_reviewer(config, tmp_path):
     assert full["open_mrs"] == 2
     assert {p["username"] for p in full["people"]} == {"dan", "maya"}
 
-    dan_view = build_dashboard(db, config, now=ny(2026, 3, 2, 10), reviewer="dan")
-    assert dan_view["view_reviewer"] == "dan"
+    dan_view = build_dashboard(db, config, now=ny(2026, 3, 2, 10), view="dan")
+    assert dan_view["view"]["kind"] == "reviewer"
+    assert dan_view["view"]["token"] == "dan"
     assert dan_view["open_mrs"] == 1
     assert dan_view["rows"][0]["mr_iid"] == 1
     assert all(o["reviewer"] == "dan" for r in dan_view["rows"] for o in r["obligations"])

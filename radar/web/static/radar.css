@@ -39,6 +39,9 @@ main { padding: 18px 22px; }
   background: var(--panel); border: 1px solid var(--line); color: var(--text); text-decoration: none; font-size: 13px; }
 .pill:hover { border-color: var(--green); }
 .pill-active { background: var(--green); color: #0b0f17; border-color: var(--green); font-weight: 600; }
+.pill-team { border-color: #2d3f66; color: #9fb4d8; }
+.pill-team:hover { border-color: #7aa2f7; }
+.pill-team.pill-active { background: #7aa2f7; color: #0b0f17; border-color: #7aa2f7; }
 .pill-count { background: rgba(0,0,0,.25); border-radius: 10px; padding: 0 6px; font-size: 11px; font-weight: 700; }
 .pill-active .pill-count { background: rgba(0,0,0,.18); }
 
