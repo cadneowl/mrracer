@@ -6,12 +6,13 @@ import re
 import sys
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from radar.config import ReviewConfig, load_config
 from radar.db import Database
 from radar.events import EventType as ET
-from radar.review import ReviewRunner, build_argv
+from radar.review import ReviewCommandError, ReviewRunner, build_argv
 from radar.web.app import _render_markdown, create_app
 from tests.conftest import ev, ny
 
@@ -41,6 +42,33 @@ def test_build_argv_preserves_interpreter_path():
     argv = build_argv(f'{PY} -c "print(1)"', {})
     assert argv[0] == sys.executable
     assert argv[1:] == ["-c", "print(1)"]
+
+
+def test_build_argv_rejects_flag_smuggling():
+    # A standalone placeholder token whose value starts with '-' is a flag-
+    # smuggling attempt via attacker-influenced MR metadata (e.g. the title).
+    with pytest.raises(ReviewCommandError):
+        build_argv("mytool {title}", {"title": "--upload-file=/etc/passwd"})
+
+
+def test_build_argv_allows_embedded_placeholder_with_dashy_value():
+    # Embedded after a fixed prefix -> value stays inside one token, safe even
+    # if it contains dashes.
+    argv = build_argv("mytool --title={title}", {"title": "--not-a-flag"})
+    assert argv == ["mytool", "--title=--not-a-flag"]
+
+
+def test_build_argv_allows_literal_flags():
+    argv = build_argv("claude -p /review", {})
+    assert argv == ["claude", "-p", "/review"]
+
+
+def test_runner_reports_flag_smuggling_as_job_error():
+    cfg = ReviewConfig(enabled=True, command="mytool {title}", timeout_seconds=30)
+    runner = ReviewRunner(cfg)
+    job = runner.start({"project_id": 1, "mr_iid": 2, "title": "-rf"})
+    assert job.status == "error"
+    assert "flag" in job.error
 
 
 # --- markdown sanitization (review output is untrusted) --------------------

@@ -33,6 +33,10 @@ PLACEHOLDER_KEYS = (
 )
 
 
+class ReviewCommandError(ValueError):
+    """The command template + MR context can't be turned into a safe argv."""
+
+
 def build_argv(command: str, ctx: dict) -> list[str]:
     """Split a command template into argv, then substitute placeholders into
     each token (never re-splitting substituted values).
@@ -40,6 +44,14 @@ def build_argv(command: str, ctx: dict) -> list[str]:
     On Windows we split with ``posix=False`` so backslash paths survive, then
     strip the quotes shlex leaves on quoted tokens. Substituting after the
     split means an MR field can never inject extra args (run with shell=False).
+
+    Argument-injection guard: if substitution makes a token *start* with ``-``
+    when its template didn't (e.g. template ``tool {title}`` with a title of
+    ``--upload-file``), the injected value would be read as a flag by the target
+    tool. We refuse rather than smuggle a flag. Templates that legitimately
+    start a token with a dash (``-p``, ``--branch={source_branch}``) keep the
+    literal dash in the template, so they're unaffected — and embedding a
+    placeholder after a fixed prefix is the safe way to pass such values.
     """
     posix = os.name != "nt"
     tokens = shlex.split(command, posix=posix)
@@ -47,8 +59,15 @@ def build_argv(command: str, ctx: dict) -> list[str]:
     for token in tokens:
         if not posix and len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
             token = token[1:-1]
+        template_token = token
         for key in PLACEHOLDER_KEYS:
             token = token.replace("{" + key + "}", str(ctx.get(key, "")))
+        if token.startswith("-") and not template_token.startswith("-"):
+            raise ReviewCommandError(
+                "refusing to run: a substituted MR value would start with '-' and "
+                f"be read as a flag (token {template_token!r} -> {token!r}). "
+                "Embed the placeholder after a fixed prefix, e.g. --arg={placeholder}."
+            )
         argv.append(token)
     return argv
 
@@ -82,7 +101,11 @@ class ReviewRunner:
         )
         with self._lock:
             self._jobs[job.id] = job
-        argv = build_argv(self.config.command, ctx)
+        try:
+            argv = build_argv(self.config.command, ctx)
+        except ReviewCommandError as exc:
+            job.status, job.error = "error", str(exc)
+            return job
         threading.Thread(target=self._run, args=(job, argv), daemon=True).start()
         return job
 

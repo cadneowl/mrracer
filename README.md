@@ -70,8 +70,12 @@ Placeholders filled from the MR: `{web_url}`, `{mr_iid}`, `{project_id}`,
 `{source_branch}`, `{target_branch}`, `{title}`, `{author}`. The command runs
 **locally on the same machine as `radar serve`**, with `shell=False`, and the
 template is tokenized *before* substitution — so an MR field can never inject
-extra arguments. Reviews run as background jobs; the modal polls until done. The
-result is shown in the dashboard only (nothing is written back to GitLab).
+shell metacharacters or extra arguments. As a further guard, if a substituted
+value would make a token *start with* `-` (flag smuggling via an
+attacker-chosen title/branch), radar refuses to run; embed placeholders after a
+fixed prefix (`--url={web_url}`) if you need dash-leading values. Reviews run as
+background jobs; the modal polls until done. The result is shown in the
+dashboard only (nothing is written back to GitLab).
 
 The command's stdout is treated as **untrusted** — it can quote MR content
 authored by others — so the rendered markdown is HTML-sanitized against a strict
