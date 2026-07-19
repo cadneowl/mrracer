@@ -71,6 +71,10 @@ class CommandConfig:
     command: str = ""
     working_dir: str | None = None
     timeout_seconds: int = 600
+    # When true, radar fetches context from its backend (the MR diff for review,
+    # the Jira ticket(s)/epic for qa) and pipes it to the command on stdin, so
+    # the skill needs no GitLab/Jira access of its own.
+    include_context: bool = False
 
 
 # Backwards-compatible alias.
@@ -250,7 +254,11 @@ def _parse_command(raw: object, name: str) -> CommandConfig:
     if timeout < 1:
         raise ConfigError(f"{name}.timeout_seconds: must be >= 1")
     return CommandConfig(
-        enabled=enabled, command=command, working_dir=working_dir, timeout_seconds=timeout
+        enabled=enabled,
+        command=command,
+        working_dir=working_dir,
+        timeout_seconds=timeout,
+        include_context=bool(raw.get("include_context", False)),
     )
 
 
@@ -382,3 +390,32 @@ def gitlab_credentials() -> tuple[str, str]:
             "(a personal access token with the read_api scope)."
         )
     return url, token
+
+
+def jira_credentials() -> tuple[str, str, str]:
+    """Read Jira Cloud credentials from the environment for backend fetches.
+
+    Returns (base_url, email, api_token). Raises ConfigError if any is missing.
+    Jira Cloud REST uses HTTP Basic auth with the account email + an API token.
+    Secrets are never logged or persisted.
+    """
+    base_url = os.environ.get("JIRA_BASE_URL", "").strip()
+    email = os.environ.get("JIRA_EMAIL", "").strip()
+    token = os.environ.get("JIRA_API_TOKEN", "").strip()
+    missing = [
+        name
+        for name, val in (
+            ("JIRA_BASE_URL", base_url),
+            ("JIRA_EMAIL", email),
+            ("JIRA_API_TOKEN", token),
+        )
+        if not val
+    ]
+    if missing:
+        raise ConfigError(
+            "missing environment variable(s): "
+            + ", ".join(missing)
+            + "\nSet JIRA_BASE_URL (e.g. https://yourco.atlassian.net), JIRA_EMAIL, and "
+            "JIRA_API_TOKEN (create one at id.atlassian.com → Security → API tokens)."
+        )
+    return base_url, email, token

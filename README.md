@@ -180,6 +180,31 @@ credentials** — the skill owns all Jira access.
 > the `/qa-testplan` skill is yours to write, like the review skill. Output is
 > sanitized and rendered the same way as reviews.
 
+### Let radar fetch the context (`include_context`)
+
+By default the skill fetches its own data (the MR from GitLab, the ticket from
+Jira). On a **private/self-hosted GitLab** that fails — the skill has no
+credentials, and a WebFetch of a private MR just returns a login page. Set
+`include_context: true` and **radar fetches the data from its backend** (it
+already holds the tokens) and pipes it to the skill on **stdin**:
+
+```yaml
+review:
+  include_context: true    # radar fetches the MR title/description/diff -> stdin
+qa:
+  include_context: true    # radar fetches the Jira ticket(s) + epic children -> stdin
+```
+
+- **Review** uses `GITLAB_URL` / `GITLAB_TOKEN` (the same env the poller uses).
+- **QA** uses `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` (Jira Cloud REST,
+  basic auth). An **epic** also pulls its child issues.
+
+With this on, the skill needs **no GitLab/Jira access of its own** — write it to
+read the context from stdin (you can drop `{web_url}` / `{jira_keys}` from the
+command). The tokens stay inside radar's process; they're still stripped from
+the child's environment. The fetch runs inside the job (you'll see a "fetching
+context…" line), and a fetch failure surfaces as a clear job error.
+
 ### Business-hours math
 
 SLA budgets are in **business hours**. Weekends and off-hours never burn budget.

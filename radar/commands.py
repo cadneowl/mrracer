@@ -111,6 +111,14 @@ def _fail(job: CommandJob, message: str) -> None:
     job.status = "error"
 
 
+def _feed_stdin(proc, text: str) -> None:
+    try:
+        proc.stdin.write(text)
+        proc.stdin.close()
+    except (OSError, ValueError):  # child exited / pipe closed early
+        pass
+
+
 def _short(text: str, limit: int = 140) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -126,7 +134,10 @@ class CommandRunner:
         self._lock = threading.Lock()
 
     def start(
-        self, ctx: dict, on_success: Callable[[CommandJob], None] | None = None
+        self,
+        ctx: dict,
+        on_success: Callable[[CommandJob], None] | None = None,
+        stdin_provider: Callable[[], str] | None = None,
     ) -> CommandJob:
         job = CommandJob(
             id=uuid.uuid4().hex[:12],
@@ -144,7 +155,9 @@ class CommandRunner:
         except CommandError as exc:
             job.status, job.error = "error", str(exc)
             return job
-        threading.Thread(target=self._run, args=(job, argv, on_success), daemon=True).start()
+        threading.Thread(
+            target=self._run, args=(job, argv, on_success, stdin_provider), daemon=True
+        ).start()
         return job
 
     def get(self, job_id: str) -> CommandJob | None:
@@ -169,23 +182,32 @@ class CommandRunner:
 
     # --- execution ---------------------------------------------------------
 
-    def _run(self, job: CommandJob, argv: list[str], on_success) -> None:
+    def _run(self, job: CommandJob, argv: list[str], on_success, stdin_provider=None) -> None:
         # Catch-all guarantees a terminal state; a worker crash must never leave
         # the job "running" (the UI would tail it forever).
         try:
-            self._execute(job, argv, on_success)
+            self._execute(job, argv, on_success, stdin_provider)
         except Exception as exc:  # noqa: BLE001 - last-resort terminal state
             log.exception("%s worker crashed", self.kind)
             _fail(job, f"unexpected error: {exc}")
 
-    def _execute(self, job: CommandJob, argv: list[str], on_success) -> None:
+    def _execute(self, job: CommandJob, argv: list[str], on_success, stdin_provider=None) -> None:
         if not argv:
             _fail(job, f"{self.kind}.command is empty")
             return
+
+        # Fetch backend context (MR diff / Jira ticket) to pipe on stdin. Runs in
+        # this worker thread; a failure here surfaces as a job error.
+        stdin_text: str | None = None
+        if stdin_provider is not None:
+            self._add(job, "log", "fetching context…")
+            stdin_text = stdin_provider()
+
         try:
             proc = subprocess.Popen(
                 argv,
                 cwd=self.config.working_dir or None,
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -200,6 +222,12 @@ class CommandRunner:
         except OSError as exc:  # pragma: no cover - defensive
             _fail(job, f"failed to launch {self.kind}: {exc}")
             return
+
+        if stdin_text is not None:
+            # Write on a thread so a large bundle can't deadlock against stdout.
+            threading.Thread(
+                target=_feed_stdin, args=(proc, stdin_text), daemon=True
+            ).start()
 
         # Drain stderr concurrently so a chatty child can't deadlock on a full pipe.
         stderr_box: list[str] = []

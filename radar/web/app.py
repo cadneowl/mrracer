@@ -22,6 +22,7 @@ from markupsafe import Markup
 from ..coach import build_coach
 from ..commands import PLACEHOLDER_KEYS, CommandJob, CommandRunner
 from ..config import Config
+from ..context import stdin_provider_for
 from ..db import Database
 from ..jira import extract_keys
 from ..service import build_dashboard
@@ -149,7 +150,8 @@ def create_app(config: Config, db_path: str) -> FastAPI:
                 with Database(db_path) as db:
                     db.save_test_plan(project_id, mr_iid, csv, job.output)
 
-        job = runners[kind].start(ctx, on_success=on_success)
+        stdin_provider = stdin_provider_for(kind, config, project_id, mr_iid, keys)
+        job = runners[kind].start(ctx, on_success=on_success, stdin_provider=stdin_provider)
         return _panel(request, job)
 
     @app.get("/{kind}/status/{job_id}", response_class=HTMLResponse)
