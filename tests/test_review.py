@@ -129,6 +129,32 @@ def test_runner_captures_utf8_output():
     assert "café → test" in done.output
 
 
+_STREAM_JSON = (
+    "import json\n"
+    'print(json.dumps({"type": "system"}))\n'
+    'print(json.dumps({"type": "assistant", "message": {"content":'
+    ' [{"type": "tool_use", "name": "WebFetch"}]}}))\n'
+    'print(json.dumps({"type": "assistant", "message": {"content":'
+    ' [{"type": "text", "text": "Reading the diff"}]}}))\n'
+    'print(json.dumps({"type": "result", "result": "# Review\\n\\nLGTM"}))\n'
+)
+
+
+def test_runner_parses_stream_json(tmp_path):
+    # A command that speaks Claude's --output-format stream-json: tool_use ->
+    # progress, and the final answer comes from the 'result' event.
+    script = tmp_path / "emit.py"
+    script.write_text(_STREAM_JSON, encoding="utf-8")
+    cfg = ReviewConfig(enabled=True, command=f'{PY} "{script}"', timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.status == "done"
+    assert done.output.startswith("# Review")  # from the result event, not raw JSON
+    kinds = {p["kind"] for p in done.progress}
+    assert "tool" in kinds and "text" in kinds
+    assert any("WebFetch" in p["text"] for p in done.progress)
+
+
 def test_runner_reports_error_on_nonzero():
     cmd = f'{PY} -c "import sys; sys.exit(3)"'
     cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=30)
@@ -158,7 +184,7 @@ def test_runner_catchall_sets_terminal_state(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(commands.subprocess, "run", boom)
+    monkeypatch.setattr(commands.subprocess, "Popen", boom)
     cfg = ReviewConfig(enabled=True, command=f'{PY} -c "print(1)"', timeout_seconds=30)
     runner = CommandRunner(cfg, "review")
     done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
@@ -229,8 +255,8 @@ def test_review_button_and_flow(tmp_path):
     start = client.post("/review/1/7")
     assert start.status_code == 200
     assert "AI review" in start.text
-    m = re.search(r"/review/status/([0-9a-f]+)", start.text)
-    assert m, "expected a status poll URL while running"
+    m = re.search(r'data-job-id="([0-9a-f]+)"', start.text)
+    assert m, "expected a job id on the running panel"
     job_id = m.group(1)
 
     html = ""

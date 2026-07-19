@@ -53,8 +53,15 @@ waive:
 # {target_branch} {title} {author}.
 review:
   enabled: false
-  # Example: invoke a prepared Claude Code skill headlessly.
-  command: 'claude -p "/code-review {web_url}"'
+  # Invoke a prepared Claude Code skill headlessly. The flags matter for a
+  # smooth, unattended run:
+  #   --permission-mode dontAsk  : never block on a tool-permission prompt
+  #     (pre-approve tools in ~/.claude/settings.json permissions.allow), OR use
+  #     --permission-mode bypassPermissions to skip all prompts.
+  #   --output-format stream-json --verbose : emit live events so the dashboard
+  #     shows real-time progress (tool uses, drafting). Plain commands still work
+  #     (their stdout lines become the progress log); they just aren't as live.
+  command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/code-review {web_url}"'
   working_dir: null          # run the command here (e.g. a repo checkout); null = radar's CWD
   timeout_seconds: 600
 
@@ -72,7 +79,7 @@ jira:
 # back to Jira; radar keeps a copy and shows it on the board.
 qa:
   enabled: false
-  command: 'claude -p "/qa-testplan {jira_keys}"'
+  command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/qa-testplan {jira_keys}"'
   working_dir: null
   timeout_seconds: 900
 

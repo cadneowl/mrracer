@@ -7,12 +7,14 @@ holds no long-lived DB handle.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
 import markdown as md
 import nh3
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
@@ -49,6 +51,10 @@ _ALLOWED_ATTRS = {
     "th": {"align"},
     "td": {"align"},
 }
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 def _render_markdown(text: str) -> Markup:
@@ -153,6 +159,38 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail="unknown job")
         return _panel(request, job)
+
+    @app.get("/{kind}/stream/{job_id}")
+    def command_stream(kind: str, job_id: str):
+        # Server-Sent Events: tail the job's progress log live, then a single
+        # `end` event carrying the terminal status. The browser renders the
+        # final result by re-fetching /status on `end`.
+        if kind not in runners:
+            raise HTTPException(status_code=404, detail="unknown kind")
+        runner = runners[kind]
+
+        async def gen():
+            sent = 0
+            for _ in range(1500):  # ~10min safety cap at 0.4s/iteration
+                snap = runner.progress_since(job_id, sent)
+                if snap is None:
+                    yield _sse("end", {"status": "error"})
+                    return
+                items, status = snap
+                for item in items:
+                    yield _sse("progress", item)
+                sent += len(items)
+                if status != "running":
+                    yield _sse("end", {"status": status})
+                    return
+                await asyncio.sleep(0.4)
+            yield _sse("end", {"status": "timeout"})
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/{kind}/close", response_class=HTMLResponse)
     def command_close(kind: str):
