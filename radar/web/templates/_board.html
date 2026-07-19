@@ -1,9 +1,17 @@
 {# Polled partial: people picker + team summary + the obligation board. #}
 <section class="people">
   <span class="people-label">View:</span>
-  <a class="pill {% if not view_reviewer %}pill-active{% endif %}" href="/?view=">Team board</a>
+  <a class="pill {% if view.kind == 'all' %}pill-active{% endif %}" href="/?view=">All MRs</a>
+  {% for team in teams %}
+    {% set authored = 'team:' ~ team ~ ':authored' %}
+    {% set toreview = 'team:' ~ team ~ ':review' %}
+    <a class="pill pill-team {% if view.token == authored %}pill-active{% endif %}"
+       href="/?view={{ authored }}" title="MRs opened by team {{ team }}">{{ team }} · authored</a>
+    <a class="pill pill-team {% if view.token == toreview %}pill-active{% endif %}"
+       href="/?view={{ toreview }}" title="MRs with a {{ team }} member requested to review">{{ team }} · to review</a>
+  {% endfor %}
   {% for p in people %}
-  <a class="pill {% if view_reviewer == p.username %}pill-active{% endif %}"
+  <a class="pill {% if view.kind == 'reviewer' and view.token == p.username %}pill-active{% endif %}"
      href="/?view={{ p.username }}"
      title="{{ p.waiting }} waiting on {{ p.username }}, {{ p.total }} total">
     {{ p.username }}
@@ -12,9 +20,9 @@
   {% endfor %}
 </section>
 
-{% if view_reviewer %}
-<h2 class="view-title">MRs waiting on <strong>{{ view_reviewer }}</strong>
-  <a class="clear" href="/?view=">← back to team board</a>
+{% if view.kind != 'all' %}
+<h2 class="view-title">{{ view.label }}
+  <a class="clear" href="/?view=">← all MRs</a>
 </h2>
 {% endif %}
 
@@ -94,8 +102,8 @@
 </table>
 {% else %}
 <div class="empty">
-  {% if view_reviewer %}
-  Nothing waiting on <strong>{{ view_reviewer }}</strong> right now. <a class="clear" href="/?view=">Back to team board</a>
+  {% if view.kind != 'all' %}
+  Nothing matches <strong>{{ view.label }}</strong> right now. <a class="clear" href="/?view=">Back to all MRs</a>
   {% else %}
   No open merge requests with review obligations. Run <code>radar poll-once</code> to fetch from GitLab.
   {% endif %}

@@ -86,6 +86,18 @@ class JiraConfig:
 
 
 @dataclass(frozen=True)
+class Team:
+    """A named group of GitLab usernames, used for board filters."""
+
+    name: str
+    members: tuple[str, ...]
+
+    @property
+    def member_set(self) -> frozenset[str]:
+        return frozenset(self.members)
+
+
+@dataclass(frozen=True)
 class Config:
     gitlab: GitLabSettings
     database_path: Path
@@ -95,7 +107,14 @@ class Config:
     review: CommandConfig
     qa: CommandConfig
     jira: JiraConfig
+    teams: tuple[Team, ...]
     gamification: dict  # consumed in Phase 3; carried verbatim for now
+
+    def team_by_name(self, name: str) -> Team | None:
+        for team in self.teams:
+            if team.name == name:
+                return team
+        return None
 
 
 # --- helpers ---------------------------------------------------------------
@@ -249,6 +268,31 @@ def _parse_jira(raw: object) -> JiraConfig:
     return JiraConfig(base_url=base_url or None, project_keys=tuple(str(k) for k in keys_raw))
 
 
+def _parse_teams(raw: object) -> tuple[Team, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError("teams: expected a list of {name, members}")
+    teams: list[Team] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(raw):
+        ctx = f"teams[{i}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{ctx}: expected a mapping with 'name' and 'members'")
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            raise ConfigError(f"{ctx}: missing 'name'")
+        if name in seen:
+            raise ConfigError(f"{ctx}: duplicate team name {name!r}")
+        seen.add(name)
+        members_raw = entry.get("members", [])
+        if not isinstance(members_raw, list) or not members_raw:
+            raise ConfigError(f"{ctx}.members: expected a non-empty list of usernames")
+        members = tuple(dict.fromkeys(str(m) for m in members_raw))  # de-dup, keep order
+        teams.append(Team(name=name, members=members))
+    return tuple(teams)
+
+
 def _parse_waive(raw: object) -> WaiveConfig:
     if raw is None:
         return WaiveConfig()
@@ -302,6 +346,7 @@ def load_config(path: str | Path) -> Config:
     review = _parse_command(raw.get("review"), "review")
     qa = _parse_command(raw.get("qa"), "qa")
     jira = _parse_jira(raw.get("jira"))
+    teams = _parse_teams(raw.get("teams"))
     gamification = raw.get("gamification") or {}
     if not isinstance(gamification, dict):
         raise ConfigError("gamification: expected a mapping")
@@ -315,6 +360,7 @@ def load_config(path: str | Path) -> Config:
         review=review,
         qa=qa,
         jira=jira,
+        teams=teams,
         gamification=gamification,
     )
 

@@ -107,14 +107,49 @@ def _people_index(rows: list[dict]) -> list[dict]:
     return sorted(people.values(), key=lambda p: (-p["waiting"], p["username"]))
 
 
+def _filter_obligations(rows: list[dict], keep) -> list[dict]:
+    """Keep only rows with an obligation matching ``keep``, narrowed to those."""
+    out = []
+    for row in rows:
+        kept = [o for o in row["obligations"] if keep(o)]
+        if kept:
+            out.append({**row, "obligations": kept, "min_urgency": _row_min_urgency(kept)})
+    return out
+
+
+def _parse_view(token: str | None, config: Config) -> tuple[str, object, str]:
+    """Resolve a view token to (kind, value, label).
+
+    Tokens: "" -> all; "team:<name>:authored" / "team:<name>:review" ->
+    team filters; anything else -> a reviewer username (personal view). Colons
+    can't appear in GitLab usernames, so they're a safe team delimiter.
+    """
+    if not token:
+        return "all", None, "All open MRs"
+    if token.startswith("team:"):
+        parts = token.split(":")
+        if len(parts) == 3:
+            _, name, mode = parts
+            team = config.team_by_name(name)
+            if team is not None and mode in ("authored", "review"):
+                label = (
+                    f"Opened by team {name}"
+                    if mode == "authored"
+                    else f"Review requested from team {name}"
+                )
+                return f"team_{mode}", team, label
+        return "all", None, "All open MRs"  # unknown team/mode -> fall back
+    return "reviewer", token, f"MRs waiting on {token}"
+
+
 def build_dashboard(
     db: Database,
     config: Config,
     now: datetime | None = None,
-    reviewer: str | None = None,
+    view: str | None = None,
 ) -> dict:
-    """Assemble the board. If ``reviewer`` is set, filter to the MRs waiting on
-    that person (a personal view); otherwise show the whole team board."""
+    """Assemble the board, optionally filtered by a view token (a reviewer's
+    personal view, or a team's authored / review-requested filter)."""
     now = now or datetime.now(UTC)
 
     all_rows: list[dict] = []
@@ -148,14 +183,17 @@ def build_dashboard(
         )
 
     people = _people_index(all_rows)
+    kind, value, label = _parse_view(view, config)
 
-    # Filter to a single reviewer's obligations for the personal view.
-    if reviewer:
-        rows = []
-        for row in all_rows:
-            mine = [o for o in row["obligations"] if o["reviewer"] == reviewer]
-            if mine:
-                rows.append({**row, "obligations": mine, "min_urgency": _row_min_urgency(mine)})
+    if kind == "reviewer":
+        # Personal view: MRs waiting on one person, narrowed to their obligation.
+        rows = _filter_obligations(all_rows, lambda o: o["reviewer"] == value)
+    elif kind == "team_review":
+        members = value.member_set
+        rows = _filter_obligations(all_rows, lambda o: o["reviewer"] in members)
+    elif kind == "team_authored":
+        members = value.member_set
+        rows = [r for r in all_rows if r["author"] in members]
     else:
         rows = all_rows
 
@@ -172,7 +210,8 @@ def build_dashboard(
         "at_risk": summary.get(CHIP_AT_RISK, 0),
         "open_mrs": len(rows),
         "people": people,
-        "view_reviewer": reviewer,
+        "teams": [t.name for t in config.teams],
+        "view": {"token": view or "", "kind": kind, "label": label},
         "generated_at": now,
     }
 

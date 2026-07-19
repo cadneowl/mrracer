@@ -71,9 +71,9 @@ def create_app(config: Config, db_path: str) -> FastAPI:
     }
     enabled = {"review": config.review.enabled, "qa": config.qa.enabled}
 
-    def context(reviewer: str | None) -> dict:
+    def context(view: str | None) -> dict:
         with Database(db_path) as db:
-            data = build_dashboard(db, config, reviewer=reviewer)
+            data = build_dashboard(db, config, view=view)
         data["poll_interval_minutes"] = config.gitlab.poll_interval_minutes
         data["review_enabled"] = config.review.enabled
         data["qa_enabled"] = config.qa.enabled
@@ -105,24 +105,24 @@ def create_app(config: Config, db_path: str) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request, view: str | None = None):
-        # `view` present -> explicit choice (empty string clears the personal
-        # view); absent -> fall back to the remembered cookie.
+        # `view` present -> explicit choice (empty string clears the filter);
+        # absent -> fall back to the remembered cookie.
         cookie = request.cookies.get(COOKIE_NAME) or None
-        reviewer = (view or None) if view is not None else cookie
+        token = (view or None) if view is not None else cookie
 
-        resp = templates.TemplateResponse(request, "dashboard.html", context(reviewer))
+        resp = templates.TemplateResponse(request, "dashboard.html", context(token))
         if view is not None:
-            if reviewer:
-                resp.set_cookie(COOKIE_NAME, reviewer, max_age=COOKIE_MAX_AGE, samesite="lax")
+            if token:
+                resp.set_cookie(COOKIE_NAME, token, max_age=COOKIE_MAX_AGE, samesite="lax")
             else:
                 resp.delete_cookie(COOKIE_NAME)
         return resp
 
     @app.get("/partials/board", response_class=HTMLResponse)
     def board(request: Request):
-        # Auto-refresh preserves the remembered personal view via the cookie.
-        reviewer = request.cookies.get(COOKIE_NAME) or None
-        return templates.TemplateResponse(request, "_board.html", context(reviewer))
+        # Auto-refresh preserves the remembered filter via the cookie.
+        token = request.cookies.get(COOKIE_NAME) or None
+        return templates.TemplateResponse(request, "_board.html", context(token))
 
     @app.post("/{kind}/{project_id}/{mr_iid}", response_class=HTMLResponse)
     def start_command(request: Request, kind: str, project_id: int, mr_iid: int):
