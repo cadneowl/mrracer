@@ -56,9 +56,15 @@ review:
   # Invoke a prepared Claude Code skill headlessly. Make the run smooth AND safe:
   #  1. Pre-approve a NARROW, read-only allowlist in ~/.claude/settings.json
   #     under permissions.allow — e.g.
-  #       ["Read", "Grep", "Glob", "WebFetch(domain:gitlab.yourco.com)"]
-  #     Add "Bash(git *)" ONLY if the skill reviews a local checkout. Do not
-  #     grant blanket Bash or any write/edit tools.
+  #       ["Read", "Grep", "Glob",
+  #        "WebFetch(domain:gitlab.yourco.com)",   # code review -> GitLab
+  #        "mcp__atlassian__*",                     # QA -> Jira via an Atlassian MCP
+  #        "WebFetch(domain:*.atlassian.net)"]      # QA -> Jira via WebFetch (alt)
+  #     For MCP tools the rule is mcp__<server>__<tool>; the "__*" wildcard
+  #     approves a whole server (a bare "mcp__atlassian" is rejected). Match
+  #     "atlassian" to your Jira MCP server's real name. Add "Bash(git *)" ONLY
+  #     if a skill reviews a local checkout. No blanket Bash or write/edit tools.
+  #     (Don't use --bare: it skips loading MCP servers.)
   #  2. --permission-mode dontAsk : enforce that allowlist WITHOUT prompting.
   #     Anything not on the list is auto-DENIED (fails closed), so the run never
   #     blocks and never silently gains capabilities.

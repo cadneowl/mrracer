@@ -99,9 +99,24 @@ radar runs the command **non-interactively** (no TTY), so it must not stop to
 ask for tool permissions. Run the skill with permissions pre-resolved:
 
 - Pre-approve a **narrow, read-only allowlist** in `~/.claude/settings.json`
-  under `permissions.allow` — e.g. `Read`, `Grep`, `Glob`,
-  `WebFetch(domain:gitlab.yourco.com)` (add `Bash(git *)` only if the skill
-  reviews a local checkout; avoid blanket `Bash` and any write tools). Then
+  under `permissions.allow`:
+  ```json
+  {
+    "permissions": {
+      "allow": [
+        "Read", "Grep", "Glob",
+        "WebFetch(domain:gitlab.yourco.com)",   // code review -> GitLab
+        "mcp__atlassian__*",                     // QA -> Jira via an Atlassian MCP
+        "WebFetch(domain:*.atlassian.net)"       // QA -> Jira via WebFetch (alt)
+      ]
+    }
+  }
+  ```
+  MCP tools use `mcp__<server>__<tool>`; the `__*` wildcard approves a whole
+  server (a bare `mcp__atlassian` is rejected). Match `atlassian` to your Jira
+  MCP server's real name. Add `Bash(git *)` only if a skill reviews a local
+  checkout; avoid blanket `Bash` and any write tools. Don't use `--bare` (it
+  skips loading MCP servers). Then
   `--permission-mode dontAsk` **enforces** that allowlist without prompting —
   anything not on the list is **auto-denied (fails closed)**, so the run never
   blocks and never silently gains capabilities. Avoid `--permission-mode
