@@ -5,6 +5,11 @@
 #   GITLAB_URL    e.g. https://gitlab.example.com
 #   GITLAB_TOKEN  a personal access token with the read_api scope
 #
+# For QA `include_context` (radar fetches Jira tickets for you), also set:
+#   JIRA_BASE_URL   e.g. https://yourco.atlassian.net
+#   JIRA_EMAIL      your Atlassian account email
+#   JIRA_API_TOKEN  an API token (id.atlassian.com -> Security -> API tokens)
+#
 # Copy this file to config.yaml and edit for your team.
 
 gitlab:
@@ -69,9 +74,14 @@ review:
   #  3. --output-format stream-json --verbose : emit live events so the dashboard
   #     shows real-time progress. Plain commands still work (stdout -> progress
   #     log); they just aren't as granular.
-  command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/code-review {web_url}"'
+  command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/code-review"'
   working_dir: null          # run the command here (e.g. a repo checkout); null = radar's CWD
   timeout_seconds: 600
+  # include_context: radar fetches the MR title/description/diff itself (via
+  # GITLAB_URL/GITLAB_TOKEN) and pipes it to the skill on STDIN. The skill then
+  # needs NO GitLab access of its own and works on private/self-hosted GitLab —
+  # write your /code-review skill to read the diff from stdin (drop {web_url}).
+  include_context: false
 
 # Teams. Each team is a named set of GitLab usernames. The board's VIEW bar
 # then offers two filters per team: "<team> · authored" (MRs opened by a team
@@ -97,9 +107,13 @@ jira:
 # back to Jira; radar keeps a copy and shows it on the board.
 qa:
   enabled: false
-  command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/qa-testplan {jira_keys}"'
+  command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/qa-testplan"'
   working_dir: null
   timeout_seconds: 900
+  # include_context: radar fetches the linked Jira ticket(s) — and an epic's
+  # child issues — via JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN, and pipes them to
+  # the skill on STDIN. The skill needs no Jira access of its own.
+  include_context: false
 
 # Gamification config is consumed in Phase 3; kept here so the file is stable.
 gamification:

@@ -87,6 +87,17 @@ class GitLabSource:
         mr = proj.mergerequests.get(mr_iid, lazy=True)
         return [dict(d.attributes) for d in mr.discussions.list(iterator=True)]
 
+    def get_mr_context(self, project_id: int, mr_iid: int) -> dict:
+        """Title, description, and unified diff of an MR (for backend fetch)."""
+        proj = self._gl.projects.get(project_id, lazy=True)
+        mr = proj.mergerequests.get(mr_iid)
+        changes = mr.changes().get("changes", [])
+        diff = "\n".join(
+            f"diff --git a/{c.get('old_path')} b/{c.get('new_path')}\n{c.get('diff', '')}"
+            for c in changes
+        )
+        return {"title": mr.title, "description": mr.description or "", "diff": diff}
+
 
 class FixtureSource:
     """In-memory / on-disk fixture source for tests and demos."""
@@ -95,9 +106,11 @@ class FixtureSource:
         self,
         mrs_by_project: dict[str, list[dict]],
         discussions_by_mr: dict[tuple[int, int], list[dict]],
+        mr_context_by_mr: dict[tuple[int, int], dict] | None = None,
     ):
         self._mrs = mrs_by_project
         self._discussions = discussions_by_mr
+        self._mr_context = mr_context_by_mr or {}
 
     @classmethod
     def from_dir(cls, path: str | Path) -> FixtureSource:
@@ -133,3 +146,8 @@ class FixtureSource:
 
     def list_discussions(self, project_id: int, mr_iid: int) -> list[dict]:
         return self._discussions.get((project_id, mr_iid), [])
+
+    def get_mr_context(self, project_id: int, mr_iid: int) -> dict:
+        return self._mr_context.get(
+            (project_id, mr_iid), {"title": "", "description": "", "diff": ""}
+        )
