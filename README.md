@@ -52,6 +52,27 @@ on your next visit and across the 60s auto-refresh; **← back to team board**
 clears it. There is **no login**: the board holds no private data, so the cookie
 just stores a display preference, not an identity.
 
+### Launch an AI code review from the board
+
+Each MR row can show a **🔍 review** button that runs a command you configure
+and shows its stdout as a rendered markdown review, in a modal over the board.
+It's tool-agnostic — point it at whatever review skill you've prepared:
+
+```yaml
+review:
+  enabled: true
+  command: 'claude -p "/code-review {web_url}"'   # e.g. a Claude Code skill, headless
+  working_dir: /path/to/checkout                  # optional; where to run it
+  timeout_seconds: 600
+```
+
+Placeholders filled from the MR: `{web_url}`, `{mr_iid}`, `{project_id}`,
+`{source_branch}`, `{target_branch}`, `{title}`, `{author}`. The command runs
+**locally on the same machine as `radar serve`**, with `shell=False`, and the
+template is tokenized *before* substitution — so an MR field can never inject
+extra arguments. Reviews run as background jobs; the modal polls until done. The
+result is shown in the dashboard only (nothing is written back to GitLab).
+
 ### Business-hours math
 
 SLA budgets are in **business hours**. Weekends and off-hours never burn budget.

@@ -1,0 +1,29 @@
+{# AI review modal. Lives in #review-panel (outside the polled board), so the
+   60s board refresh never wipes it. While running it re-fetches itself every
+   2s; the 'done'/'error' fragments omit the trigger, which stops polling. #}
+<div class="modal-overlay">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="modal-title">🔍 AI review — {{ job.title }} <span class="mrid">!{{ job.mr_iid }}</span></span>
+      <a class="modal-close" href="#" hx-get="/review/close" hx-target="#review-panel" hx-swap="innerHTML">✕</a>
+    </div>
+    <div class="modal-body">
+      {% if job.status == "running" %}
+      <div class="review-loading"
+           hx-get="/review/status/{{ job.id }}"
+           hx-trigger="every 2s"
+           hx-target="#review-panel"
+           hx-swap="innerHTML">
+        <span class="spinner"></span> running your review command…
+      </div>
+      {% elif job.status == "done" %}
+      <article class="review-output">{{ output_html }}</article>
+      {% else %}
+      <div class="review-error">
+        <strong>Review failed.</strong>
+        <pre>{{ job.error }}</pre>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
