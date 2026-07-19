@@ -1,0 +1,34 @@
+{# Command modal (code review / QA test plan). Lives in #command-panel (outside
+   the polled board), so the 60s board refresh never wipes it. While running it
+   re-fetches itself every 2s; the 'done'/'error' fragments omit the trigger,
+   which stops polling. #}
+<div class="modal-overlay">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="modal-title">
+        {% if kind == "qa" %}🧪{% else %}🔍{% endif %} {{ heading }} —
+        {{ job.title }} <span class="mrid">!{{ job.mr_iid }}</span>
+        {% if generated_at %}<span class="stamp">saved {{ generated_at[:19] }}Z</span>{% endif %}
+      </span>
+      <a class="modal-close" href="#" hx-get="/{{ kind }}/close" hx-target="#command-panel" hx-swap="innerHTML">✕</a>
+    </div>
+    <div class="modal-body">
+      {% if job.status == "running" %}
+      <div class="review-loading"
+           hx-get="/{{ kind }}/status/{{ job.id }}"
+           hx-trigger="every 2s"
+           hx-target="#command-panel"
+           hx-swap="innerHTML">
+        <span class="spinner"></span> running your {{ heading|lower }} command…
+      </div>
+      {% elif job.status == "done" %}
+      <article class="review-output">{{ output_html }}</article>
+      {% else %}
+      <div class="review-error">
+        <strong>{{ heading }} failed.</strong>
+        <pre>{{ job.error }}</pre>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>

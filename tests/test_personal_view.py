@@ -18,7 +18,7 @@ def _seed(db):
         db.upsert_mr_snapshot(
             project_id=1, mr_iid=iid, title=snap["title"], author="aviva",
             web_url=snap["web_url"], source_branch="f", target_branch="main",
-            labels=[], draft=False, state="opened", reviewers=[reviewer],
+            description="", labels=[], draft=False, state="opened", reviewers=[reviewer],
             created_at="2026-03-02T09:00:00Z", updated_at="2026-03-02T09:00:00Z",
         )
         db.insert_events(

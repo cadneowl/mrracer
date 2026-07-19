@@ -63,13 +63,26 @@ class WaiveConfig:
 
 
 @dataclass(frozen=True)
-class ReviewConfig:
-    """Launch an external AI code-review command for an MR from the dashboard."""
+class CommandConfig:
+    """Launch an external command for an MR from the dashboard (code review /
+    QA test plan). The command is a template filled with MR context."""
 
     enabled: bool = False
     command: str = ""
     working_dir: str | None = None
     timeout_seconds: int = 600
+
+
+# Backwards-compatible alias.
+ReviewConfig = CommandConfig
+
+
+@dataclass(frozen=True)
+class JiraConfig:
+    """How to recognise and link the Jira issue(s) associated with an MR."""
+
+    base_url: str | None = None  # e.g. https://yourco.atlassian.net (for browse links)
+    project_keys: tuple[str, ...] = ()  # optional filter, e.g. ("PROJ", "BUG")
 
 
 @dataclass(frozen=True)
@@ -79,7 +92,9 @@ class Config:
     calendar: CalendarConfig
     slas: tuple[SLARule, ...]
     waive: WaiveConfig
-    review: ReviewConfig
+    review: CommandConfig
+    qa: CommandConfig
+    jira: JiraConfig
     gamification: dict  # consumed in Phase 3; carried verbatim for now
 
 
@@ -195,29 +210,43 @@ def _parse_slas(raw: object) -> tuple[SLARule, ...]:
     return tuple(rules)
 
 
-def _parse_review(raw: object) -> ReviewConfig:
+def _parse_command(raw: object, name: str) -> CommandConfig:
     if raw is None:
-        return ReviewConfig()
+        return CommandConfig()
     if not isinstance(raw, dict):
-        raise ConfigError("review: expected a mapping")
+        raise ConfigError(f"{name}: expected a mapping")
     enabled = bool(raw.get("enabled", False))
     command = str(raw.get("command", "")).strip()
     if enabled and not command:
-        raise ConfigError("review.enabled is true but review.command is empty")
+        raise ConfigError(f"{name}.enabled is true but {name}.command is empty")
     working_dir = raw.get("working_dir")
     if working_dir is not None:
         working_dir = str(working_dir)
         if not Path(working_dir).is_dir():
-            raise ConfigError(f"review.working_dir does not exist: {working_dir}")
+            raise ConfigError(f"{name}.working_dir does not exist: {working_dir}")
     try:
         timeout = int(raw.get("timeout_seconds", 600))
     except (TypeError, ValueError):
-        raise ConfigError("review.timeout_seconds: expected an integer") from None
+        raise ConfigError(f"{name}.timeout_seconds: expected an integer") from None
     if timeout < 1:
-        raise ConfigError("review.timeout_seconds: must be >= 1")
-    return ReviewConfig(
+        raise ConfigError(f"{name}.timeout_seconds: must be >= 1")
+    return CommandConfig(
         enabled=enabled, command=command, working_dir=working_dir, timeout_seconds=timeout
     )
+
+
+def _parse_jira(raw: object) -> JiraConfig:
+    if raw is None:
+        return JiraConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("jira: expected a mapping")
+    base_url = raw.get("base_url")
+    if base_url is not None:
+        base_url = str(base_url).strip()
+    keys_raw = raw.get("project_keys", [])
+    if not isinstance(keys_raw, list):
+        raise ConfigError("jira.project_keys: expected a list of strings")
+    return JiraConfig(base_url=base_url or None, project_keys=tuple(str(k) for k in keys_raw))
 
 
 def _parse_waive(raw: object) -> WaiveConfig:
@@ -270,7 +299,9 @@ def load_config(path: str | Path) -> Config:
     calendar = _parse_calendar(_require(raw, "calendar", "config"))
     slas = _parse_slas(_require(raw, "slas", "config"))
     waive = _parse_waive(raw.get("waive"))
-    review = _parse_review(raw.get("review"))
+    review = _parse_command(raw.get("review"), "review")
+    qa = _parse_command(raw.get("qa"), "qa")
+    jira = _parse_jira(raw.get("jira"))
     gamification = raw.get("gamification") or {}
     if not isinstance(gamification, dict):
         raise ConfigError("gamification: expected a mapping")
@@ -282,6 +313,8 @@ def load_config(path: str | Path) -> Config:
         slas=slas,
         waive=waive,
         review=review,
+        qa=qa,
+        jira=jira,
         gamification=gamification,
     )
 

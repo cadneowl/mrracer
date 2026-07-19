@@ -98,6 +98,7 @@ def poll_once(db: Database, config: Config, source: MRSource) -> PollResult:
                 web_url=mr["web_url"],
                 source_branch=mr["source_branch"],
                 target_branch=mr["target_branch"],
+                description=mr["description"],
                 labels=mr["labels"],
                 draft=mr["draft"],
                 state=mr["state"],

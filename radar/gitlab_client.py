@@ -38,6 +38,7 @@ def normalize_mr(raw: dict) -> dict:
         "web_url": raw.get("web_url"),
         "source_branch": raw.get("source_branch"),
         "target_branch": raw.get("target_branch"),
+        "description": raw.get("description") or "",
         "labels": list(raw.get("labels", []) or []),
         "draft": bool(raw.get("draft", raw.get("work_in_progress", False))),
         "state": raw.get("state", "opened"),

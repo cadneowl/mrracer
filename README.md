@@ -82,6 +82,37 @@ authored by others — so the rendered markdown is HTML-sanitized against a stri
 allowlist (via `nh3`) before display: no `<script>`, event handlers, or
 `javascript:` URLs survive, while headings, code blocks, tables, and links do.
 
+### Launch a QA test plan from the board (shift-left)
+
+To involve QA on every MR, radar can generate a **manual QA test plan** (not unit
+tests) from the MR's linked Jira ticket(s), on demand. It works exactly like the
+review button — radar just launches your command:
+
+```yaml
+jira:
+  base_url: https://yourco.atlassian.net   # for the issue links
+  project_keys: [PROJ, BUG]                # optional filter
+
+qa:
+  enabled: true
+  command: 'claude -p "/qa-testplan {jira_keys}"'
+  working_dir: /path/to/checkout
+  timeout_seconds: 900
+```
+
+radar recognises Jira keys (`PROJ-123`) in each MR's **branch, title, and
+description**, shows them as links on the board, and passes them to the command
+via `{jira_keys}` (space-separated) / `{jira_keys_csv}`. Your `/qa-testplan`
+**skill** reads the ticket(s) itself and — since it already has Jira access — can
+write the plan back to Jira (a comment, or Xray/Zephyr test cases if you have
+them). radar keeps a copy: the generated plan is saved and shown on the board
+with a **✓ plan** badge that re-opens it, no re-run needed. **radar needs no Jira
+credentials** — the skill owns all Jira access.
+
+> radar provides the *infrastructure* (extraction, launch, storage, display);
+> the `/qa-testplan` skill is yours to write, like the review skill. Output is
+> sanitized and rendered the same way as reviews.
+
 ### Business-hours math
 
 SLA budgets are in **business hours**. Weekends and off-hours never burn budget.
