@@ -43,6 +43,15 @@ Rows are sorted **most-overdue first**, and the board auto-refreshes every 60s
 via htmx. Breach counts are surfaced at **team level only** — there is
 deliberately no per-person breach list on the main board.
 
+### Personal view (click-a-person)
+
+Click any reviewer — a name chip on the board, or a pill in the **VIEW** bar —
+to filter down to *the MRs waiting on them* (`/?view=<username>`). The choice is
+remembered in a `radar_view` cookie, so the board returns to that personal view
+on your next visit and across the 60s auto-refresh; **← back to team board**
+clears it. There is **no login**: the board holds no private data, so the cookie
+just stores a display preference, not an identity.
+
 ### Business-hours math
 
 SLA budgets are in **business hours**. Weekends and off-hours never burn budget.
