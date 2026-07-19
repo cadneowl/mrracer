@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 
+from ..coach import build_coach
 from ..commands import PLACEHOLDER_KEYS, CommandJob, CommandRunner
 from ..config import Config
 from ..db import Database
@@ -207,6 +208,19 @@ def create_app(config: Config, db_path: str) -> FastAPI:
             title=f"{plan['jira_keys']}", status="done", output=plan["content"],
         )
         return _panel(request, job, generated_at=plan["generated_at"])
+
+    @app.get("/coach", response_class=HTMLResponse)
+    def coach(request: Request):
+        with Database(db_path) as db:
+            data = build_coach(db, config)
+        data["poll_interval_minutes"] = config.gitlab.poll_interval_minutes
+        return templates.TemplateResponse(request, "coach.html", data)
+
+    @app.get("/coach/partial", response_class=HTMLResponse)
+    def coach_partial(request: Request):
+        with Database(db_path) as db:
+            data = build_coach(db, config)
+        return templates.TemplateResponse(request, "_coach.html", data)
 
     @app.get("/healthz")
     def healthz():

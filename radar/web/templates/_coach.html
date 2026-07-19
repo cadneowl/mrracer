@@ -1,0 +1,48 @@
+{# Polled partial: team summary + per-reviewer breach detail. #}
+<section class="summary">
+  <div class="stat"><span class="num">{{ team.reviewers }}</span><span class="lbl">reviewers</span></div>
+  <div class="stat stat-red"><span class="num">{{ team.open_breaches }}</span><span class="lbl">open breaches</span></div>
+  <div class="stat stat-amber"><span class="num">{{ team.open_at_risk }}</span><span class="lbl">at risk</span></div>
+  <div class="stat stat-green">
+    <span class="num">{{ team.compliance_pct if team.compliance_pct is not none else "—" }}{% if team.compliance_pct is not none %}%{% endif %}</span>
+    <span class="lbl">SLA compliance</span>
+  </div>
+  <div class="stat"><span class="num">{{ team.chronic }}</span><span class="lbl">chronic</span></div>
+</section>
+
+{% if reviewers %}
+<div class="coach-grid">
+  {% for r in reviewers %}
+  <section class="coach-card {% if r.chronic %}coach-card-chronic{% endif %}">
+    <div class="coach-head">
+      <span class="coach-name">{{ r.username }}</span>
+      {% if r.chronic %}<span class="chronic-badge">chronic · {{ r.breach_rate_pct }}% breach</span>{% endif %}
+    </div>
+    <div class="coach-stats">
+      <div class="cstat"><b class="{% if r.open_breach_count %}bad{% endif %}">{{ r.open_breach_count }}</b> open breach{{ "" if r.open_breach_count == 1 else "es" }}</div>
+      <div class="cstat"><b>{{ r.open_at_risk }}</b> at risk</div>
+      <div class="cstat"><b>{{ r.compliance_pct if r.compliance_pct is not none else "—" }}{% if r.compliance_pct is not none %}%{% endif %}</b> compliance</div>
+      <div class="cstat"><b>{{ r.median_first_response if r.median_first_response is not none else "—" }}{% if r.median_first_response is not none %}h{% endif %}</b> median 1st resp</div>
+      <div class="cstat"><b>{{ r.p90_first_response if r.p90_first_response is not none else "—" }}{% if r.p90_first_response is not none %}h{% endif %}</b> p90</div>
+      <div class="cstat"><b>{{ r.open_load }}</b> open load</div>
+    </div>
+    {% if r.open_breaches %}
+    <ul class="breach-list">
+      {% for b in r.open_breaches %}
+      <li>
+        {% if b.web_url %}<a href="{{ b.web_url }}" target="_blank" rel="noopener">{{ b.title }}</a>
+        {% else %}<span>{{ b.title }}</span>{% endif %}
+        <span class="mrid">!{{ b.mr_iid }}</span>
+        <span class="overdue">{{ b.overdue_hours }}h over</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty">No reviewer activity yet. Run <code>radar poll-once</code> to fetch from GitLab.</div>
+{% endif %}
+
+<p class="gen">generated {{ generated_at.strftime("%Y-%m-%d %H:%M:%S UTC") }}</p>

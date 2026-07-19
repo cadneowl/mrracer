@@ -83,6 +83,7 @@ class ObligationState:
     within_sla: bool | None
     thread_count: int
     urgency: float  # ascending sort key; most-overdue (most negative) first
+    first_response_hours: float | None = None  # business hours requested -> first response
 
     def to_record(self) -> dict:
         return {
@@ -232,6 +233,24 @@ def _color_for_fraction(fraction: float) -> str:
 
 
 def _derive_one(
+    obl: Obligation,
+    config: Config,
+    snapshot: dict,
+    mr_waiver: str | None,
+    now: datetime,
+) -> ObligationState:
+    state = _compute_state(obl, config, snapshot, mr_waiver, now)
+    if obl.first_response_at is not None:
+        state.first_response_hours = business_hours_between(
+            obl.requested_at,
+            obl.first_response_at,
+            config.calendar.calendar,
+            config.calendar.tz_for(obl.reviewer),
+        )
+    return state
+
+
+def _compute_state(
     obl: Obligation,
     config: Config,
     snapshot: dict,

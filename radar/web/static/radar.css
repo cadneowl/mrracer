@@ -160,3 +160,22 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 
 .gen { color: var(--muted); font-size: 11px; margin-top: 12px; }
 .foot { color: var(--muted); font-size: 12px; padding: 12px 22px; border-top: 1px solid var(--line); }
+.foot-link { color: var(--muted); text-decoration: none; }
+.foot-link:hover { color: var(--text); text-decoration: underline; }
+
+/* Coach view */
+.coach-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
+.coach-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.coach-card-chronic { border-color: var(--red); }
+.coach-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.coach-name { font-weight: 700; font-size: 15px; }
+.chronic-badge { font-size: 11px; color: var(--red); border: 1px solid var(--red);
+  border-radius: 20px; padding: 1px 8px; text-transform: uppercase; letter-spacing: .3px; }
+.coach-stats { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); }
+.coach-stats .cstat b { color: var(--text); font-size: 14px; }
+.coach-stats .cstat b.bad { color: var(--red); }
+.breach-list { list-style: none; margin: 12px 0 0; padding: 10px 0 0; border-top: 1px solid var(--line); font-size: 13px; }
+.breach-list li { padding: 3px 0; }
+.breach-list a { color: var(--text); text-decoration: none; font-weight: 600; }
+.breach-list a:hover { text-decoration: underline; }
+.breach-list .overdue { color: var(--red); font-weight: 600; margin-left: 6px; }
