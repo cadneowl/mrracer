@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import markdown as md
+import nh3
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,9 +29,34 @@ COOKIE_NAME = "radar_view"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365  # 1 year
 
 
+# Review output is untrusted HTML: it comes from an external command whose
+# input includes attacker-influenceable MR content (diffs, titles, comments).
+# So we render markdown, then sanitize the resulting HTML against a strict
+# allowlist before marking it safe — no <script>, event handlers, or js: URLs.
+_ALLOWED_TAGS = {
+    "a", "p", "br", "hr", "pre", "code", "blockquote", "em", "strong", "del", "ins",
+    "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "thead", "tbody", "tr", "th", "td", "span",
+}
+_ALLOWED_ATTRS = {
+    "a": {"href", "title"},
+    "code": {"class"},
+    "span": {"class"},
+    "pre": {"class"},
+    "th": {"align"},
+    "td": {"align"},
+}
+
+
 def _render_markdown(text: str) -> Markup:
     html = md.markdown(text, extensions=["fenced_code", "tables", "sane_lists"])
-    return Markup(html)
+    clean = nh3.clean(
+        html,
+        tags=_ALLOWED_TAGS,
+        attributes=_ALLOWED_ATTRS,
+        url_schemes={"http", "https", "mailto"},
+    )
+    return Markup(clean)
 
 
 def create_app(config: Config, db_path: str) -> FastAPI:

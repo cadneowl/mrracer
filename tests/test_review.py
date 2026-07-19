@@ -12,7 +12,7 @@ from radar.config import ReviewConfig, load_config
 from radar.db import Database
 from radar.events import EventType as ET
 from radar.review import ReviewRunner, build_argv
-from radar.web.app import create_app
+from radar.web.app import _render_markdown, create_app
 from tests.conftest import ev, ny
 
 # Quoted interpreter path so a Windows path with spaces/backslashes stays one
@@ -41,6 +41,30 @@ def test_build_argv_preserves_interpreter_path():
     argv = build_argv(f'{PY} -c "print(1)"', {})
     assert argv[0] == sys.executable
     assert argv[1:] == ["-c", "print(1)"]
+
+
+# --- markdown sanitization (review output is untrusted) --------------------
+
+
+def test_render_strips_script_but_keeps_markdown():
+    html = str(_render_markdown("# Title\n\n<script>alert(document.cookie)</script>\n\n**bold**"))
+    assert "<script>" not in html and "alert(document.cookie)" not in html
+    assert "<h1>" in html and "<strong>bold</strong>" in html
+
+
+def test_render_strips_event_handlers_and_js_urls():
+    html = str(
+        _render_markdown('<img src=x onerror="alert(1)">\n\n[click](javascript:alert(1))')
+    )
+    assert "onerror" not in html
+    assert "javascript:" not in html
+
+
+def test_render_keeps_code_blocks_verbatim():
+    # A code review is full of angle brackets; they must render, not corrupt.
+    html = str(_render_markdown("```python\nif a < b and c > d:\n    pass\n```"))
+    assert "<pre>" in html or "<code>" in html
+    assert "a &lt; b" in html and "c &gt; d" in html
 
 
 # --- runner lifecycle ------------------------------------------------------

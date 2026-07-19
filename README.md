@@ -73,6 +73,11 @@ template is tokenized *before* substitution — so an MR field can never inject
 extra arguments. Reviews run as background jobs; the modal polls until done. The
 result is shown in the dashboard only (nothing is written back to GitLab).
 
+The command's stdout is treated as **untrusted** — it can quote MR content
+authored by others — so the rendered markdown is HTML-sanitized against a strict
+allowlist (via `nh3`) before display: no `<script>`, event handlers, or
+`javascript:` URLs survive, while headings, code blocks, tables, and links do.
+
 ### Business-hours math
 
 SLA budgets are in **business hours**. Weekends and off-hours never burn budget.
