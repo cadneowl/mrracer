@@ -91,11 +91,20 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
   background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; }
 .empty code, .foot code, .gen code { background: var(--panel-2); padding: 1px 6px; border-radius: 5px; }
 
+.tag-jira { color: #7aa2f7; border-color: #2d3f66; font-weight: 600; text-decoration: none; }
+.tag-jira:hover { border-color: #7aa2f7; }
+
+.row-actions { display: inline-flex; gap: 6px; margin-left: 8px; vertical-align: middle; }
 .review-btn {
-  margin-left: 8px; padding: 2px 9px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  padding: 2px 9px; border-radius: 6px; font-size: 12px; cursor: pointer;
   background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
 }
 .review-btn:hover { border-color: var(--green); color: var(--green); }
+.plan-badge {
+  padding: 2px 9px; border-radius: 6px; font-size: 12px; text-decoration: none;
+  background: rgba(34,197,94,.12); color: var(--green); border: 1px solid var(--green); cursor: pointer;
+}
+.modal-title .stamp { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 8px; }
 
 /* Review modal */
 .modal-overlay {
@@ -124,6 +133,8 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.save-warn { color: var(--amber); border: 1px solid var(--amber); border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 12px; font-size: 13px; }
 .review-error strong { color: var(--red); }
 .review-error pre, .review-output pre {
   background: var(--bg); border: 1px solid var(--line); border-radius: 8px;

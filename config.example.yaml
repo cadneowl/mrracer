@@ -58,6 +58,24 @@ review:
   working_dir: null          # run the command here (e.g. a repo checkout); null = radar's CWD
   timeout_seconds: 600
 
+# Jira association. radar recognises issue keys (PROJ-123) in each MR's branch,
+# title, and description, shows them as links on the board, and passes them to
+# the QA test-plan command. base_url builds the browse links; project_keys is
+# an optional filter so unrelated keys aren't picked up.
+jira:
+  base_url: https://yourco.atlassian.net
+  project_keys: [PROJ, BUG]
+
+# Launch a QA test-plan generator for an MR from a button on the dashboard.
+# Same shape as `review`. Extra placeholders: {jira_keys} (space-separated) and
+# {jira_keys_csv}. The skill fetches the ticket(s) itself and can write the plan
+# back to Jira; radar keeps a copy and shows it on the board.
+qa:
+  enabled: false
+  command: 'claude -p "/qa-testplan {jira_keys}"'
+  working_dir: null
+  timeout_seconds: 900
+
 # Gamification config is consumed in Phase 3; kept here so the file is stable.
 gamification:
   points:

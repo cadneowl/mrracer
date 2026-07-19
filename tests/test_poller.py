@@ -45,7 +45,7 @@ def _diff_thread(note_id, author, body, at):
     }
 
 
-def _mr(reviewers, updated_at="2026-03-02T11:05:00Z"):
+def _mr(reviewers, updated_at="2026-03-02T11:05:00Z", state="opened"):
     return {
         "project_id": PID,
         "iid": 1,
@@ -56,7 +56,7 @@ def _mr(reviewers, updated_at="2026-03-02T11:05:00Z"):
         "target_branch": "main",
         "labels": [],
         "draft": False,
-        "state": "opened",
+        "state": state,
         "reviewers": [{"username": r} for r in reviewers],
         "created_at": "2026-03-02T09:00:00Z",
         "updated_at": updated_at,
@@ -140,6 +140,27 @@ def test_reviewer_reconciliation(config, tmp_path):
         if e.event_type == ET.REVIEW_REQUESTED and e.reviewer == "maya"
     ]
     assert len(reqs) == 1
+    db.close()
+
+
+def test_merged_mr_resolves_and_leaves_board(config, tmp_path):
+    db = Database(tmp_path / "r.db")
+    # First poll: MR is open (sets the high-water mark).
+    poll_once(db, config, _source())
+    assert build_dashboard(db, config)["open_mrs"] == 1
+
+    # Next poll sees it merged (state='all' fetch): a terminal event is emitted,
+    # the snapshot flips to 'merged', and it drops off the board.
+    merged = FixtureSource(
+        mrs_by_project={PROJECT: [_mr(["dan"], updated_at="2026-03-03T09:00:00Z", state="merged")]},
+        discussions_by_mr={(PID, 1): _discussions()},
+    )
+    poll_once(db, config, merged)
+
+    assert db.get_snapshot(PID, 1)["state"] == "merged"
+    types = {e.event_type for e in db.iter_events(PID, 1)}
+    assert ET.MR_MERGED in types
+    assert build_dashboard(db, config)["open_mrs"] == 0
     db.close()
 
 

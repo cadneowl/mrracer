@@ -129,6 +129,23 @@ def test_author_note_also_resumes_clock(config):
     assert st.elapsed_hours == 3.0
 
 
+def test_late_approval_breaches_approval_sla(config):
+    # Fast first response, but the reviewer sits on the approval far past the
+    # approval budget (24h default) -> within_sla must be False, and the
+    # recorded elapsed reflects the approval-phase reviewer-owed hours.
+    events = [
+        ev(ET.REVIEW_REQUESTED, ny(2026, 3, 2, 9), reviewer="dan"),
+        ev(ET.CHANGES_REQUESTED, ny(2026, 3, 2, 10), reviewer="dan"),  # 1h first response
+        ev(ET.COMMITS_PUSHED, ny(2026, 3, 2, 11), actor="aviva"),      # ball back to dan
+        ev(ET.APPROVAL_ADDED, ny(2026, 3, 5, 12), reviewer="dan"),     # Thu — very late
+    ]
+    st = _one(events, config, now=ny(2026, 3, 6, 9))
+    assert st.phase == "resolved"
+    # Mon 11-18 (7) + Tue 9-18 (9) + Wed 9-18 (9) + Thu 9-12 (3) = 28h
+    assert st.elapsed_hours == 28.0
+    assert st.within_sla is False
+
+
 def test_full_cycle_ends_on_approval(config):
     events = [
         ev(ET.REVIEW_REQUESTED, ny(2026, 3, 2, 9), reviewer="dan"),

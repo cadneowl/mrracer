@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS mr_snapshots (
     web_url        TEXT,
     source_branch  TEXT,
     target_branch  TEXT,
+    description    TEXT NOT NULL DEFAULT '',
     labels         TEXT NOT NULL DEFAULT '[]',
     draft          INTEGER NOT NULL DEFAULT 0,
     state          TEXT NOT NULL DEFAULT 'opened',
@@ -52,6 +53,15 @@ CREATE TABLE IF NOT EXISTS mr_snapshots (
     created_at     TEXT,
     updated_at     TEXT,
     last_polled_at TEXT,
+    PRIMARY KEY (project_id, mr_iid)
+);
+
+CREATE TABLE IF NOT EXISTS test_plans (
+    project_id   INTEGER NOT NULL,
+    mr_iid       INTEGER NOT NULL,
+    jira_keys    TEXT NOT NULL DEFAULT '',
+    content      TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
     PRIMARY KEY (project_id, mr_iid)
 );
 
@@ -91,14 +101,27 @@ class Database:
     def __init__(self, path: str | Path):
         self.path = str(path)
         self.conn = sqlite3.connect(self.path)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.init_schema()
+        try:
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.init_schema()
+        except Exception:
+            self.conn.close()  # don't leak the handle if setup/migration fails
+            raise
 
     def init_schema(self) -> None:
         self.conn.executescript(_SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a DB was first created."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(mr_snapshots)")}
+        if "description" not in cols:
+            self.conn.execute(
+                "ALTER TABLE mr_snapshots ADD COLUMN description TEXT NOT NULL DEFAULT ''"
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -173,6 +196,7 @@ class Database:
         web_url: str | None,
         source_branch: str | None,
         target_branch: str | None,
+        description: str,
         labels: list[str],
         draft: bool,
         state: str,
@@ -184,14 +208,14 @@ class Database:
             """
             INSERT INTO mr_snapshots
                 (project_id, mr_iid, title, author, web_url, source_branch,
-                 target_branch, labels, draft, state, reviewers,
+                 target_branch, description, labels, draft, state, reviewers,
                  created_at, updated_at, last_polled_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, mr_iid) DO UPDATE SET
                 title=excluded.title, author=excluded.author, web_url=excluded.web_url,
                 source_branch=excluded.source_branch, target_branch=excluded.target_branch,
-                labels=excluded.labels, draft=excluded.draft, state=excluded.state,
-                reviewers=excluded.reviewers, created_at=excluded.created_at,
+                description=excluded.description, labels=excluded.labels, draft=excluded.draft,
+                state=excluded.state, reviewers=excluded.reviewers, created_at=excluded.created_at,
                 updated_at=excluded.updated_at, last_polled_at=excluded.last_polled_at
             """,
             (
@@ -202,6 +226,7 @@ class Database:
                 web_url,
                 source_branch,
                 target_branch,
+                description or "",
                 json.dumps(labels),
                 1 if draft else 0,
                 state,
@@ -212,6 +237,28 @@ class Database:
             ),
         )
         self.conn.commit()
+
+    # --- QA test plans -----------------------------------------------------
+
+    def save_test_plan(self, project_id: int, mr_iid: int, jira_keys: str, content: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO test_plans (project_id, mr_iid, jira_keys, content, generated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, mr_iid) DO UPDATE SET
+                jira_keys=excluded.jira_keys, content=excluded.content,
+                generated_at=excluded.generated_at
+            """,
+            (project_id, mr_iid, jira_keys, content, _now_utc_iso()),
+        )
+        self.conn.commit()
+
+    def get_test_plan(self, project_id: int, mr_iid: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM test_plans WHERE project_id=? AND mr_iid=?",
+            (project_id, mr_iid),
+        ).fetchone()
+        return dict(row) if row else None
 
     def get_snapshot(self, project_id: int, mr_iid: int) -> dict | None:
         row = self.conn.execute(

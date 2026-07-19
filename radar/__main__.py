@@ -86,6 +86,9 @@ def cmd_serve(args) -> int:
         log.warning("serving read-only from existing data; set GITLAB_URL/GITLAB_TOKEN to poll")
 
     try:
+        # Single worker on purpose: the poller (APScheduler) and the in-memory
+        # command-job registry live in this process. Running multiple workers
+        # would start N pollers and split job state across processes.
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     finally:
         if scheduler is not None:

@@ -17,7 +17,10 @@ def match_sla(config: Config, target_branch: str | None, labels: list[str]) -> S
     label_set = set(labels)
     for rule in config.slas:
         m = rule.match
-        if m.target_branch is not None and not fnmatch.fnmatch(
+        # fnmatchcase, not fnmatch: git branch names are case-sensitive, but
+        # fnmatch normalises case on Windows (os.path.normcase), which would
+        # make rule selection OS-dependent.
+        if m.target_branch is not None and not fnmatch.fnmatchcase(
             target_branch or "", m.target_branch
         ):
             continue

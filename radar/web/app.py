@@ -17,10 +17,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 
+from ..commands import PLACEHOLDER_KEYS, CommandJob, CommandRunner
 from ..config import Config
 from ..db import Database
-from ..review import PLACEHOLDER_KEYS, ReviewRunner
+from ..jira import extract_keys
 from ..service import build_dashboard
+
+_KINDS = {"review": "AI review", "qa": "QA test plan"}
 
 _BASE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(_BASE / "templates"))
@@ -62,24 +65,43 @@ def _render_markdown(text: str) -> Markup:
 def create_app(config: Config, db_path: str) -> FastAPI:
     app = FastAPI(title="radar", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=str(_BASE / "static")), name="static")
-    runner = ReviewRunner(config.review)
+    runners = {
+        "review": CommandRunner(config.review, "review"),
+        "qa": CommandRunner(config.qa, "qa"),
+    }
+    enabled = {"review": config.review.enabled, "qa": config.qa.enabled}
 
     def context(reviewer: str | None) -> dict:
         with Database(db_path) as db:
             data = build_dashboard(db, config, reviewer=reviewer)
         data["poll_interval_minutes"] = config.gitlab.poll_interval_minutes
         data["review_enabled"] = config.review.enabled
+        data["qa_enabled"] = config.qa.enabled
         return data
 
-    def _job_panel(request: Request, job) -> HTMLResponse:
+    def _panel(request: Request, job, generated_at: str | None = None) -> HTMLResponse:
         return templates.TemplateResponse(
             request,
-            "_review_panel.html",
+            "_command_panel.html",
             {
                 "job": job,
+                "kind": job.kind,
+                "heading": _KINDS.get(job.kind, job.kind),
+                "generated_at": generated_at,
                 "output_html": _render_markdown(job.output) if job.status == "done" else None,
             },
         )
+
+    def _ctx_for(snap: dict, project_id: int, mr_iid: int) -> tuple[dict, list[str]]:
+        keys = extract_keys(
+            [snap.get("title"), snap.get("source_branch"), snap.get("description")],
+            config.jira.project_keys,
+        )
+        ctx = {"project_id": project_id, "mr_iid": mr_iid}
+        ctx.update({k: snap.get(k, "") for k in PLACEHOLDER_KEYS})
+        ctx["jira_keys"] = " ".join(keys)
+        ctx["jira_keys_csv"] = ",".join(keys)
+        return ctx, keys
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request, view: str | None = None):
@@ -102,29 +124,51 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         reviewer = request.cookies.get(COOKIE_NAME) or None
         return templates.TemplateResponse(request, "_board.html", context(reviewer))
 
-    @app.post("/review/{project_id}/{mr_iid}", response_class=HTMLResponse)
-    def start_review(request: Request, project_id: int, mr_iid: int):
-        if not config.review.enabled:
-            raise HTTPException(status_code=404, detail="review is not enabled")
+    @app.post("/{kind}/{project_id}/{mr_iid}", response_class=HTMLResponse)
+    def start_command(request: Request, kind: str, project_id: int, mr_iid: int):
+        if kind not in runners or not enabled[kind]:
+            raise HTTPException(status_code=404, detail=f"{kind} is not enabled")
         with Database(db_path) as db:
             snap = db.get_snapshot(project_id, mr_iid)
         if snap is None:
             raise HTTPException(status_code=404, detail="unknown merge request")
-        ctx = {"project_id": project_id, "mr_iid": mr_iid}
-        ctx.update({k: snap.get(k, "") for k in PLACEHOLDER_KEYS})
-        job = runner.start(ctx)
-        return _job_panel(request, job)
+        ctx, keys = _ctx_for(snap, project_id, mr_iid)
 
-    @app.get("/review/status/{job_id}", response_class=HTMLResponse)
-    def review_status(request: Request, job_id: str):
-        job = runner.get(job_id)
+        on_success = None
+        if kind == "qa":
+            csv = ",".join(keys)
+
+            def on_success(job) -> None:
+                with Database(db_path) as db:
+                    db.save_test_plan(project_id, mr_iid, csv, job.output)
+
+        job = runners[kind].start(ctx, on_success=on_success)
+        return _panel(request, job)
+
+    @app.get("/{kind}/status/{job_id}", response_class=HTMLResponse)
+    def command_status(request: Request, kind: str, job_id: str):
+        if kind not in runners:
+            raise HTTPException(status_code=404, detail="unknown kind")
+        job = runners[kind].get(job_id)
         if job is None:
-            raise HTTPException(status_code=404, detail="unknown review job")
-        return _job_panel(request, job)
+            raise HTTPException(status_code=404, detail="unknown job")
+        return _panel(request, job)
 
-    @app.get("/review/close", response_class=HTMLResponse)
-    def review_close():
+    @app.get("/{kind}/close", response_class=HTMLResponse)
+    def command_close(kind: str):
         return HTMLResponse("")  # htmx swaps this empty content in to dismiss
+
+    @app.get("/qa/stored/{project_id}/{mr_iid}", response_class=HTMLResponse)
+    def stored_plan(request: Request, project_id: int, mr_iid: int):
+        with Database(db_path) as db:
+            plan = db.get_test_plan(project_id, mr_iid)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="no stored test plan")
+        job = CommandJob(
+            id="stored", kind="qa", project_id=project_id, mr_iid=mr_iid,
+            title=f"{plan['jira_keys']}", status="done", output=plan["content"],
+        )
+        return _panel(request, job, generated_at=plan["generated_at"])
 
     @app.get("/healthz")
     def healthz():

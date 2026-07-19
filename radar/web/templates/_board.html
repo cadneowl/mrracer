@@ -42,17 +42,38 @@
     {% for row in rows %}
     <tr>
       <td class="col-mr">
-        <a href="{{ row.web_url }}" target="_blank" rel="noopener">{{ row.title }}</a>
+        {% if row.web_url %}<a href="{{ row.web_url }}" target="_blank" rel="noopener">{{ row.title }}</a>
+        {% else %}<span class="mr-title">{{ row.title }}</span>{% endif %}
         <span class="mrid">!{{ row.mr_iid }}</span>
         {% if row.draft %}<span class="tag tag-draft">draft</span>{% endif %}
         {% for label in row.labels %}<span class="tag">{{ label }}</span>{% endfor %}
+        {% for j in row.jira %}
+          {% if j.url %}<a class="tag tag-jira" href="{{ j.url }}" target="_blank" rel="noopener">{{ j.key }}</a>
+          {% else %}<span class="tag tag-jira">{{ j.key }}</span>{% endif %}
+        {% endfor %}
+        <span class="row-actions">
         {% if review_enabled %}
         <button class="review-btn"
                 hx-post="/review/{{ row.project_id }}/{{ row.mr_iid }}"
-                hx-target="#review-panel"
+                hx-target="#command-panel"
                 hx-swap="innerHTML"
                 title="Run your AI code-review skill on this MR">🔍 review</button>
         {% endif %}
+        {% if qa_enabled %}
+        <button class="review-btn"
+                hx-post="/qa/{{ row.project_id }}/{{ row.mr_iid }}"
+                hx-target="#command-panel"
+                hx-swap="innerHTML"
+                title="Generate a QA test plan from the linked Jira ticket(s)">🧪 QA plan</button>
+        {% endif %}
+        {% if row.has_plan %}
+        <a class="plan-badge"
+           hx-get="/qa/stored/{{ row.project_id }}/{{ row.mr_iid }}"
+           hx-target="#command-panel"
+           hx-swap="innerHTML"
+           href="#" title="View the last saved QA test plan">✓ plan</a>
+        {% endif %}
+        </span>
       </td>
       <td class="muted">{{ row.author or "—" }}</td>
       <td class="muted">{{ row.target_branch or "—" }}</td>

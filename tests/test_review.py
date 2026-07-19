@@ -9,10 +9,10 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from radar.commands import CommandError, CommandRunner, build_argv
 from radar.config import ReviewConfig, load_config
 from radar.db import Database
 from radar.events import EventType as ET
-from radar.review import ReviewCommandError, ReviewRunner, build_argv
 from radar.web.app import _render_markdown, create_app
 from tests.conftest import ev, ny
 
@@ -47,7 +47,7 @@ def test_build_argv_preserves_interpreter_path():
 def test_build_argv_rejects_flag_smuggling():
     # A standalone placeholder token whose value starts with '-' is a flag-
     # smuggling attempt via attacker-influenced MR metadata (e.g. the title).
-    with pytest.raises(ReviewCommandError):
+    with pytest.raises(CommandError):
         build_argv("mytool {title}", {"title": "--upload-file=/etc/passwd"})
 
 
@@ -65,7 +65,7 @@ def test_build_argv_allows_literal_flags():
 
 def test_runner_reports_flag_smuggling_as_job_error():
     cfg = ReviewConfig(enabled=True, command="mytool {title}", timeout_seconds=30)
-    runner = ReviewRunner(cfg)
+    runner = CommandRunner(cfg, "review")
     job = runner.start({"project_id": 1, "mr_iid": 2, "title": "-rf"})
     assert job.status == "error"
     assert "flag" in job.error
@@ -110,26 +110,65 @@ def _await(runner, job, timeout=15.0):
 
 def test_runner_captures_stdout():
     cfg = ReviewConfig(enabled=True, command=f'{PY} -c "print(chr(35),42)"', timeout_seconds=30)
-    runner = ReviewRunner(cfg)
+    runner = CommandRunner(cfg, "review")
     job = runner.start({"project_id": 1, "mr_iid": 2, "title": "T"})
     done = _await(runner, job)
     assert done.status == "done"
     assert "42" in done.output
 
 
+def test_runner_captures_utf8_output():
+    # Markdown plans contain arrows/em-dashes/emoji; radar must decode UTF-8
+    # regardless of the OS locale (Windows defaults to cp1252).
+    cmd = f"{PY} -c \"print('café → test')\""
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    job = runner.start({"project_id": 1, "mr_iid": 2})
+    done = _await(runner, job)
+    assert done.status == "done"
+    assert "café → test" in done.output
+
+
 def test_runner_reports_error_on_nonzero():
     cmd = f'{PY} -c "import sys; sys.exit(3)"'
     cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=30)
-    runner = ReviewRunner(cfg)
+    runner = CommandRunner(cfg, "review")
     job = runner.start({"project_id": 1, "mr_iid": 2})
     done = _await(runner, job)
     assert done.status == "error"
     assert done.returncode == 3
 
 
+def test_child_env_excludes_gitlab_token(monkeypatch):
+    # The skill subprocess must NOT inherit the GitLab PAT.
+    monkeypatch.setenv("GITLAB_TOKEN", "super-secret-pat")
+    cmd = f"{PY} -c \"import os; print(os.environ.get('GITLAB_TOKEN', 'ABSENT'))\""
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.status == "done"
+    assert "ABSENT" in done.output
+    assert "super-secret-pat" not in done.output
+
+
+def test_runner_catchall_sets_terminal_state(monkeypatch):
+    # An unexpected error in the worker must not strand the job in "running".
+    from radar import commands
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(commands.subprocess, "run", boom)
+    cfg = ReviewConfig(enabled=True, command=f'{PY} -c "print(1)"', timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.status == "error"
+    assert "unexpected error" in done.error
+
+
 def test_runner_missing_command():
     cfg = ReviewConfig(enabled=True, command="definitely-not-a-real-binary-xyz", timeout_seconds=30)
-    runner = ReviewRunner(cfg)
+    runner = CommandRunner(cfg, "review")
     job = runner.start({"project_id": 1, "mr_iid": 2})
     done = _await(runner, job)
     assert done.status == "error"
@@ -167,7 +206,7 @@ def _seed(db):
     db.upsert_mr_snapshot(
         project_id=1, mr_iid=7, title="Add widget", author="aviva",
         web_url="https://gitlab.example.com/g/p/-/merge_requests/7",
-        source_branch="f", target_branch="main", labels=[], draft=False,
+        source_branch="f", target_branch="main", description="", labels=[], draft=False,
         state="opened", reviewers=["dan"], created_at="2026-03-02T09:00:00Z",
         updated_at="2026-03-02T09:00:00Z",
     )
