@@ -46,6 +46,18 @@ waive:
   draft: true
   labels: ["blocked", "do-not-review"]
 
+# Launch an AI code-review command for an MR from a button on the dashboard.
+# The command is a template; radar fills placeholders and runs it locally
+# (shell=False), then shows stdout as the rendered review. Available
+# placeholders: {web_url} {mr_iid} {project_id} {source_branch}
+# {target_branch} {title} {author}.
+review:
+  enabled: false
+  # Example: invoke a prepared Claude Code skill headlessly.
+  command: 'claude -p "/code-review {web_url}"'
+  working_dir: null          # run the command here (e.g. a repo checkout); null = radar's CWD
+  timeout_seconds: 600
+
 # Gamification config is consumed in Phase 3; kept here so the file is stable.
 gamification:
   points:

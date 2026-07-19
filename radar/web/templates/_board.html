@@ -46,6 +46,13 @@
         <span class="mrid">!{{ row.mr_iid }}</span>
         {% if row.draft %}<span class="tag tag-draft">draft</span>{% endif %}
         {% for label in row.labels %}<span class="tag">{{ label }}</span>{% endfor %}
+        {% if review_enabled %}
+        <button class="review-btn"
+                hx-post="/review/{{ row.project_id }}/{{ row.mr_iid }}"
+                hx-target="#review-panel"
+                hx-swap="innerHTML"
+                title="Run your AI code-review skill on this MR">🔍 review</button>
+        {% endif %}
       </td>
       <td class="muted">{{ row.author or "—" }}</td>
       <td class="muted">{{ row.target_branch or "—" }}</td>

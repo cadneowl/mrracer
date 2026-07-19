@@ -63,12 +63,23 @@ class WaiveConfig:
 
 
 @dataclass(frozen=True)
+class ReviewConfig:
+    """Launch an external AI code-review command for an MR from the dashboard."""
+
+    enabled: bool = False
+    command: str = ""
+    working_dir: str | None = None
+    timeout_seconds: int = 600
+
+
+@dataclass(frozen=True)
 class Config:
     gitlab: GitLabSettings
     database_path: Path
     calendar: CalendarConfig
     slas: tuple[SLARule, ...]
     waive: WaiveConfig
+    review: ReviewConfig
     gamification: dict  # consumed in Phase 3; carried verbatim for now
 
 
@@ -184,6 +195,31 @@ def _parse_slas(raw: object) -> tuple[SLARule, ...]:
     return tuple(rules)
 
 
+def _parse_review(raw: object) -> ReviewConfig:
+    if raw is None:
+        return ReviewConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("review: expected a mapping")
+    enabled = bool(raw.get("enabled", False))
+    command = str(raw.get("command", "")).strip()
+    if enabled and not command:
+        raise ConfigError("review.enabled is true but review.command is empty")
+    working_dir = raw.get("working_dir")
+    if working_dir is not None:
+        working_dir = str(working_dir)
+        if not Path(working_dir).is_dir():
+            raise ConfigError(f"review.working_dir does not exist: {working_dir}")
+    try:
+        timeout = int(raw.get("timeout_seconds", 600))
+    except (TypeError, ValueError):
+        raise ConfigError("review.timeout_seconds: expected an integer") from None
+    if timeout < 1:
+        raise ConfigError("review.timeout_seconds: must be >= 1")
+    return ReviewConfig(
+        enabled=enabled, command=command, working_dir=working_dir, timeout_seconds=timeout
+    )
+
+
 def _parse_waive(raw: object) -> WaiveConfig:
     if raw is None:
         return WaiveConfig()
@@ -234,6 +270,7 @@ def load_config(path: str | Path) -> Config:
     calendar = _parse_calendar(_require(raw, "calendar", "config"))
     slas = _parse_slas(_require(raw, "slas", "config"))
     waive = _parse_waive(raw.get("waive"))
+    review = _parse_review(raw.get("review"))
     gamification = raw.get("gamification") or {}
     if not isinstance(gamification, dict):
         raise ConfigError("gamification: expected a mapping")
@@ -244,6 +281,7 @@ def load_config(path: str | Path) -> Config:
         calendar=calendar,
         slas=slas,
         waive=waive,
+        review=review,
         gamification=gamification,
     )
 

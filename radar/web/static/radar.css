@@ -91,5 +91,50 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
   background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; }
 .empty code, .foot code, .gen code { background: var(--panel-2); padding: 1px 6px; border-radius: 5px; }
 
+.review-btn {
+  margin-left: 8px; padding: 2px 9px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+}
+.review-btn:hover { border-color: var(--green); color: var(--green); }
+
+/* Review modal */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 50;
+  display: flex; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto;
+}
+.modal {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  width: min(860px, 100%); max-height: 85vh; display: flex; flex-direction: column;
+  box-shadow: 0 20px 60px rgba(0,0,0,.5);
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; border-bottom: 1px solid var(--line);
+}
+.modal-title { font-weight: 600; }
+.modal-close { color: var(--muted); text-decoration: none; font-size: 18px; padding: 0 6px; }
+.modal-close:hover { color: var(--text); }
+.modal-body { padding: 18px; overflow-y: auto; }
+
+.review-loading { color: var(--muted); display: flex; align-items: center; gap: 10px; padding: 20px 0; }
+.spinner {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid var(--line); border-top-color: var(--green);
+  display: inline-block; animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.review-error strong { color: var(--red); }
+.review-error pre, .review-output pre {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px; overflow-x: auto; white-space: pre-wrap; font-size: 13px;
+}
+.review-output { line-height: 1.6; }
+.review-output h1, .review-output h2, .review-output h3 { margin: 18px 0 8px; }
+.review-output code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+.review-output pre code { background: none; padding: 0; }
+.review-output table { border-collapse: collapse; }
+.review-output th, .review-output td { border: 1px solid var(--line); padding: 6px 10px; }
+
 .gen { color: var(--muted); font-size: 11px; margin-top: 12px; }
 .foot { color: var(--muted); font-size: 12px; padding: 12px 22px; border-top: 1px solid var(--line); }
