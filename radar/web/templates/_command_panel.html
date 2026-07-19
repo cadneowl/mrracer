@@ -14,13 +14,37 @@
     </div>
     <div class="modal-body">
       {% if job.status == "running" %}
-      <div class="review-loading"
-           hx-get="/{{ kind }}/status/{{ job.id }}"
-           hx-trigger="every 2s"
-           hx-target="#command-panel"
-           hx-swap="innerHTML">
-        <span class="spinner"></span> running your {{ heading|lower }} command…
-      </div>
+      <div class="review-loading"><span class="spinner"></span> running your {{ heading|lower }} command…</div>
+      <ul class="progress-log" id="plog-{{ job.id }}" data-job-id="{{ job.id }}" data-kind="{{ kind }}"></ul>
+      <script>
+      (function () {
+        var el = document.getElementById("plog-{{ job.id }}");
+        if (!el) return;
+        var kind = el.dataset.kind, id = el.dataset.jobId;
+        var icons = { tool: "🔧", text: "✍", log: "•" };
+        var es = new EventSource("/" + kind + "/stream/" + id);
+        es.addEventListener("progress", function (e) {
+          var d = JSON.parse(e.data);
+          var li = document.createElement("li");
+          li.className = "plog-" + (d.kind || "log");
+          li.textContent = (icons[d.kind] || "•") + " " + d.text;
+          el.appendChild(li);
+          el.scrollTop = el.scrollHeight;
+        });
+        var done = false;
+        function finish() {
+          if (done) return;
+          done = true;
+          es.close();
+          if (window.htmx) {
+            htmx.ajax("GET", "/" + kind + "/status/" + id,
+                      { target: "#command-panel", swap: "innerHTML" });
+          }
+        }
+        es.addEventListener("end", finish);
+        es.onerror = finish;  // server closed the stream or a network hiccup
+      })();
+      </script>
       {% elif job.status == "done" %}
       {% if job.persist_error %}<div class="save-warn">⚠ {{ job.persist_error }}</div>{% endif %}
       <article class="review-output">{{ output_html }}</article>

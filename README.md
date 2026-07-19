@@ -82,6 +82,35 @@ authored by others — so the rendered markdown is HTML-sanitized against a stri
 allowlist (via `nh3`) before display: no `<script>`, event handlers, or
 `javascript:` URLs survive, while headings, code blocks, tables, and links do.
 
+#### Running headless (no prompts) + live progress
+
+radar runs the command **non-interactively** (no TTY), so it must not stop to
+ask for tool permissions. Run the skill with permissions pre-resolved:
+
+- Pre-approve a **narrow, read-only allowlist** in `~/.claude/settings.json`
+  under `permissions.allow` — e.g. `Read`, `Grep`, `Glob`,
+  `WebFetch(domain:gitlab.yourco.com)` (add `Bash(git *)` only if the skill
+  reviews a local checkout; avoid blanket `Bash` and any write tools). Then
+  `--permission-mode dontAsk` **enforces** that allowlist without prompting —
+  anything not on the list is **auto-denied (fails closed)**, so the run never
+  blocks and never silently gains capabilities. Avoid `--permission-mode
+  bypassPermissions` (it allows everything — fails open); only consider it
+  inside a locked-down sandbox with no internal-network access and no secrets in
+  the environment.
+- `--output-format stream-json --verbose` — makes Claude emit live events, so
+  the modal shows **real-time progress** (a log of tool uses and drafting) while
+  the run is in flight, then renders the final result. radar reads the child's
+  stdout line-by-line and streams it to the browser over SSE. Commands that
+  don't speak stream-json still work — their stdout lines become the progress
+  log; they just aren't as granular.
+
+Authentication comes from your normal Claude Code setup (`~/.claude/settings.json`
+gateway/token, or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the
+environment that launches `radar serve`). Don't use `--bare` — it skips loading
+`settings.json`. radar strips `GITLAB_TOKEN`/`GITLAB_URL` from the child env, so
+a skill that needs GitLab/Jira access must have its own credentials (e.g. a
+GitLab/Atlassian MCP).
+
 ### Launch a QA test plan from the board (shift-left)
 
 To involve QA on every MR, radar can generate a **manual QA test plan** (not unit

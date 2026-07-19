@@ -82,7 +82,7 @@ def test_qa_generates_stores_and_reopens_plan(tmp_path):
 
     start = client.post("/qa/1/7")
     assert start.status_code == 200
-    job_id = re.search(r"/qa/status/([0-9a-f]+)", start.text).group(1)
+    job_id = re.search(r'data-job-id="([0-9a-f]+)"', start.text).group(1)
 
     html = ""
     for _ in range(300):
@@ -108,6 +108,41 @@ def test_qa_generates_stores_and_reopens_plan(tmp_path):
     assert plan is not None
     assert plan["jira_keys"] == "PROJ-42"
     assert "PROJ-42" in plan["content"]
+
+
+_QA_STREAM = (
+    "import json\n"
+    'print(json.dumps({"type": "assistant", "message": {"content":'
+    ' [{"type": "tool_use", "name": "WebFetch"}]}}))\n'
+    'print(json.dumps({"type": "result", "result": "# QA Plan for PROJ-42"}))\n'
+)
+
+
+def test_qa_stream_endpoint_emits_progress_and_end(tmp_path):
+    script = tmp_path / "emit.py"
+    script.write_text(_QA_STREAM, encoding="utf-8")
+    config = _config(tmp_path, f'{PY} "{script}"')
+    db_path = tmp_path / "r.db"
+    db = Database(db_path)
+    _seed(db)
+    db.close()
+
+    client = TestClient(create_app(config, str(db_path)))
+    start = client.post("/qa/1/7")
+    assert "EventSource" in start.text  # running panel wires up the live stream
+    job_id = re.search(r'data-job-id="([0-9a-f]+)"', start.text).group(1)
+
+    # Let the job finish, then read the (now terminal) SSE stream deterministically.
+    for _ in range(300):
+        if "review-output" in client.get(f"/qa/status/{job_id}").text:
+            break
+        time.sleep(0.05)
+
+    body = client.get(f"/qa/stream/{job_id}").text
+    assert "event: progress" in body
+    assert "WebFetch" in body
+    assert "event: end" in body
+    assert '"status": "done"' in body
 
 
 def test_qa_disabled_hides_button_and_blocks_endpoint(config, tmp_path):
