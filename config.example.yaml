@@ -53,14 +53,22 @@ waive:
 # {target_branch} {title} {author}.
 review:
   enabled: false
-  # Invoke a prepared Claude Code skill headlessly. The flags matter for a
-  # smooth, unattended run:
-  #   --permission-mode dontAsk  : never block on a tool-permission prompt
-  #     (pre-approve tools in ~/.claude/settings.json permissions.allow), OR use
-  #     --permission-mode bypassPermissions to skip all prompts.
-  #   --output-format stream-json --verbose : emit live events so the dashboard
-  #     shows real-time progress (tool uses, drafting). Plain commands still work
-  #     (their stdout lines become the progress log); they just aren't as live.
+  # Invoke a prepared Claude Code skill headlessly. Make the run smooth AND safe:
+  #  1. Pre-approve a NARROW, read-only allowlist in ~/.claude/settings.json
+  #     under permissions.allow — e.g.
+  #       ["Read", "Grep", "Glob", "WebFetch(domain:gitlab.yourco.com)"]
+  #     Add "Bash(git *)" ONLY if the skill reviews a local checkout. Do not
+  #     grant blanket Bash or any write/edit tools.
+  #  2. --permission-mode dontAsk : enforce that allowlist WITHOUT prompting.
+  #     Anything not on the list is auto-DENIED (fails closed), so the run never
+  #     blocks and never silently gains capabilities.
+  #     Do NOT use --permission-mode bypassPermissions: it allows everything
+  #     (fails open). Only consider it inside a locked-down sandbox (container /
+  #     firejail / nsjail) with no network to internal services and no secrets
+  #     in the environment.
+  #  3. --output-format stream-json --verbose : emit live events so the dashboard
+  #     shows real-time progress. Plain commands still work (stdout -> progress
+  #     log); they just aren't as granular.
   command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/code-review {web_url}"'
   working_dir: null          # run the command here (e.g. a repo checkout); null = radar's CWD
   timeout_seconds: 600

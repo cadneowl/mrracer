@@ -87,10 +87,16 @@ allowlist (via `nh3`) before display: no `<script>`, event handlers, or
 radar runs the command **non-interactively** (no TTY), so it must not stop to
 ask for tool permissions. Run the skill with permissions pre-resolved:
 
-- `--permission-mode dontAsk` — never prompts; pre-approve tools in
-  `~/.claude/settings.json` under `permissions.allow` (e.g. `Read`, `Grep`,
-  `Bash(git *)`, `WebFetch(domain:gitlab.yourco.com)`). Or `--permission-mode
-  bypassPermissions` to skip all prompts.
+- Pre-approve a **narrow, read-only allowlist** in `~/.claude/settings.json`
+  under `permissions.allow` — e.g. `Read`, `Grep`, `Glob`,
+  `WebFetch(domain:gitlab.yourco.com)` (add `Bash(git *)` only if the skill
+  reviews a local checkout; avoid blanket `Bash` and any write tools). Then
+  `--permission-mode dontAsk` **enforces** that allowlist without prompting —
+  anything not on the list is **auto-denied (fails closed)**, so the run never
+  blocks and never silently gains capabilities. Avoid `--permission-mode
+  bypassPermissions` (it allows everything — fails open); only consider it
+  inside a locked-down sandbox with no internal-network access and no secrets in
+  the environment.
 - `--output-format stream-json --verbose` — makes Claude emit live events, so
   the modal shows **real-time progress** (a log of tool uses and drafting) while
   the run is in flight, then renders the final result. radar reads the child's
