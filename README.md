@@ -43,6 +43,16 @@ Rows are sorted **most-overdue first**, and the board auto-refreshes every 60s
 via htmx. Breach counts are surfaced at **team level only** — there is
 deliberately no per-person breach list on the main board.
 
+### Coach view (manager-only)
+
+Per the "no surveillance" principle, individual breach detail lives *only* on a
+separate **`/coach`** page (unlinked except a subtle board-footer link — no auth
+yet, manager-only by obscurity). It shows, per reviewer: current **open
+breaches** (which MRs, hours over), **SLA compliance %**, **median / p90
+first-response** time, **open load**, and a **chronic** flag for high recurring
+breach rates. Everything is derived live from the event log (open breaches from
+open MRs, compliance from resolved obligations); waived obligations are excluded.
+
 ### Filters (personal & team)
 
 The **VIEW** bar filters the board. The chosen filter is remembered in a

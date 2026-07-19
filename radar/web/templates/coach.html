@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>radar — coach view</title>
+  <script src="/static/htmx.min.js"></script>
+  <link rel="stylesheet" href="/static/radar.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span> radar
+      <span class="subtitle">coach view · manager only</span>
+    </div>
+    <div class="meta"><a class="foot-link" href="/">← board</a> · auto-refresh 60s</div>
+  </header>
+
+  <main id="coach" hx-get="/coach/partial" hx-trigger="every 60s" hx-swap="innerHTML">
+    {% include "_coach.html" %}
+  </main>
+
+  <footer class="foot">
+    Individual breach detail is intentionally kept off the shared board. This view is for
+    coaching conversations, not scoreboards — waived obligations are excluded.
+  </footer>
+</body>
+</html>
