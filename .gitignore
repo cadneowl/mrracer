@@ -24,3 +24,7 @@ config.yaml
 
 # playwright scratch
 .playwright-mcp/
+
+# coverage
+.coverage
+htmlcov/
