@@ -139,6 +139,33 @@ def test_runner_reports_error_on_nonzero():
     assert done.returncode == 3
 
 
+def test_child_env_excludes_gitlab_token(monkeypatch):
+    # The skill subprocess must NOT inherit the GitLab PAT.
+    monkeypatch.setenv("GITLAB_TOKEN", "super-secret-pat")
+    cmd = f"{PY} -c \"import os; print(os.environ.get('GITLAB_TOKEN', 'ABSENT'))\""
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.status == "done"
+    assert "ABSENT" in done.output
+    assert "super-secret-pat" not in done.output
+
+
+def test_runner_catchall_sets_terminal_state(monkeypatch):
+    # An unexpected error in the worker must not strand the job in "running".
+    from radar import commands
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(commands.subprocess, "run", boom)
+    cfg = ReviewConfig(enabled=True, command=f'{PY} -c "print(1)"', timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.status == "error"
+    assert "unexpected error" in done.error
+
+
 def test_runner_missing_command():
     cfg = ReviewConfig(enabled=True, command="definitely-not-a-real-binary-xyz", timeout_seconds=30)
     runner = CommandRunner(cfg, "review")

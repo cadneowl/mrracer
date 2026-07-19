@@ -133,6 +133,8 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.save-warn { color: var(--amber); border: 1px solid var(--amber); border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 12px; font-size: 13px; }
 .review-error strong { color: var(--red); }
 .review-error pre, .review-output pre {
   background: var(--bg); border: 1px solid var(--line); border-radius: 8px;

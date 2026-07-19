@@ -22,6 +22,7 @@
         <span class="spinner"></span> running your {{ heading|lower }} command…
       </div>
       {% elif job.status == "done" %}
+      {% if job.persist_error %}<div class="save-warn">⚠ {{ job.persist_error }}</div>{% endif %}
       <article class="review-output">{{ output_html }}</article>
       {% else %}
       <div class="review-error">

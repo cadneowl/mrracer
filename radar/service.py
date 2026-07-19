@@ -43,6 +43,14 @@ def _remaining_label(o: ObligationState) -> str:
     return f"{_fmt_hours(-o.remaining_hours)} over"
 
 
+def _safe_url(url: str | None) -> str | None:
+    """Only allow http(s) links to be rendered as clickable (defence in depth
+    against a javascript:/data: scheme reaching an href)."""
+    if url and url.split(":", 1)[0].lower() in ("http", "https"):
+        return url
+    return None
+
+
 def _wall_age(created_at: str | None, now: datetime) -> str:
     if not created_at:
         return "—"
@@ -126,7 +134,7 @@ def build_dashboard(
                 "project_id": snap["project_id"],
                 "mr_iid": snap["mr_iid"],
                 "title": snap["title"],
-                "web_url": snap["web_url"],
+                "web_url": _safe_url(snap["web_url"]),
                 "author": snap["author"],
                 "target_branch": snap["target_branch"],
                 "labels": snap["labels"],

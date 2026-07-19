@@ -14,7 +14,7 @@ extra arguments. A substituted value that would make a token *start with* ``-``
 
 from __future__ import annotations
 
-import contextlib
+import logging
 import os
 import shlex
 import subprocess
@@ -24,6 +24,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .config import CommandConfig
+
+log = logging.getLogger("radar.commands")
+
+# Env vars never exported to the skill subprocess. The child is an LLM agent
+# fed attacker-influenceable MR content; it must not inherit our GitLab PAT.
+_ENV_DENYLIST = frozenset({"GITLAB_TOKEN", "GITLAB_URL"})
+
+_MAX_OUTPUT = 200_000   # cap captured stdout to bound memory / stored plan size
+_MAX_JOBS = 256         # bound the in-memory job registry (evict oldest)
 
 # Placeholders a command template may reference, filled from the MR context.
 PLACEHOLDER_KEYS = (
@@ -88,7 +97,14 @@ class CommandJob:
     status: str = "running"  # running / done / error
     output: str = ""
     error: str = ""
+    persist_error: str = ""  # set if the result was produced but couldn't be saved
     returncode: int | None = None
+
+
+def _fail(job: CommandJob, message: str) -> None:
+    """Move a job to a terminal error state (error text set before status)."""
+    job.error = message[:8000]
+    job.status = "error"
 
 
 class CommandRunner:
@@ -112,6 +128,9 @@ class CommandRunner:
         )
         with self._lock:
             self._jobs[job.id] = job
+            # Evict oldest terminal jobs so long-running `serve` doesn't leak.
+            while len(self._jobs) > _MAX_JOBS:
+                self._jobs.pop(next(iter(self._jobs)))
         try:
             argv = build_argv(self.config.command, ctx)
         except CommandError as exc:
@@ -121,8 +140,18 @@ class CommandRunner:
         return job
 
     def _run(self, job: CommandJob, argv: list[str], on_success) -> None:
+        # Catch-all guarantees every job reaches a terminal state; a crash in
+        # the worker thread must never strand the job in "running" (the UI would
+        # poll it forever).
+        try:
+            self._execute(job, argv, on_success)
+        except Exception as exc:  # noqa: BLE001 - last-resort terminal state
+            log.exception("%s worker crashed", self.kind)
+            _fail(job, f"unexpected error: {exc}")
+
+    def _execute(self, job: CommandJob, argv: list[str], on_success) -> None:
         if not argv:
-            job.status, job.error = "error", f"{self.kind}.command is empty"
+            _fail(job, f"{self.kind}.command is empty")
             return
         try:
             proc = subprocess.run(
@@ -136,33 +165,41 @@ class CommandRunner:
                 # crashing the job.
                 encoding="utf-8",
                 errors="replace",
-                # Nudge Python-based skills to emit UTF-8 too (no effect on others).
-                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                env=self._child_env(),
                 timeout=self.config.timeout_seconds,
             )
         except subprocess.TimeoutExpired:
-            job.status = "error"
-            job.error = f"{self.kind} timed out after {self.config.timeout_seconds}s"
+            _fail(job, f"{self.kind} timed out after {self.config.timeout_seconds}s")
             return
         except FileNotFoundError:
-            job.status = "error"
-            job.error = f"command not found: {argv[0]!r} (is it on PATH?)"
+            _fail(job, f"command not found: {argv[0]!r} (is it on PATH?)")
             return
         except OSError as exc:  # pragma: no cover - defensive
-            job.status, job.error = "error", f"failed to launch {self.kind}: {exc}"
+            _fail(job, f"failed to launch {self.kind}: {exc}")
             return
 
-        job.returncode = proc.returncode
         if proc.returncode == 0 and proc.stdout.strip():
-            job.status, job.output = "done", proc.stdout
+            # Publish payload BEFORE flipping status, so a reader that sees
+            # status=="done" always sees the output too (htmx stops polling on
+            # the first "done", so a torn read would strand an empty panel).
+            job.output = proc.stdout[:_MAX_OUTPUT]
+            job.returncode = 0
             if on_success is not None:
-                # Persistence must never crash the worker thread.
-                with contextlib.suppress(Exception):
+                try:
                     on_success(job)
+                except Exception as exc:  # noqa: BLE001 - report, don't crash
+                    log.exception("%s result produced but not saved", self.kind)
+                    job.persist_error = f"result was generated but could not be saved: {exc}"
+            job.status = "done"
         else:
             detail = proc.stderr or proc.stdout or f"exited with code {proc.returncode}"
-            job.status = "error"
-            job.error = detail.strip()[:8000]
+            job.returncode = proc.returncode
+            _fail(job, detail.strip())
+
+    def _child_env(self) -> dict:
+        env = {k: v for k, v in os.environ.items() if k not in _ENV_DENYLIST}
+        env["PYTHONIOENCODING"] = "utf-8"  # nudge Python skills to emit UTF-8
+        return env
 
     def get(self, job_id: str) -> CommandJob | None:
         with self._lock:

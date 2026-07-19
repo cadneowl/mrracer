@@ -42,7 +42,8 @@
     {% for row in rows %}
     <tr>
       <td class="col-mr">
-        <a href="{{ row.web_url }}" target="_blank" rel="noopener">{{ row.title }}</a>
+        {% if row.web_url %}<a href="{{ row.web_url }}" target="_blank" rel="noopener">{{ row.title }}</a>
+        {% else %}<span class="mr-title">{{ row.title }}</span>{% endif %}
         <span class="mrid">!{{ row.mr_iid }}</span>
         {% if row.draft %}<span class="tag tag-draft">draft</span>{% endif %}
         {% for label in row.labels %}<span class="tag">{{ label }}</span>{% endfor %}

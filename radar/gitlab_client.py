@@ -19,8 +19,8 @@ from typing import Protocol
 
 
 class MRSource(Protocol):
-    def list_open_merge_requests(
-        self, project: str, updated_after: str | None
+    def list_merge_requests(
+        self, project: str, updated_after: str | None, state: str
     ) -> list[dict]: ...
 
     def list_discussions(self, project_id: int, mr_iid: int) -> list[dict]: ...
@@ -62,12 +62,12 @@ class GitLabSource:
             self._project_cache[project] = self._gl.projects.get(project)
         return self._project_cache[project]
 
-    def list_open_merge_requests(
-        self, project: str, updated_after: str | None
+    def list_merge_requests(
+        self, project: str, updated_after: str | None, state: str
     ) -> list[dict]:
         proj = self._project(project)
         kwargs = {
-            "state": "opened",
+            "state": state,
             "order_by": "updated_at",
             "sort": "asc",
             "iterator": True,
@@ -121,10 +121,12 @@ class FixtureSource:
                 disc[(pid, iid)] = json.loads(f.read_text(encoding="utf-8"))
         return cls(mrs, disc)
 
-    def list_open_merge_requests(
-        self, project: str, updated_after: str | None
+    def list_merge_requests(
+        self, project: str, updated_after: str | None, state: str
     ) -> list[dict]:
-        mrs = [m for m in self._mrs.get(project, []) if m.get("state", "opened") == "opened"]
+        mrs = list(self._mrs.get(project, []))
+        if state != "all":
+            mrs = [m for m in mrs if m.get("state", "opened") == state]
         if updated_after:
             mrs = [m for m in mrs if (m.get("updated_at") or "") > updated_after]
         return sorted(mrs, key=lambda m: m.get("updated_at") or "")

@@ -273,10 +273,15 @@ def _derive_one(
             if obl.first_response_at
             else 0.0
         )
-        within = fr_elapsed <= fr_budget
+        # Approval-phase elapsed = reviewer-owed business hours up to approval
+        # (pauses excluded). within_sla folds in BOTH budgets.
+        ap_intervals = _reviewer_owed_intervals(obl, obl.approved_at)
+        ap_elapsed = sum(business_hours_between(a, b, cal, tz) for a, b in ap_intervals)
+        within = fr_elapsed <= fr_budget and ap_elapsed <= ap_budget
+        fraction = ap_elapsed / ap_budget if ap_budget > 0 else math.inf
         return _state(
             obl, config, CHIP_PENDING, "resolved", "approved",
-            ap_budget, 0.0, ap_budget, 0.0, paused=False, tz=tz,
+            ap_budget, ap_elapsed, ap_budget - ap_elapsed, fraction, paused=False, tz=tz,
             resolved_at=obl.approved_at, resolution_type="approval",
             within_sla=within, urgency=math.inf,
         )

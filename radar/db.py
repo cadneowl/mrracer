@@ -101,10 +101,14 @@ class Database:
     def __init__(self, path: str | Path):
         self.path = str(path)
         self.conn = sqlite3.connect(self.path)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.init_schema()
+        try:
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.init_schema()
+        except Exception:
+            self.conn.close()  # don't leak the handle if setup/migration fails
+            raise
 
     def init_schema(self) -> None:
         self.conn.executescript(_SCHEMA)

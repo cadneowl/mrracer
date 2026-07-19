@@ -102,7 +102,9 @@ qa:
 
 radar recognises Jira keys (`PROJ-123`) in each MR's **branch, title, and
 description**, shows them as links on the board, and passes them to the command
-via `{jira_keys}` (space-separated) / `{jira_keys_csv}`. Your `/qa-testplan`
+via `{jira_keys}` (space-separated) / `{jira_keys_csv}`. Setting `project_keys`
+is recommended — without it, tokens like `UTF-8` or `SHA-256` match the key
+pattern and would show as phantom links. Your `/qa-testplan`
 **skill** reads the ticket(s) itself and — since it already has Jira access — can
 write the plan back to Jira (a comment, or Xray/Zephyr test cases if you have
 them). radar keeps a copy: the generated plan is saved and shown on the board
@@ -217,7 +219,7 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `calendar.default_timezone` | Timezone for reviewers not in the map. |
 | `calendar.reviewer_timezones` | Per-reviewer timezone overrides. |
 | `slas` | Ordered rules; **first match wins**. Each has a `match` (optional `target_branch` glob and/or required `labels`) and `first_response_business_hours` / `approval_business_hours`. The last rule must be the default `match: {}`. |
-| `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is a draft, or the MR carries any `labels` listed here. |
+| `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is **currently** a draft, or the MR carries any `labels` listed here. (Only the current draft state waives; historical draft periods are not subtracted from the clock.) |
 | `gamification` | Consumed in Phase 3; carried verbatim for now. |
 
 Secrets are **never** in this file — only `GITLAB_URL` / `GITLAB_TOKEN` in the
