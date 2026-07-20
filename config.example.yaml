@@ -81,7 +81,7 @@ review:
   #     shows real-time progress. Plain commands still work (stdout -> progress
   #     log); they just aren't as granular.
   command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/code-review"'
-  working_dir: null          # run the command here (e.g. a repo checkout); null = radar's CWD
+  working_dir: null          # run the command here (e.g. ~/src/repo — ~ and $VARS expand); null = radar's CWD
   timeout_seconds: 600
   # include_context: radar fetches the MR title/description/diff itself (via
   # GITLAB_URL/GITLAB_TOKEN) and pipes it to the skill on STDIN. The skill then

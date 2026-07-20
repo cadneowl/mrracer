@@ -244,9 +244,12 @@ def _parse_command(raw: object, name: str) -> CommandConfig:
         raise ConfigError(f"{name}.enabled is true but {name}.command is empty")
     working_dir = raw.get("working_dir")
     if working_dir is not None:
-        working_dir = str(working_dir)
+        # Expand ~ and $VARS so paths like "~/src/repo" work (Path/subprocess
+        # don't expand them on their own); store the resolved absolute path.
+        raw_dir = str(working_dir)
+        working_dir = str(Path(os.path.expandvars(raw_dir)).expanduser())
         if not Path(working_dir).is_dir():
-            raise ConfigError(f"{name}.working_dir does not exist: {working_dir}")
+            raise ConfigError(f"{name}.working_dir does not exist: {raw_dir}")
     try:
         timeout = int(raw.get("timeout_seconds", 600))
     except (TypeError, ValueError):

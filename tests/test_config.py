@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from radar.config import ConfigError, gitlab_credentials, load_config
@@ -37,6 +39,21 @@ def test_valid_config(tmp_path):
 def test_missing_file(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_config(tmp_path / "nope.yaml")
+
+
+def test_working_dir_expands_tilde(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))       # posix expanduser
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # windows expanduser
+    (tmp_path / "repo").mkdir()
+    text = VALID + "\nreview: {enabled: true, command: 'claude -p /x', working_dir: '~/repo'}\n"
+    cfg = load_config(_write(tmp_path, text))
+    assert Path(cfg.review.working_dir) == (tmp_path / "repo")  # ~ was expanded
+
+
+def test_working_dir_missing_reports_original(tmp_path):
+    text = VALID + "\nreview: {enabled: true, command: 'x', working_dir: '~/nope-xyz'}\n"
+    with pytest.raises(ConfigError, match="~/nope-xyz"):  # error shows what the user wrote
+        load_config(_write(tmp_path, text))
 
 
 def test_missing_projects(tmp_path):
