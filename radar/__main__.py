@@ -4,8 +4,10 @@
     python -m radar serve         run the dashboard + background poller
     python -m radar recompute     re-derive all obligations from the event log
     python -m radar validate      check config.yaml and exit
+    python -m radar check         validate config + GitLab/Jira/DB connectivity
 
-Secrets come only from GITLAB_URL / GITLAB_TOKEN in the environment.
+Secrets come only from the environment: GITLAB_URL / GITLAB_TOKEN, and (for QA
+context fetch) JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN.
 """
 
 from __future__ import annotations
@@ -103,6 +105,29 @@ def cmd_validate(args) -> int:
     return 0
 
 
+_CHECK_SYMBOL = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL", "skip": "skip"}
+
+
+def cmd_check(args) -> int:
+    """Validate config, DB, and external connectivity (GitLab, Jira, commands)."""
+    from .diagnostics import run_checks
+
+    config = load_config(args.config)
+    checks = run_checks(config)
+    width = max(len(c.name) for c in checks)
+    failed = warned = 0
+    for c in checks:
+        print(f"[{_CHECK_SYMBOL.get(c.status, '?')}] {c.name.ljust(width)}  {c.detail}")
+        failed += c.status == "fail"
+        warned += c.status == "warn"
+    print()
+    if failed:
+        print(f"{failed} check(s) FAILED, {warned} warning(s).")
+        return 1
+    print(f"all checks passed ({warned} warning(s))." if warned else "all checks passed.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="radar", description=__doc__)
     parser.add_argument("-c", "--config", default="config.yaml", help="path to config.yaml")
@@ -114,6 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_recompute
     )
     sub.add_parser("validate", help="validate config.yaml").set_defaults(func=cmd_validate)
+    sub.add_parser(
+        "check", help="validate config, DB, and GitLab/Jira connectivity"
+    ).set_defaults(func=cmd_check)
 
     serve = sub.add_parser("serve", help="run dashboard + background poller")
     serve.add_argument("--host", default="127.0.0.1")
