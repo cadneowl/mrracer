@@ -288,6 +288,7 @@ event log is on disk in SQLite).
 | `radar serve [--host H] [--port P]` | Run the dashboard and the background poller. |
 | `radar recompute` | Re-derive every obligation from the event log under the current config. Run after changing SLA rules. |
 | `radar validate` | Validate `config.yaml` and exit. |
+| `radar check` | Diagnostics: validate config + the DB, and check GitLab/Jira connectivity (auth, token scope, project reachability) and that the review/QA commands are on PATH. Prints ✅/⚠️/❌ per check; exits non-zero on any failure. Also flags if review-request times came from created-date backfill (inflated breaches) rather than system notes. |
 
 Global flags: `-c/--config PATH` (default `config.yaml`), `-v/--verbose`.
 

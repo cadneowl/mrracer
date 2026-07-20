@@ -54,6 +54,10 @@ class JiraClient:
         except (urllib.error.URLError, TimeoutError, ValueError) as exc:
             raise JiraError(f"Jira request failed for {path}: {exc}") from None
 
+    def myself(self) -> dict:
+        """The authenticated account — used to validate credentials."""
+        return self._getter("/rest/api/2/myself")
+
     def get_issue(self, key: str) -> dict:
         return self._getter(f"/rest/api/2/issue/{urllib.parse.quote(key)}?fields={_ISSUE_FIELDS}")
 
