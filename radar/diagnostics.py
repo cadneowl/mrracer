@@ -90,13 +90,15 @@ def _check_gitlab(config: Config) -> list[Check]:
 
 
 def _check_jira(config: Config) -> Check:
-    needed = config.qa.enabled and config.qa.include_context
+    needed = any(
+        s.enabled and s.include_context and s.context == "jira" for s in config.skills
+    )
     try:
         base, email, token = jira_credentials()
     except ConfigError as exc:
         if needed:
             return Check("jira.env", "fail", exc.args[0].splitlines()[0])
-        return Check("jira.env", "skip", "not set (qa.include_context is off)")
+        return Check("jira.env", "skip", "not set (no Jira-context skill is enabled)")
 
     try:
         from .jira_client import JiraClient
@@ -110,13 +112,14 @@ def _check_jira(config: Config) -> Check:
 
 def _check_commands(config: Config) -> list[Check]:
     out = []
-    for name, cmd in (("review", config.review), ("qa", config.qa)):
-        if not cmd.enabled:
+    for skill in config.skills:
+        name = skill.name
+        if not skill.enabled:
             out.append(Check(f"{name}.command", "skip", "disabled"))
             continue
-        exe = _first_token(cmd.command)
+        exe = _first_token(skill.command)
         if exe and shutil.which(exe):
-            ctx = " · include_context (radar fetches)" if cmd.include_context else ""
+            ctx = " · include_context (radar fetches)" if skill.include_context else ""
             out.append(Check(f"{name}.command", "ok", f"'{exe}' on PATH{ctx}"))
         else:
             out.append(Check(f"{name}.command", "warn", f"'{exe}' not found on PATH"))

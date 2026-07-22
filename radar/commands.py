@@ -33,9 +33,14 @@ from .config import CommandConfig
 
 log = logging.getLogger("radar.commands")
 
-# Env vars never exported to the skill subprocess. The child is an LLM agent
-# fed attacker-influenceable MR content; it must not inherit our GitLab PAT.
-_ENV_DENYLIST = frozenset({"GITLAB_TOKEN", "GITLAB_URL"})
+# Env vars never exported to the skill subprocess. The child is an LLM agent fed
+# attacker-influenceable MR content; it must not inherit radar's GitLab PAT or
+# Jira credentials. When a skill needs context, radar fetches it and pipes it on
+# stdin (see context.py); a skill that fetches on its own must carry its own
+# credentials (e.g. an MCP server), not borrow radar's.
+_ENV_DENYLIST = frozenset(
+    {"GITLAB_TOKEN", "GITLAB_URL", "JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"}
+)
 
 _MAX_OUTPUT = 200_000    # cap captured output to bound memory / stored plan size
 _MAX_JOBS = 256          # bound the in-memory job registry (evict oldest)

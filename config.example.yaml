@@ -121,6 +121,25 @@ qa:
   # the skill on STDIN. The skill needs no Jira access of its own.
   include_context: false
 
+# Extra skills. `review` and `qa` above are the two built-ins; add any number of
+# your own here and each becomes another button on every MR row. Same shape and
+# placeholders as `review`/`qa`, plus two opt-in capabilities:
+#   context: gitlab_diff | jira  — with include_context, radar fetches that
+#                                   backend and pipes it to the skill on STDIN.
+#   stores_result: true          — persist the output and show a re-openable ✓
+#                                   badge (this is what qa uses).
+# A skills entry named `review` or `qa` overrides the block above (both forms
+# work). Every enabled skill also shows up in `radar check`.
+skills:
+  - name: dba              # url/id slug; must be unique
+    label: DBA review      # panel heading / long name
+    button: DBA            # short button text (optional; defaults to label)
+    icon: "🗄"             # button emoji (optional; defaults to ▶)
+    enabled: false
+    command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/dba"'
+    working_dir: null      # ~ and $VARS expand; null = radar's CWD
+    timeout_seconds: 600
+
 # Gamification config is consumed in Phase 3; kept here so the file is stable.
 gamification:
   points:

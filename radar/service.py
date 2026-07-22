@@ -163,7 +163,7 @@ def build_dashboard(
             [snap.get("title"), snap.get("source_branch"), snap.get("description")],
             config.jira.project_keys,
         )
-        plan = db.get_test_plan(snap["project_id"], snap["mr_iid"])
+        stored_kinds = db.stored_kinds(snap["project_id"], snap["mr_iid"])
         all_rows.append(
             {
                 "project_id": snap["project_id"],
@@ -178,7 +178,7 @@ def build_dashboard(
                 "obligations": views,
                 "min_urgency": _row_min_urgency(views),
                 "jira": [{"key": k, "url": browse_url(config.jira.base_url, k)} for k in keys],
-                "has_plan": plan is not None,
+                "stored_kinds": stored_kinds,
             }
         )
 
