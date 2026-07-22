@@ -54,10 +54,15 @@ def build_qa_input(client, keys: list[str]) -> str:
 def stdin_provider_for(
     kind: str, config: Config, project_id: int, mr_iid: int, keys: list[str]
 ) -> Callable[[], str] | None:
-    """A thunk that produces the stdin bundle for a job, or None if this command
+    """A thunk that produces the stdin bundle for a job, or None if this skill
     doesn't fetch context. The fetch runs inside the worker thread (so a slow or
-    failing fetch surfaces as a job error, not a slow button)."""
-    if kind == "review" and config.review.include_context:
+    failing fetch surfaces as a job error, not a slow button). Which backend is
+    fetched is driven by the skill's ``context`` capability, not its name."""
+    skill = config.skill_by_name(kind)
+    if skill is None or not skill.include_context:
+        return None
+
+    if skill.context == "gitlab_diff":
         def provider() -> str:
             from .gitlab_client import GitLabSource
 
@@ -66,7 +71,7 @@ def stdin_provider_for(
 
         return provider
 
-    if kind == "qa" and config.qa.include_context and keys:
+    if skill.context == "jira" and keys:
         def provider() -> str:
             from .jira_client import JiraClient
 

@@ -95,7 +95,7 @@ def test_qa_generates_stores_and_reopens_plan(tmp_path):
 
     # Plan persisted -> board shows the badge and it re-opens from storage.
     board = client.get("/").text
-    assert "✓ plan" in board
+    assert "✓ QA plan" in board
     stored = client.get("/qa/stored/1/7")
     assert stored.status_code == 200
     assert "PROJ-42" in stored.text

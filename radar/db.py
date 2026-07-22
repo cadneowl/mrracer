@@ -56,13 +56,16 @@ CREATE TABLE IF NOT EXISTS mr_snapshots (
     PRIMARY KEY (project_id, mr_iid)
 );
 
+-- Stored skill results (e.g. QA test plans). Keyed by skill `kind` too, so
+-- distinct storing skills keep separate results for the same MR.
 CREATE TABLE IF NOT EXISTS test_plans (
     project_id   INTEGER NOT NULL,
     mr_iid       INTEGER NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'qa',
     jira_keys    TEXT NOT NULL DEFAULT '',
     content      TEXT NOT NULL,
     generated_at TEXT NOT NULL,
-    PRIMARY KEY (project_id, mr_iid)
+    PRIMARY KEY (project_id, mr_iid, kind)
 );
 
 CREATE TABLE IF NOT EXISTS poll_state (
@@ -121,6 +124,31 @@ class Database:
         if "description" not in cols:
             self.conn.execute(
                 "ALTER TABLE mr_snapshots ADD COLUMN description TEXT NOT NULL DEFAULT ''"
+            )
+
+        # test_plans gained `kind` in the primary key so multiple storing skills
+        # don't share one row. SQLite can't ALTER a PK, so rebuild the table;
+        # existing rows are all QA plans (the only skill that stored before).
+        tp_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(test_plans)")}
+        if tp_cols and "kind" not in tp_cols:
+            self.conn.executescript(
+                """
+                ALTER TABLE test_plans RENAME TO test_plans_old;
+                CREATE TABLE test_plans (
+                    project_id   INTEGER NOT NULL,
+                    mr_iid       INTEGER NOT NULL,
+                    kind         TEXT NOT NULL DEFAULT 'qa',
+                    jira_keys    TEXT NOT NULL DEFAULT '',
+                    content      TEXT NOT NULL,
+                    generated_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, mr_iid, kind)
+                );
+                INSERT INTO test_plans
+                    (project_id, mr_iid, kind, jira_keys, content, generated_at)
+                    SELECT project_id, mr_iid, 'qa', jira_keys, content, generated_at
+                    FROM test_plans_old;
+                DROP TABLE test_plans_old;
+                """
             )
 
     def close(self) -> None:
@@ -238,27 +266,37 @@ class Database:
         )
         self.conn.commit()
 
-    # --- QA test plans -----------------------------------------------------
+    # --- stored skill results (QA test plans, etc.) ------------------------
 
-    def save_test_plan(self, project_id: int, mr_iid: int, jira_keys: str, content: str) -> None:
+    def save_test_plan(
+        self, project_id: int, mr_iid: int, kind: str, jira_keys: str, content: str
+    ) -> None:
         self.conn.execute(
             """
-            INSERT INTO test_plans (project_id, mr_iid, jira_keys, content, generated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(project_id, mr_iid) DO UPDATE SET
+            INSERT INTO test_plans (project_id, mr_iid, kind, jira_keys, content, generated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, mr_iid, kind) DO UPDATE SET
                 jira_keys=excluded.jira_keys, content=excluded.content,
                 generated_at=excluded.generated_at
             """,
-            (project_id, mr_iid, jira_keys, content, _now_utc_iso()),
+            (project_id, mr_iid, kind, jira_keys, content, _now_utc_iso()),
         )
         self.conn.commit()
 
-    def get_test_plan(self, project_id: int, mr_iid: int) -> dict | None:
+    def get_test_plan(self, project_id: int, mr_iid: int, kind: str = "qa") -> dict | None:
         row = self.conn.execute(
-            "SELECT * FROM test_plans WHERE project_id=? AND mr_iid=?",
-            (project_id, mr_iid),
+            "SELECT * FROM test_plans WHERE project_id=? AND mr_iid=? AND kind=?",
+            (project_id, mr_iid, kind),
         ).fetchone()
         return dict(row) if row else None
+
+    def stored_kinds(self, project_id: int, mr_iid: int) -> list[str]:
+        """Skill kinds that have a stored result for this MR (for board badges)."""
+        rows = self.conn.execute(
+            "SELECT kind FROM test_plans WHERE project_id=? AND mr_iid=?",
+            (project_id, mr_iid),
+        ).fetchall()
+        return [r["kind"] for r in rows]
 
     def get_snapshot(self, project_id: int, mr_iid: int) -> dict | None:
         row = self.conn.execute(

@@ -8,6 +8,7 @@ GITLAB_URL and GITLAB_TOKEN environment variables (see gitlab_client).
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -63,22 +64,35 @@ class WaiveConfig:
 
 
 @dataclass(frozen=True)
-class CommandConfig:
-    """Launch an external command for an MR from the dashboard (code review /
-    QA test plan). The command is a template filled with MR context."""
+class SkillConfig:
+    """One dashboard skill: an external command run for an MR, launched from a
+    board button. The command is a template filled with MR context.
 
+    ``name`` is the URL/id slug; ``button``/``label``/``icon`` drive the board
+    button text, the panel heading, and the emoji. ``context`` names an optional
+    backend fetch whose output is piped to the command on stdin when
+    ``include_context`` is on — ``"gitlab_diff"`` (the MR diff) or ``"jira"``
+    (the linked ticket(s)/epic) — so the skill needs no GitLab/Jira access of its
+    own. ``stores_result`` persists the output so the board can re-open it later
+    (used by the QA test plan).
+    """
+
+    name: str = ""
+    label: str = ""  # panel heading / long name
+    button: str = ""  # short board-button text
+    icon: str = "▶"
     enabled: bool = False
     command: str = ""
     working_dir: str | None = None
     timeout_seconds: int = 600
-    # When true, radar fetches context from its backend (the MR diff for review,
-    # the Jira ticket(s)/epic for qa) and pipes it to the command on stdin, so
-    # the skill needs no GitLab/Jira access of its own.
     include_context: bool = False
+    context: str | None = None  # "gitlab_diff" | "jira" | None
+    stores_result: bool = False
 
 
-# Backwards-compatible alias.
-ReviewConfig = CommandConfig
+# Backwards-compatible aliases (older names for the same shape).
+CommandConfig = SkillConfig
+ReviewConfig = SkillConfig
 
 
 @dataclass(frozen=True)
@@ -108,8 +122,7 @@ class Config:
     calendar: CalendarConfig
     slas: tuple[SLARule, ...]
     waive: WaiveConfig
-    review: CommandConfig
-    qa: CommandConfig
+    skills: tuple[SkillConfig, ...]
     jira: JiraConfig
     teams: tuple[Team, ...]
     gamification: dict  # consumed in Phase 3; carried verbatim for now
@@ -119,6 +132,22 @@ class Config:
             if team.name == name:
                 return team
         return None
+
+    def skill_by_name(self, name: str) -> SkillConfig | None:
+        for skill in self.skills:
+            if skill.name == name:
+                return skill
+        return None
+
+    @property
+    def review(self) -> SkillConfig:
+        """Back-compat accessor for the built-in review skill."""
+        return self.skill_by_name("review") or SkillConfig(name="review")
+
+    @property
+    def qa(self) -> SkillConfig:
+        """Back-compat accessor for the built-in qa skill."""
+        return self.skill_by_name("qa") or SkillConfig(name="qa")
 
 
 # --- helpers ---------------------------------------------------------------
@@ -233,15 +262,46 @@ def _parse_slas(raw: object) -> tuple[SLARule, ...]:
     return tuple(rules)
 
 
-def _parse_command(raw: object, name: str) -> CommandConfig:
+_VALID_CONTEXTS = {"gitlab_diff", "jira"}
+
+# A skill name is interpolated into dashboard routes and htmx URLs
+# (/{name}/{project_id}/{mr_iid}), so it must be a URL-safe slug and must not
+# shadow a fixed sub-path used within a skill's own route namespace.
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_RESERVED_NAMES = frozenset({"status", "stream", "close", "stored"})
+
+# The two built-in skills. They always exist (disabled unless configured), so
+# the dashboard and `radar check` have a stable review + qa baseline, and each
+# carries the special capability the generic skill machinery can't infer: review
+# pipes the MR diff to stdin; qa pipes the Jira ticket(s) and persists the plan.
+_BUILTIN_SKILLS: dict[str, dict] = {
+    "review": {
+        "label": "AI review", "button": "review", "icon": "🔍",
+        "context": "gitlab_diff", "stores_result": False,
+    },
+    "qa": {
+        "label": "QA test plan", "button": "QA plan", "icon": "🧪",
+        "context": "jira", "stores_result": True,
+    },
+}
+
+
+def _parse_skill(raw: object, name: str, ctx: str) -> SkillConfig:
     if raw is None:
-        return CommandConfig()
+        raw = {}
     if not isinstance(raw, dict):
-        raise ConfigError(f"{name}: expected a mapping")
+        raise ConfigError(f"{ctx}: expected a mapping")
+    builtin = _BUILTIN_SKILLS.get(name, {})
+
+    label = str(raw.get("label", builtin.get("label", name)))
+    button = str(raw.get("button", builtin.get("button", label)))
+    icon = str(raw.get("icon", builtin.get("icon", "▶")))
+
     enabled = bool(raw.get("enabled", False))
     command = str(raw.get("command", "")).strip()
     if enabled and not command:
-        raise ConfigError(f"{name}.enabled is true but {name}.command is empty")
+        raise ConfigError(f"{ctx}.enabled is true but {ctx}.command is empty")
+
     working_dir = raw.get("working_dir")
     if working_dir is not None:
         # Expand ~ and $VARS so paths like "~/src/repo" work (Path/subprocess
@@ -249,20 +309,86 @@ def _parse_command(raw: object, name: str) -> CommandConfig:
         raw_dir = str(working_dir)
         working_dir = str(Path(os.path.expandvars(raw_dir)).expanduser())
         if not Path(working_dir).is_dir():
-            raise ConfigError(f"{name}.working_dir does not exist: {raw_dir}")
+            raise ConfigError(f"{ctx}.working_dir does not exist: {raw_dir}")
+
     try:
         timeout = int(raw.get("timeout_seconds", 600))
     except (TypeError, ValueError):
-        raise ConfigError(f"{name}.timeout_seconds: expected an integer") from None
+        raise ConfigError(f"{ctx}.timeout_seconds: expected an integer") from None
     if timeout < 1:
-        raise ConfigError(f"{name}.timeout_seconds: must be >= 1")
-    return CommandConfig(
-        enabled=enabled,
-        command=command,
-        working_dir=working_dir,
-        timeout_seconds=timeout,
-        include_context=bool(raw.get("include_context", False)),
+        raise ConfigError(f"{ctx}.timeout_seconds: must be >= 1")
+
+    context = raw.get("context", builtin.get("context"))
+    if context is not None:
+        context = str(context)
+        if context not in _VALID_CONTEXTS:
+            allowed = ", ".join(sorted(_VALID_CONTEXTS))
+            raise ConfigError(
+                f"{ctx}.context: unknown value {context!r} (expected one of {allowed}, "
+                "or omit it for a skill that needs no backend fetch)"
+            )
+
+    include_context = bool(raw.get("include_context", False))
+    if include_context and context is None:
+        raise ConfigError(
+            f"{ctx}.include_context is true but no 'context' source is set, so radar "
+            "wouldn't know what to fetch. Set context: gitlab_diff or jira, or drop "
+            "include_context."
+        )
+
+    stores_result = bool(raw.get("stores_result", builtin.get("stores_result", False)))
+
+    return SkillConfig(
+        name=name, label=label, button=button, icon=icon, enabled=enabled,
+        command=command, working_dir=working_dir, timeout_seconds=timeout,
+        include_context=include_context, context=context, stores_result=stores_result,
     )
+
+
+def _parse_skills(raw_top: dict) -> tuple[SkillConfig, ...]:
+    """Build the ordered skill list: the built-in review + qa (always present,
+    disabled unless configured), optionally overridden by legacy top-level
+    ``review:``/``qa:`` blocks, plus any entries from a ``skills:`` list. A
+    skills-list entry wins over a legacy block of the same name."""
+    by_name: dict[str, SkillConfig] = {}
+    order: list[str] = []
+
+    # Built-in baseline (disabled defaults), then legacy top-level blocks.
+    for name in ("review", "qa"):
+        by_name[name] = _parse_skill({}, name, name)
+        order.append(name)
+    for name in ("review", "qa"):
+        block = raw_top.get(name)
+        if block is not None:
+            by_name[name] = _parse_skill(block, name, name)
+
+    skills_raw = raw_top.get("skills")
+    if skills_raw is not None:
+        if not isinstance(skills_raw, list):
+            raise ConfigError("skills: expected a list of skill mappings")
+        seen: set[str] = set()
+        for i, entry in enumerate(skills_raw):
+            ctx = f"skills[{i}]"
+            if not isinstance(entry, dict):
+                raise ConfigError(f"{ctx}: expected a mapping")
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                raise ConfigError(f"{ctx}: missing 'name'")
+            if not _NAME_RE.match(name):
+                raise ConfigError(
+                    f"{ctx}: skill name {name!r} must be a slug — lowercase letters, "
+                    "digits, '-' or '_', starting with a letter or digit"
+                )
+            if name in _RESERVED_NAMES:
+                raise ConfigError(f"{ctx}: skill name {name!r} is reserved")
+            if name in seen:
+                raise ConfigError(f"{ctx}: duplicate skill name {name!r}")
+            seen.add(name)
+            if name not in by_name:
+                order.append(name)
+            by_name[name] = _parse_skill(entry, name, ctx)
+
+    return tuple(by_name[n] for n in order)
 
 
 def _parse_jira(raw: object) -> JiraConfig:
@@ -354,8 +480,7 @@ def load_config(path: str | Path) -> Config:
     calendar = _parse_calendar(_require(raw, "calendar", "config"))
     slas = _parse_slas(_require(raw, "slas", "config"))
     waive = _parse_waive(raw.get("waive"))
-    review = _parse_command(raw.get("review"), "review")
-    qa = _parse_command(raw.get("qa"), "qa")
+    skills = _parse_skills(raw)
     jira = _parse_jira(raw.get("jira"))
     teams = _parse_teams(raw.get("teams"))
     gamification = raw.get("gamification") or {}
@@ -368,8 +493,7 @@ def load_config(path: str | Path) -> Config:
         calendar=calendar,
         slas=slas,
         waive=waive,
-        review=review,
-        qa=qa,
+        skills=skills,
         jira=jira,
         teams=teams,
         gamification=gamification,

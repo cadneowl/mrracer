@@ -27,8 +27,6 @@ from ..db import Database
 from ..jira import extract_keys
 from ..service import build_dashboard
 
-_KINDS = {"review": "AI review", "qa": "QA test plan"}
-
 _BASE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(_BASE / "templates"))
 
@@ -73,28 +71,35 @@ def _render_markdown(text: str) -> Markup:
 def create_app(config: Config, db_path: str) -> FastAPI:
     app = FastAPI(title="radar", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=str(_BASE / "static")), name="static")
-    runners = {
-        "review": CommandRunner(config.review, "review"),
-        "qa": CommandRunner(config.qa, "qa"),
-    }
-    enabled = {"review": config.review.enabled, "qa": config.qa.enabled}
+    skills_by_name = {s.name: s for s in config.skills}
+    runners = {s.name: CommandRunner(s, s.name) for s in config.skills}
+    enabled = {s.name: s.enabled for s in config.skills}
+
+    def _skill_view(s) -> dict:
+        return {"name": s.name, "label": s.label, "button": s.button, "icon": s.icon}
+
+    # Skills that persist output: the board shows a re-openable badge per skill
+    # that has a stored result for a given MR (row.stored_kinds decides which).
+    storing_skills = [_skill_view(s) for s in config.skills if s.stores_result]
 
     def context(view: str | None) -> dict:
         with Database(db_path) as db:
             data = build_dashboard(db, config, view=view)
         data["poll_interval_minutes"] = config.gitlab.poll_interval_minutes
-        data["review_enabled"] = config.review.enabled
-        data["qa_enabled"] = config.qa.enabled
+        data["enabled_skills"] = [_skill_view(s) for s in config.skills if s.enabled]
+        data["storing_skills"] = storing_skills
         return data
 
     def _panel(request: Request, job, generated_at: str | None = None) -> HTMLResponse:
+        skill = skills_by_name.get(job.kind)
         return templates.TemplateResponse(
             request,
             "_command_panel.html",
             {
                 "job": job,
                 "kind": job.kind,
-                "heading": _KINDS.get(job.kind, job.kind),
+                "heading": skill.label if skill else job.kind,
+                "icon": skill.icon if skill else "▶",
                 "generated_at": generated_at,
                 "output_html": _render_markdown(job.output) if job.status == "done" else None,
             },
@@ -143,12 +148,12 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         ctx, keys = _ctx_for(snap, project_id, mr_iid)
 
         on_success = None
-        if kind == "qa":
+        if skills_by_name[kind].stores_result:
             csv = ",".join(keys)
 
             def on_success(job) -> None:
                 with Database(db_path) as db:
-                    db.save_test_plan(project_id, mr_iid, csv, job.output)
+                    db.save_test_plan(project_id, mr_iid, kind, csv, job.output)
 
         stdin_provider = stdin_provider_for(kind, config, project_id, mr_iid, keys)
         job = runners[kind].start(ctx, on_success=on_success, stdin_provider=stdin_provider)
@@ -199,14 +204,17 @@ def create_app(config: Config, db_path: str) -> FastAPI:
     def command_close(kind: str):
         return HTMLResponse("")  # htmx swaps this empty content in to dismiss
 
-    @app.get("/qa/stored/{project_id}/{mr_iid}", response_class=HTMLResponse)
-    def stored_plan(request: Request, project_id: int, mr_iid: int):
+    @app.get("/{kind}/stored/{project_id}/{mr_iid}", response_class=HTMLResponse)
+    def stored_plan(request: Request, kind: str, project_id: int, mr_iid: int):
+        skill = skills_by_name.get(kind)
+        if skill is None or not skill.stores_result:
+            raise HTTPException(status_code=404, detail=f"{kind} has no stored results")
         with Database(db_path) as db:
-            plan = db.get_test_plan(project_id, mr_iid)
+            plan = db.get_test_plan(project_id, mr_iid, kind)
         if plan is None:
-            raise HTTPException(status_code=404, detail="no stored test plan")
+            raise HTTPException(status_code=404, detail="no stored result")
         job = CommandJob(
-            id="stored", kind="qa", project_id=project_id, mr_iid=mr_iid,
+            id="stored", kind=kind, project_id=project_id, mr_iid=mr_iid,
             title=f"{plan['jira_keys']}", status="done", output=plan["content"],
         )
         return _panel(request, job, generated_at=plan["generated_at"])

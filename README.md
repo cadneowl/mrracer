@@ -205,6 +205,40 @@ command). The tokens stay inside radar's process; they're still stripped from
 the child's environment. The fetch runs inside the job (you'll see a "fetching
 context…" line), and a fetch failure surfaces as a clear job error.
 
+### Add your own skills (custom board buttons)
+
+`review` and `qa` are just the two **built-in** skills. You can add any number of
+your own with a `skills:` list — each entry becomes another button on every MR
+row, running whatever command you configure:
+
+```yaml
+skills:
+  - name: dba            # url/id slug; must be unique
+    label: DBA review    # panel heading / long name
+    button: DBA          # short button text (optional; defaults to label)
+    icon: "🗄"           # emoji shown on the button (optional)
+    enabled: true
+    command: 'claude -p "/dba {web_url}"'
+    working_dir: /path/to/checkout
+    timeout_seconds: 600
+```
+
+A skill in the list takes the **same fields** as `review`/`qa` and the same
+placeholders, safety guards, streaming, and sanitized-markdown output. Two
+capabilities are opt-in via extra fields:
+
+- `context: gitlab_diff` or `context: jira` — pair with `include_context: true`
+  to have radar fetch that backend and pipe it to the skill on stdin (see above).
+  Omit `context` for a skill that needs no backend fetch.
+- `stores_result: true` — persist the output and show a **✓** badge that re-opens
+  it (this is what `qa` uses for saved test plans).
+
+The built-in `review`/`qa` skills can also be written as `skills:` entries (by
+`name`) instead of the legacy top-level `review:`/`qa:` blocks — both forms work,
+and a `skills:` entry wins if you configure the same name in both places. Every
+enabled skill also appears in `radar check` so you can confirm its command is on
+`PATH`.
+
 ### Business-hours math
 
 SLA budgets are in **business hours**. Weekends and off-hours never burn budget.

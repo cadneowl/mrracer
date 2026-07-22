@@ -6,7 +6,7 @@
   <div class="modal">
     <div class="modal-head">
       <span class="modal-title">
-        {% if kind == "qa" %}🧪{% else %}🔍{% endif %} {{ heading }} —
+        {{ icon }} {{ heading }} —
         {{ job.title }} <span class="mrid">!{{ job.mr_iid }}</span>
         {% if generated_at %}<span class="stamp">saved {{ generated_at[:19] }}Z</span>{% endif %}
       </span>
