@@ -11,9 +11,11 @@ import os
 import shlex
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
 from .config import Config, ConfigError, gitlab_credentials, jira_credentials
 from .db import Database
+from .dotenv import candidates, load_dotenv
 from .skillcontext import resolve_inputs, resolve_source
 from .tls import ca_trust_state
 from .worktree import is_git_repo
@@ -54,6 +56,36 @@ def _check_database(config: Config) -> Check:
         )
     except Exception as exc:  # noqa: BLE001 - report, never crash the run
         return Check("database", "fail", f"{config.database_path}: {exc}")
+
+
+def _check_dotenv(config_path: str | Path | None) -> Check:
+    """Whether a .env was found, and what it contributed.
+
+    Reported because the failure it prevents is invisible: a variable that was
+    never read looks identical to one that was never needed, and the error
+    surfaces much later as a certificate or auth failure naming no setting at
+    all. Names are listed; values never are, since this file holds tokens.
+    """
+    found = [p for p in candidates(config_path) if p.is_file()]
+    if not found:
+        looked = ", ".join(str(p) for p in candidates(config_path))
+        return Check("env.dotenv", "skip", f"no .env (looked in {looked})")
+
+    # Re-reading is safe: load_dotenv never overwrites a variable that already
+    # has a value, so by now everything it can contribute is already applied and
+    # this second pass reports rather than changes.
+    result = load_dotenv(config_path)
+    where = ", ".join(str(p) for p in result.files)
+    if result.problems:
+        return Check("env.dotenv", "warn", "; ".join(result.problems))
+    detail = f"{where}: {len(result.applied) + len(result.overridden)} variable(s)"
+    if result.applied:
+        detail += f" · from file: {', '.join(result.applied)}"
+    if result.overridden:
+        detail += f" · shell wins: {', '.join(result.overridden)}"
+    if result.malformed:
+        return Check("env.dotenv", "warn", f"{detail} · {result.malformed} unparsable line(s)")
+    return Check("env.dotenv", "ok", detail)
 
 
 def _check_tls() -> Check:
@@ -270,7 +302,7 @@ def _check_note_parsing(config: Config) -> Check | None:
     return Check("note_parsing", "ok", f"{from_notes}/{total} review requests from system notes")
 
 
-def run_checks(config: Config) -> list[Check]:
+def run_checks(config: Config, config_path: str | Path | None = None) -> list[Check]:
     """Run every diagnostic and return the results (order = report order)."""
     checks: list[Check] = [
         Check(
@@ -280,6 +312,7 @@ def run_checks(config: Config) -> list[Check]:
             f"{len(config.teams)} team(s), default tz {config.calendar.default_timezone}",
         ),
         _check_database(config),
+        _check_dotenv(config_path),
         _check_tls(),
     ]
     checks.extend(_check_gitlab(config))

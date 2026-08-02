@@ -18,6 +18,7 @@ import sys
 
 from .config import ConfigError, gitlab_credentials, load_config
 from .db import Database
+from .dotenv import load_dotenv
 from .poller import poll_once
 from .service import recompute as run_recompute
 from .tls import sync_ca_bundle
@@ -114,7 +115,7 @@ def cmd_check(args) -> int:
     from .diagnostics import run_checks
 
     config = load_config(args.config)
-    checks = run_checks(config)
+    checks = run_checks(config, config_path=args.config)
     width = max(len(c.name) for c in checks)
     failed = warned = 0
     for c in checks:
@@ -155,6 +156,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _setup_logging(getattr(args, "verbose", False))
+    # Order matters: the CA bundle is one of the things a .env is most likely to
+    # carry, so the file has to be read before anything is propagated from the
+    # environment — otherwise there is nothing there to propagate.
+    dotenv = load_dotenv(getattr(args, "config", None))
+    for problem in dotenv.problems:
+        log.warning("%s", problem)
+    if dotenv.files:
+        log.debug(".env: %s", dotenv.summary())
     # Before anything opens a socket, and after logging exists so the result is
     # reported the same way as everything else.
     bundle = sync_ca_bundle()

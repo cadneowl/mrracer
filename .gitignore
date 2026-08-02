@@ -17,6 +17,10 @@ uv.lock
 radar.db*
 config.yaml
 
+# credentials read at startup — a token lives here
+.env
+.env.*
+
 # editors / OS
 .vscode/
 .idea/
