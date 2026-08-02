@@ -10,6 +10,13 @@
 #   JIRA_EMAIL      your Atlassian account email
 #   JIRA_API_TOKEN  an API token (id.atlassian.com -> Security -> API tokens)
 #
+# Behind a TLS-inspecting proxy (Zscaler & co.), point ONE of these at your
+# organisation's root cert and radar copies it to the rest at startup — GitLab
+# goes through requests and Jira through urllib, and they read different ones:
+#   REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE     (requests: GitLab)
+#   SSL_CERT_FILE / SSL_CERT_DIR            (urllib: Jira)
+# `radar check` prints a tls.ca_bundle line saying what each will trust.
+#
 # Copy this file to config.yaml and edit for your team.
 
 gitlab:

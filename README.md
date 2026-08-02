@@ -452,7 +452,36 @@ $env:GITLAB_URL = "https://gitlab.example.com"
 $env:GITLAB_TOKEN = "glpat-xxxxxxxxxxxxxxxxxxxx"
 ```
 
-### 2. Configure
+### 2. Behind a TLS-inspecting proxy (Zscaler & co.)
+
+Skip this unless HTTPS is intercepted on your network. If it is, every call must
+trust your organisation's root certificate — and radar reaches its two backends
+through two HTTP stacks that read **different** environment variables:
+
+| Backend | Stack | Reads |
+|---|---|---|
+| GitLab | `python-gitlab` → `requests` | `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` |
+| Jira | `urllib` → `ssl` | `SSL_CERT_FILE`, `SSL_CERT_DIR` |
+
+Neither looks at the other's. A proxy installer typically exports only
+`REQUESTS_CA_BUNDLE`, which is why the board can poll GitLab perfectly while the
+QA button dies on a certificate error (or the reverse).
+
+**Set whichever one you like — radar copies it to the others at startup**, so
+both stacks and any skill it launches agree:
+
+```bash
+export REQUESTS_CA_BUNDLE=/path/to/corp-root.pem   # any one of the four
+```
+
+A variable you set yourself is never overwritten, so pointing the two stacks at
+different bundles deliberately still works. A path that doesn't exist is *not*
+propagated — Python ignores a missing bundle and silently falls back to the
+system store, so radar logs a warning rather than spreading a typo. `radar check`
+prints a `tls.ca_bundle` line ahead of the GitLab and Jira checks reporting what
+each stack will actually trust.
+
+### 3. Configure
 
 ```bash
 cp config.example.yaml config.yaml
@@ -460,7 +489,7 @@ cp config.example.yaml config.yaml
 uv run radar validate            # sanity-check the file
 ```
 
-### 3. Poll and serve
+### 4. Poll and serve
 
 ```bash
 uv run radar poll-once           # fetch once, print obligation counts
