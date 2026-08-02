@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from .config import Config, ConfigError, gitlab_credentials, jira_credentials
 from .db import Database
+from .skillcontext import resolve_inputs, resolve_source
+from .worktree import is_git_repo
 
 
 @dataclass
@@ -91,7 +93,7 @@ def _check_gitlab(config: Config) -> list[Check]:
 
 def _check_jira(config: Config) -> Check:
     needed = any(
-        s.enabled and s.include_context and s.context == "jira" for s in config.skills
+        s.enabled and s.include_context and "jira" in s.contexts for s in config.skills
     )
     try:
         base, email, token = jira_credentials()
@@ -119,11 +121,115 @@ def _check_commands(config: Config) -> list[Check]:
             continue
         exe = _first_token(skill.command)
         if exe and shutil.which(exe):
-            ctx = " · include_context (radar fetches)" if skill.include_context else ""
+            fetched = ", ".join(skill.contexts) if skill.include_context else ""
+            ctx = f" · fetches {fetched}" if fetched else ""
             out.append(Check(f"{name}.command", "ok", f"'{exe}' on PATH{ctx}"))
         else:
             out.append(Check(f"{name}.command", "warn", f"'{exe}' not found on PATH"))
     return out
+
+
+def _check_skill_context(config: Config) -> list[Check]:
+    """Report each enabled skill's declared context bag, resolved.
+
+    The point is to fail here rather than at the click: an unset ``required``
+    var or a source root that is not a directory is a deployment problem, and
+    seeing it in ``radar check`` beats seeing an agent produce a confident
+    review of a tree it never opened. Values are never printed — an ``env:``
+    entry shows as its source.
+    """
+    out: list[Check] = []
+    for skill in config.skills:
+        if not skill.enabled or (skill.source is None and not skill.inputs):
+            continue
+        try:
+            out.append(_skill_context_check(config, skill))
+        except Exception as exc:  # noqa: BLE001 - report, never crash the run
+            out.append(Check(f"{skill.name}.context", "fail", str(exc)))
+    return out
+
+
+def _skill_context_check(config: Config, skill) -> Check:
+    """One skill's resolved bag, as a single check (see ``_check_skill_context``)."""
+    name = f"{skill.name}.context"
+    # Resolved per project, because that is how a job resolves it: a root that
+    # serves project A and is missing for project B is not an ok.
+    roots: dict[str, str] = {}
+    rootless: list[str] = []
+    unmatched: list[str] = []
+    by_message: dict[str, list[str]] = {}
+    for project in config.gitlab.projects:
+        # Matched here by the name in `gitlab.projects`, which is all a check
+        # has: a job matches on the numeric project id too, so a mapping keyed
+        # by id against paths listed here resolves at run time even though it
+        # cannot be resolved now. That is a caveat to report, not a failure.
+        if skill.source is not None and skill.source.input_for(project, "") is None:
+            unmatched.append(project)
+            continue
+        root, issues = resolve_source(skill.source, project, "")
+        for issue in issues:
+            by_message.setdefault(issue, []).append(project)
+        if root:
+            roots[project] = root
+        elif skill.source is not None and not issues:
+            rootless.append(project)
+
+    # One declaration covering every project raises the same problem once per
+    # project: say it once, and name the projects only when it is not all of them.
+    problems = [
+        msg if len(hit) == len(config.gitlab.projects) else f"{', '.join(hit)}: {msg}"
+        for msg, hit in by_message.items()
+    ]
+
+    resolved = resolve_inputs(skill.inputs)
+    problems += [f"input '{n}': {var} is not set" for n, var in resolved.missing]
+
+    # `checkout: worktree` is git's to satisfy, and both ways it can fail are
+    # invisible until someone presses the button.
+    if skill.checkout == "worktree":
+        if shutil.which("git") is None:
+            problems.append("checkout: worktree needs git on PATH")
+        else:
+            problems += [
+                f"{project}: {root} is not a git repository, so no worktree can be made"
+                for project, root in roots.items()
+                if not is_git_repo(root)
+            ]
+
+    distinct = set(roots.values())
+    if not roots:
+        detail = "no source root resolved"
+    elif len(distinct) == 1:
+        detail = next(iter(distinct))  # one checkout serves every project
+    else:
+        detail = "; ".join(f"{project} -> {root}" for project, root in roots.items())
+    if skill.checkout == "worktree":
+        detail += f" · worktree per job (fetching from '{skill.remote}')"
+    if resolved.redacted:
+        detail += " · inputs: " + ", ".join(f"{k}={v}" for k, v in resolved.redacted.items())
+
+    if problems:
+        return Check(name, "fail", "; ".join(problems))
+    if unmatched:
+        return Check(
+            name,
+            "warn",
+            f"no 'source:' entry matches {', '.join(unmatched)} — a job on one of those "
+            "will refuse to run unless the mapping is keyed by that project's numeric id, "
+            f"or a 'default:' is added · {detail}",
+        )
+    if rootless:
+        # Declared, matched, and optional-but-unset: legal (the skill runs
+        # without a checkout) and worth saying out loud, because "I set that
+        # variable" and "that variable is exported where radar runs" are
+        # different claims.
+        return Check(
+            name,
+            "warn",
+            f"no checkout resolved for {', '.join(rootless)} — the declared variable is "
+            f"not set, so the skill runs without one · {detail}",
+        )
+    return Check(name, "ok", detail)
 
 
 def _check_note_parsing(config: Config) -> Check | None:
@@ -165,6 +271,7 @@ def run_checks(config: Config) -> list[Check]:
     checks.extend(_check_gitlab(config))
     checks.append(_check_jira(config))
     checks.extend(_check_commands(config))
+    checks.extend(_check_skill_context(config))
     note = _check_note_parsing(config)
     if note is not None:
         checks.append(note)

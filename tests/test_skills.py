@@ -67,7 +67,7 @@ def test_custom_skill_parsed_with_defaults(tmp_path):
     dba = cfg.skill_by_name("dba")
     assert dba.enabled and dba.label == "DBA review" and dba.icon == "🗄"
     assert dba.button == "DBA review"  # button defaults to label
-    assert dba.context is None and dba.stores_result is False  # generic: no capabilities
+    assert dba.contexts == () and dba.stores_result is False  # generic: no capabilities
 
 
 def test_custom_skill_button_and_flow(tmp_path):
@@ -134,7 +134,7 @@ def test_skills_list_entry_can_configure_builtin_review(tmp_path):
     )
     review = cfg.skill_by_name("review")
     assert review.enabled and review.icon == "🔍" and review.button == "review"
-    assert review.context == "gitlab_diff" and review.include_context is True
+    assert review.contexts == ("gitlab_diff",) and review.include_context is True
 
 
 def test_include_context_without_source_is_rejected(tmp_path):
@@ -186,7 +186,7 @@ def test_skills_list_entry_wins_over_legacy_block(tmp_path):
     )
     qa = cfg.skill_by_name("qa")
     assert qa.command == "list-command {jira_keys}"  # skills-list overrides legacy
-    assert qa.context == "jira" and qa.stores_result is True  # built-in caps retained
+    assert qa.contexts == ("jira",) and qa.stores_result is True  # built-in caps retained
     assert [s.name for s in cfg.skills] == ["review", "qa"]  # no duplicate entry
 
 

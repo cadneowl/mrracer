@@ -38,6 +38,9 @@ def normalize_mr(raw: dict) -> dict:
         "web_url": raw.get("web_url"),
         "source_branch": raw.get("source_branch"),
         "target_branch": raw.get("target_branch"),
+        # The MR's head commit. Present on the list endpoint, so it costs no
+        # extra call; it is what a skill checks out to read the proposed code.
+        "head_sha": raw.get("sha"),
         "description": raw.get("description") or "",
         "labels": list(raw.get("labels", []) or []),
         "draft": bool(raw.get("draft", raw.get("work_in_progress", False))),
@@ -51,10 +54,17 @@ def normalize_mr(raw: dict) -> dict:
 class GitLabSource:
     """Live GitLab source backed by python-gitlab."""
 
-    def __init__(self, url: str, token: str):
+    # Per-request ceiling. Without one, python-gitlab (requests) waits forever:
+    # a server that accepts the connection and never answers would hang the
+    # poller's scheduler thread, or a review job, with nothing to time it out.
+    HTTP_TIMEOUT_S = 60
+
+    def __init__(self, url: str, token: str, timeout: int | None = None):
         import gitlab  # imported lazily so tests need no network stack
 
-        self._gl = gitlab.Gitlab(url, private_token=token)
+        self._gl = gitlab.Gitlab(
+            url, private_token=token, timeout=timeout or self.HTTP_TIMEOUT_S
+        )
         self._project_cache: dict[str, object] = {}
 
     def _project(self, project: str):
@@ -88,7 +98,7 @@ class GitLabSource:
         return [dict(d.attributes) for d in mr.discussions.list(iterator=True)]
 
     def get_mr_context(self, project_id: int, mr_iid: int) -> dict:
-        """Title, description, and unified diff of an MR (for backend fetch)."""
+        """Title, description, refs, and unified diff of an MR (backend fetch)."""
         proj = self._gl.projects.get(project_id, lazy=True)
         mr = proj.mergerequests.get(mr_iid)
         changes = mr.changes().get("changes", [])
@@ -96,7 +106,18 @@ class GitLabSource:
             f"diff --git a/{c.get('old_path')} b/{c.get('new_path')}\n{c.get('diff', '')}"
             for c in changes
         )
-        return {"title": mr.title, "description": mr.description or "", "diff": diff}
+        # diff_refs pins the diff to exact commits, so a skill with a checkout
+        # can read the same snapshot the diff was computed against rather than
+        # whatever the branch has moved on to.
+        refs = getattr(mr, "diff_refs", None) or {}
+        return {
+            "title": mr.title,
+            "description": mr.description or "",
+            "diff": diff,
+            "base_sha": refs.get("base_sha"),
+            "head_sha": refs.get("head_sha") or getattr(mr, "sha", None),
+            "start_sha": refs.get("start_sha"),
+        }
 
 
 class FixtureSource:

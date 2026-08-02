@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import sys
+import threading
 import time
 
 import pytest
@@ -22,6 +23,7 @@ from tests.conftest import ev, ny
 
 PY = f'"{sys.executable}"'
 ECHO_STDIN = f'{PY} -c "import sys; sys.stdout.write(sys.stdin.read())"'
+SLEEP_2 = f'{PY} -c "import time; time.sleep(2); print(1)"'
 
 
 # --- context formatting ----------------------------------------------------
@@ -89,15 +91,65 @@ def test_runner_pipes_stdin_provider_to_command():
     cfg = ReviewConfig(enabled=True, command=ECHO_STDIN, timeout_seconds=30)
     runner = CommandRunner(cfg, "review")
     job = runner.start(
-        {"project_id": 1, "mr_iid": 2}, stdin_provider=lambda: "# Diff\nHELLO-FROM-STDIN"
+        {"project_id": 1, "mr_iid": 2},
+        stdin_provider=lambda root="", inputs=None: "# Diff\nHELLO-FROM-STDIN",
     )
     done = _await(runner, job)
     assert done.status == "done"
     assert "HELLO-FROM-STDIN" in done.output
 
 
+def test_a_hanging_context_fetch_fails_the_job_instead_of_running_forever():
+    """`timeout_seconds` is the whole job's budget, not just the command's.
+
+    A context fetch talks to GitLab/Jira, and a socket with no answer coming
+    back has no timeout of its own — the job would sit in "running" forever and
+    the panel would tail it just as long.
+    """
+    stuck = threading.Event()
+
+    def never_returns(source_root="", inputs=None):
+        stuck.wait(30)  # a server that accepts the connection and says nothing
+        return "too late"
+
+    cfg = ReviewConfig(enabled=True, command=ECHO_STDIN, timeout_seconds=2)
+    runner = CommandRunner(cfg, "review")
+    started = time.time()
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2},
+                                       stdin_provider=never_returns))
+    elapsed = time.time() - started
+    stuck.set()
+
+    assert done.status == "error"
+    assert "timed out" in done.error and "fetching context" in done.error
+    assert elapsed < 15  # gave up on its own budget, not the fetch's
+
+
+def test_the_command_gets_what_is_left_of_the_budget():
+    """Preparation is spent from the same clock, so a slow fetch shortens the
+    command's share rather than being added on top of it.
+
+    Asserted as an outcome rather than a stopwatch reading, so a loaded machine
+    cannot turn it into a flake: a 4s budget mostly eaten by a 3s fetch leaves
+    the command about a second, which a 2s command overruns — while a command
+    given its own fresh 4s would finish comfortably and the job would be "done".
+    """
+    cfg = ReviewConfig(enabled=True, command=SLEEP_2, timeout_seconds=4)
+    runner = CommandRunner(cfg, "review")
+    done = _await(
+        runner,
+        runner.start(
+            {"project_id": 1, "mr_iid": 2},
+            stdin_provider=lambda root="", inputs=None: (time.sleep(3), "ctx")[1],
+        ),
+        timeout=30,
+    )
+    assert done.status == "error", "the command outlived a budget it should have shared"
+    assert "timed out" in done.error
+
+
 def test_runner_stdin_provider_failure_is_job_error():
-    def boom():
+    def boom(source_root="", inputs=None):
         raise RuntimeError("fetch failed")
 
     cfg = ReviewConfig(enabled=True, command=ECHO_STDIN, timeout_seconds=30)
@@ -175,7 +227,7 @@ review:
     import radar.web.app as appmod
 
     def fake_provider(kind, cfg, pid, iid, keys):
-        return (lambda: "BACKEND-DIFF-MARKER") if kind == "review" else None
+        return (lambda root="", inputs=None: "BACKEND-DIFF-MARKER") if kind == "review" else None
 
     monkeypatch.setattr(appmod, "stdin_provider_for", fake_provider)
 

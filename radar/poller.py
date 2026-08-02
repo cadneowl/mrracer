@@ -147,6 +147,7 @@ def _poll_project(db: Database, config: Config, source: MRSource, key: str) -> t
             web_url=mr["web_url"],
             source_branch=mr["source_branch"],
             target_branch=mr["target_branch"],
+            head_sha=mr.get("head_sha"),
             description=mr["description"],
             labels=mr["labels"],
             draft=mr["draft"],
