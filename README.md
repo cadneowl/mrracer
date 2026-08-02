@@ -80,12 +80,17 @@ and shows its stdout as a rendered markdown review, in a modal over the board.
 It's tool-agnostic — point it at whatever review skill you've prepared:
 
 ```yaml
-review:
-  enabled: true
-  command: 'claude -p "/code-review {web_url}"'   # e.g. a Claude Code skill, headless
-  working_dir: /path/to/checkout                  # optional; where to run it
-  timeout_seconds: 600                            # budget for the whole job
+skills:
+  - name: review
+    enabled: true
+    command: 'claude -p "/code-review {web_url}"' # e.g. a Claude Code skill, headless
+    working_dir: /path/to/checkout                # optional; where to run it
+    timeout_seconds: 600                          # budget for the whole job
 ```
+
+Every skill lives in the `skills:` list — that is the only place they are
+declared. `review` and `qa` are ordinary entries whose **names** carry defaults
+(see [Add your own skills](#add-your-own-skills-custom-board-buttons)).
 
 `timeout_seconds` bounds the **whole job**, not just the command: preparing a
 checkout and fetching the MR's context both talk to the network and are spent
@@ -166,11 +171,12 @@ jira:
   base_url: https://yourco.atlassian.net   # for the issue links
   project_keys: [PROJ, BUG]                # optional filter
 
-qa:
-  enabled: true
-  command: 'claude -p "/qa-testplan {jira_keys}"'
-  working_dir: /path/to/checkout
-  timeout_seconds: 900
+skills:
+  - name: qa
+    enabled: true
+    command: 'claude -p "/qa-testplan {jira_keys}"'
+    working_dir: /path/to/checkout
+    timeout_seconds: 900
 ```
 
 radar recognises Jira keys (`PROJ-123`) in each MR's **branch, title, and
@@ -197,10 +203,11 @@ credentials, and a WebFetch of a private MR just returns a login page. Set
 already holds the tokens) and pipes it to the skill on **stdin**:
 
 ```yaml
-review:
-  include_context: true    # radar fetches the MR title/description/diff -> stdin
-qa:
-  include_context: true    # radar fetches the Jira ticket(s) + epic children -> stdin
+skills:
+  - name: review
+    include_context: true  # radar fetches the MR title/description/diff -> stdin
+  - name: qa
+    include_context: true  # radar fetches the Jira ticket(s) + epic children -> stdin
 ```
 
 - **Review** uses `GITLAB_URL` / `GITLAB_TOKEN` (the same env the poller uses).
@@ -216,10 +223,11 @@ context…" line), and a fetch failure surfaces as a clear job error.
 `context:` takes a **list**, so one skill can be given both:
 
 ```yaml
-review:
-  enabled: true
-  include_context: true
-  context: [gitlab_diff, jira]   # the diff *and* the ticket that motivated it
+skills:
+  - name: review
+    enabled: true
+    include_context: true
+    context: [gitlab_diff, jira]  # the diff *and* the ticket that motivated it
 ```
 
 ### Tell a skill where the code is (`source:` and `inputs:`)
@@ -337,9 +345,9 @@ pin its own comparison.
 
 ### Add your own skills (custom board buttons)
 
-`review` and `qa` are just the two **built-in** skills. You can add any number of
-your own with a `skills:` list — each entry becomes another button on every MR
-row, running whatever command you configure:
+Every skill is an entry in the `skills:` list, and each one becomes a button on
+every MR row. `review` and `qa` are entries like any other — nothing exists
+until the list names it. Add as many of your own as you like:
 
 ```yaml
 skills:
@@ -353,9 +361,9 @@ skills:
     timeout_seconds: 600
 ```
 
-A skill in the list takes the **same fields** as `review`/`qa` and the same
-placeholders, safety guards, streaming, and sanitized-markdown output. Two
-capabilities are opt-in via extra fields:
+Every entry takes the **same fields** and gets the same placeholders, safety
+guards, streaming, and sanitized-markdown output. These capabilities are opt-in
+via extra fields:
 
 - `context: gitlab_diff` / `context: jira` / `context: [gitlab_diff, jira]` — pair
   with `include_context: true` to have radar fetch those backends and pipe them to
@@ -368,11 +376,27 @@ capabilities are opt-in via extra fields:
 - `checkout: worktree` (+ optional `remote:`) — give each job its own worktree at
   the MR's head commit instead of sharing the configured checkout (see above).
 
-The built-in `review`/`qa` skills can also be written as `skills:` entries (by
-`name`) instead of the legacy top-level `review:`/`qa:` blocks — both forms work,
-and a `skills:` entry wins if you configure the same name in both places. Every
-enabled skill also appears in `radar check` so you can confirm its command is on
-`PATH`.
+**Two names come with defaults.** `review` and `qa` aren't special *skills* —
+they're names that carry the one capability a command line can't advertise:
+
+| `name:` | inherits |
+|---|---|
+| `review` | `context: gitlab_diff`, the 🔍 icon |
+| `qa` | `context: jira`, `stores_result: true`, the 🧪 icon |
+
+They are defaults, not magic — write `context:` or `stores_result:` yourself and
+yours wins. Any other name starts with no capabilities at all, so a skill that
+needs the diff says `context: gitlab_diff` outright.
+
+Skills are declared **only** here. Older versions also accepted top-level
+`review:` and `qa:` blocks; those are now refused with a message pointing at the
+list, because two ways to declare one skill meant a `skills:` entry could
+silently replace a block of the same name, and a `review` button could appear on
+the board without appearing in `skills:`. Moving a block is mechanical — indent
+it under `skills:` and give it `- name: review`.
+
+Every enabled skill also appears in `radar check`, so you can confirm its command
+is on `PATH` before clicking it.
 
 ### Business-hours math
 
@@ -480,6 +504,9 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `calendar.reviewer_timezones` | Per-reviewer timezone overrides. |
 | `slas` | Ordered rules; **first match wins**. Each has a `match` (optional `target_branch` glob and/or required `labels`) and `first_response_business_hours` / `approval_business_hours`. The last rule must be the default `match: {}`. |
 | `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is **currently** a draft, or the MR carries any `labels` listed here. (Only the current draft state waives; historical draft periods are not subtracted from the clock.) |
+| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`. The names `review` and `qa` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
+| `jira` | `base_url` (builds the `PROJ-123` browse links on the board) and `project_keys` (optional filter so `UTF-8`-shaped tokens aren't matched). Not a credential — fetching a ticket uses `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` from the environment. |
+| `teams` | Named GitLab-username groups; each becomes an *authored* / *to review* filter pill on the board. |
 | `gamification` | Consumed in Phase 3; carried verbatim for now. |
 
 Secrets are **never** in this file — only `GITLAB_URL` / `GITLAB_TOKEN` in the

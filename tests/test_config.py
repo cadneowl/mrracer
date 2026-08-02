@@ -41,17 +41,37 @@ def test_missing_file(tmp_path):
         load_config(tmp_path / "nope.yaml")
 
 
+def test_example_config_is_loadable_and_current():
+    """The shipped example is the first thing an operator copies, so it is held
+    to the same parser as their real file — a config.example.yaml that has
+    drifted into a shape radar no longer accepts is worse than none."""
+    cfg = load_config(Path(__file__).resolve().parent.parent / "config.example.yaml")
+    # Every skill lives in `skills:`, including the two whose names carry
+    # built-in capabilities. Nothing appears that the file did not declare.
+    assert [s.name for s in cfg.skills] == ["review", "qa", "dba"]
+    assert all(not s.enabled for s in cfg.skills)  # opt in deliberately
+    assert cfg.skill_by_name("review").contexts == ("gitlab_diff",)
+    qa = cfg.skill_by_name("qa")
+    assert qa.contexts == ("jira",) and qa.stores_result is True
+    assert cfg.skill_by_name("dba").contexts == ()  # a plain name inherits nothing
+
+
 def test_working_dir_expands_tilde(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))       # posix expanduser
     monkeypatch.setenv("USERPROFILE", str(tmp_path))  # windows expanduser
     (tmp_path / "repo").mkdir()
-    text = VALID + "\nreview: {enabled: true, command: 'claude -p /x', working_dir: '~/repo'}\n"
+    text = VALID + (
+        "\nskills:\n"
+        "  - {name: review, enabled: true, command: 'claude -p /x', working_dir: '~/repo'}\n"
+    )
     cfg = load_config(_write(tmp_path, text))
-    assert Path(cfg.review.working_dir) == (tmp_path / "repo")  # ~ was expanded
+    assert Path(cfg.skill_by_name("review").working_dir) == (tmp_path / "repo")  # ~ expanded
 
 
 def test_working_dir_missing_reports_original(tmp_path):
-    text = VALID + "\nreview: {enabled: true, command: 'x', working_dir: '~/nope-xyz'}\n"
+    text = VALID + (
+        "\nskills:\n  - {name: review, enabled: true, command: 'x', working_dir: '~/nope-xyz'}\n"
+    )
     with pytest.raises(ConfigError, match="~/nope-xyz"):  # error shows what the user wrote
         load_config(_write(tmp_path, text))
 

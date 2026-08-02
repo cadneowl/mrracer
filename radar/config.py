@@ -152,20 +152,17 @@ class Config:
         return None
 
     def skill_by_name(self, name: str) -> SkillConfig | None:
+        """The skill declared under ``name``, or None if the config never names it.
+
+        None means absent, and callers are expected to say so. An earlier version
+        of this returned a disabled placeholder for ``review``/``qa`` so callers
+        could dot into it unconditionally, which made a skill nobody configured
+        indistinguishable from one deliberately turned off.
+        """
         for skill in self.skills:
             if skill.name == name:
                 return skill
         return None
-
-    @property
-    def review(self) -> SkillConfig:
-        """Back-compat accessor for the built-in review skill."""
-        return self.skill_by_name("review") or SkillConfig(name="review")
-
-    @property
-    def qa(self) -> SkillConfig:
-        """Back-compat accessor for the built-in qa skill."""
-        return self.skill_by_name("qa") or SkillConfig(name="qa")
 
 
 # --- helpers ---------------------------------------------------------------
@@ -289,10 +286,12 @@ _VALID_CHECKOUTS = {"none", "worktree"}
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _RESERVED_NAMES = frozenset({"status", "stream", "close", "stored"})
 
-# The two built-in skills. They always exist (disabled unless configured), so
-# the dashboard and `radar check` have a stable review + qa baseline, and each
-# carries the special capability the generic skill machinery can't infer: review
-# pipes the MR diff to stdin; qa pipes the Jira ticket(s) and persists the plan.
+# Defaults carried by two well-known names. They are *not* skills in their own
+# right — nothing exists until `skills:` declares it — but a skill that claims
+# one of these names inherits the capability the generic machinery cannot infer
+# from a command line: review pipes the MR diff to stdin; qa pipes the Jira
+# ticket(s) and persists its output. Anything here can still be overridden
+# per-skill; declaring `context:` or `stores_result:` explicitly always wins.
 _BUILTIN_SKILLS: dict[str, dict] = {
     "review": {
         "label": "AI review", "button": "review", "icon": "🔍",
@@ -412,50 +411,63 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
     )
 
 
-def _parse_skills(raw_top: dict, base_dir: Path) -> tuple[SkillConfig, ...]:
-    """Build the ordered skill list: the built-in review + qa (always present,
-    disabled unless configured), optionally overridden by legacy top-level
-    ``review:``/``qa:`` blocks, plus any entries from a ``skills:`` list. A
-    skills-list entry wins over a legacy block of the same name."""
-    by_name: dict[str, SkillConfig] = {}
-    order: list[str] = []
+# Where `review:` and `qa:` used to be configurable, back when they were the
+# only two buttons. Kept only to be refused by name: silently ignoring a block
+# would take a working button off a dashboard without saying so.
+_LEGACY_SKILL_BLOCKS = ("review", "qa")
 
-    # Built-in baseline (disabled defaults), then legacy top-level blocks.
-    for name in ("review", "qa"):
-        by_name[name] = _parse_skill({}, name, name, base_dir)
-        order.append(name)
-    for name in ("review", "qa"):
-        block = raw_top.get(name)
-        if block is not None:
-            by_name[name] = _parse_skill(block, name, name, base_dir)
+
+def _parse_skills(raw_top: dict, base_dir: Path) -> tuple[SkillConfig, ...]:
+    """Build the skill list from ``skills:`` — the one place skills are declared.
+
+    A skill exists because the config names it, and in the order the config
+    names it. Nothing is contributed from anywhere else: two ways to declare the
+    same skill meant one silently replaced the other, and a baseline nobody
+    wrote meant ``config.skills`` did not match the file you were reading.
+    """
+    for name in _LEGACY_SKILL_BLOCKS:
+        if name in raw_top:
+            raise ConfigError(
+                f"{name}: top-level '{name}:' blocks are no longer read — every skill "
+                f"is declared in the 'skills:' list. Move this block there:\n\n"
+                f"  skills:\n"
+                f"    - name: {name}\n"
+                f"      enabled: true\n"
+                f"      command: ...\n\n"
+                f"The fields are unchanged, and the name keeps what it means: review "
+                f"defaults to context: gitlab_diff, qa to context: jira plus "
+                f"stores_result: true (so the board can re-open its output). The two "
+                f"context defaults only fetch anything when include_context is on."
+            )
 
     skills_raw = raw_top.get("skills")
-    if skills_raw is not None:
-        if not isinstance(skills_raw, list):
-            raise ConfigError("skills: expected a list of skill mappings")
-        seen: set[str] = set()
-        for i, entry in enumerate(skills_raw):
-            ctx = f"skills[{i}]"
-            if not isinstance(entry, dict):
-                raise ConfigError(f"{ctx}: expected a mapping")
-            name = str(entry.get("name", "")).strip()
-            if not name:
-                raise ConfigError(f"{ctx}: missing 'name'")
-            if not _NAME_RE.match(name):
-                raise ConfigError(
-                    f"{ctx}: skill name {name!r} must be a slug — lowercase letters, "
-                    "digits, '-' or '_', starting with a letter or digit"
-                )
-            if name in _RESERVED_NAMES:
-                raise ConfigError(f"{ctx}: skill name {name!r} is reserved")
-            if name in seen:
-                raise ConfigError(f"{ctx}: duplicate skill name {name!r}")
-            seen.add(name)
-            if name not in by_name:
-                order.append(name)
-            by_name[name] = _parse_skill(entry, name, ctx, base_dir)
+    if skills_raw is None:
+        return ()
+    if not isinstance(skills_raw, list):
+        raise ConfigError("skills: expected a list of skill mappings")
 
-    return tuple(by_name[n] for n in order)
+    out: list[SkillConfig] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(skills_raw):
+        ctx = f"skills[{i}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{ctx}: expected a mapping")
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            raise ConfigError(f"{ctx}: missing 'name'")
+        if not _NAME_RE.match(name):
+            raise ConfigError(
+                f"{ctx}: skill name {name!r} must be a slug — lowercase letters, "
+                "digits, '-' or '_', starting with a letter or digit"
+            )
+        if name in _RESERVED_NAMES:
+            raise ConfigError(f"{ctx}: skill name {name!r} is reserved")
+        if name in seen:
+            raise ConfigError(f"{ctx}: duplicate skill name {name!r}")
+        seen.add(name)
+        out.append(_parse_skill(entry, name, ctx, base_dir))
+
+    return tuple(out)
 
 
 def _parse_jira(raw: object) -> JiraConfig:

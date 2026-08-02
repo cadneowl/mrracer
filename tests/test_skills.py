@@ -61,9 +61,10 @@ def test_custom_skill_parsed_with_defaults(tmp_path):
         "    enabled: true\n"
         "    command: 'mytool {web_url}'\n",
     )
-    # Built-in review + qa still present (disabled), custom skill appended.
+    # The list holds exactly what the config declared — review/qa are names with
+    # built-in defaults, not skills that exist on their own.
     names = [s.name for s in cfg.skills]
-    assert names == ["review", "qa", "dba"]
+    assert names == ["dba"]
     dba = cfg.skill_by_name("dba")
     assert dba.enabled and dba.label == "DBA review" and dba.icon == "🗄"
     assert dba.button == "DBA review"  # button defaults to label
@@ -173,21 +174,47 @@ def test_reserved_skill_name_is_rejected(tmp_path):
         _config(tmp_path, "skills:\n  - name: stored\n    command: 'x'\n")
 
 
-def test_skills_list_entry_wins_over_legacy_block(tmp_path):
-    # Both a legacy top-level qa: block and a skills-list entry named qa exist;
-    # the skills-list entry wins, while keeping qa's built-in capabilities.
+def test_qa_declared_in_skills_list_keeps_builtin_capabilities(tmp_path):
+    # `skills:` is the only place a skill is declared, and claiming a built-in
+    # name there still inherits what the name means.
     cfg = _config(
         tmp_path,
-        "qa:\n  enabled: true\n  command: 'legacy-command'\n"
         "skills:\n"
         "  - name: qa\n"
         "    enabled: true\n"
         "    command: 'list-command {jira_keys}'\n",
     )
     qa = cfg.skill_by_name("qa")
-    assert qa.command == "list-command {jira_keys}"  # skills-list overrides legacy
-    assert qa.contexts == ("jira",) and qa.stores_result is True  # built-in caps retained
-    assert [s.name for s in cfg.skills] == ["review", "qa"]  # no duplicate entry
+    assert qa.command == "list-command {jira_keys}"
+    assert qa.contexts == ("jira",) and qa.stores_result is True  # built-in caps
+    assert qa.icon == "🧪" and qa.button == "QA plan"
+    assert [s.name for s in cfg.skills] == ["qa"]
+
+
+@pytest.mark.parametrize("name", ["review", "qa"])
+def test_legacy_top_level_block_is_refused_with_a_migration_message(tmp_path, name):
+    # Silently ignoring the block would take a working button off the board with
+    # no explanation, so it is named and refused instead.
+    with pytest.raises(ConfigError, match="no longer read") as exc:
+        _config(tmp_path, f"{name}:\n  enabled: true\n  command: 'mytool'\n")
+    message = str(exc.value)
+    assert "skills:" in message and f"- name: {name}" in message  # shows the fix
+
+
+def test_an_undeclared_builtin_is_absent_not_disabled(tmp_path):
+    # Nothing arrives that the config did not ask for: a `skills:` list naming
+    # only review leaves no phantom qa behind for the board or `radar check`.
+    cfg = _config(
+        tmp_path,
+        "skills:\n  - name: review\n    enabled: true\n    command: 'mytool'\n",
+    )
+    assert [s.name for s in cfg.skills] == ["review"]
+    assert cfg.skill_by_name("qa") is None
+
+
+def test_no_skills_section_means_no_skills(tmp_path):
+    cfg = _config(tmp_path, "")
+    assert cfg.skills == ()
 
 
 def test_custom_stores_result_is_isolated_from_qa(tmp_path):
@@ -240,7 +267,7 @@ def test_diagnostics_lists_custom_skill(tmp_path):
     )
     checks = {c.name: c for c in _check_commands(cfg)}
     assert checks["dba.command"].status == "warn"  # enabled but not on PATH
-    assert checks["review.command"].status == "skip"  # built-in, disabled
+    assert "review.command" not in checks  # never declared, so never reported
 
 
 def test_migration_preserves_existing_test_plans(tmp_path):

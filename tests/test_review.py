@@ -218,10 +218,11 @@ slas:
     first_response_business_hours: 16
     approval_business_hours: 24
 waive: {{draft: true}}
-review:
-  enabled: true
-  command: '{command}'
-  timeout_seconds: 30
+skills:
+  - name: review
+    enabled: true
+    command: '{command}'
+    timeout_seconds: 30
 """,
         encoding="utf-8",
     )
