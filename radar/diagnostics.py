@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from .config import Config, ConfigError, gitlab_credentials, jira_credentials
 from .db import Database
 from .skillcontext import resolve_inputs, resolve_source
+from .tls import ca_trust_state
 from .worktree import is_git_repo
 
 
@@ -53,6 +54,18 @@ def _check_database(config: Config) -> Check:
         )
     except Exception as exc:  # noqa: BLE001 - report, never crash the run
         return Check("database", "fail", f"{config.database_path}: {exc}")
+
+
+def _check_tls() -> Check:
+    """What each HTTP stack will trust — reported before the calls that use it.
+
+    Placed ahead of the GitLab and Jira checks on purpose: when those fail with
+    a certificate error, the answer is almost always on this line, and a
+    mismatch here explains the otherwise baffling case where one backend works
+    and the other does not.
+    """
+    status, detail = ca_trust_state()
+    return Check("tls.ca_bundle", status, detail)
 
 
 def _check_gitlab(config: Config) -> list[Check]:
@@ -267,6 +280,7 @@ def run_checks(config: Config) -> list[Check]:
             f"{len(config.teams)} team(s), default tz {config.calendar.default_timezone}",
         ),
         _check_database(config),
+        _check_tls(),
     ]
     checks.extend(_check_gitlab(config))
     checks.append(_check_jira(config))

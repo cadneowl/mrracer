@@ -20,6 +20,7 @@ from .config import ConfigError, gitlab_credentials, load_config
 from .db import Database
 from .poller import poll_once
 from .service import recompute as run_recompute
+from .tls import sync_ca_bundle
 
 log = logging.getLogger("radar")
 
@@ -154,6 +155,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _setup_logging(getattr(args, "verbose", False))
+    # Before anything opens a socket, and after logging exists so the result is
+    # reported the same way as everything else.
+    bundle = sync_ca_bundle()
+    if bundle and bundle.problem:
+        log.warning("%s", bundle.problem)
+    elif bundle and bundle.applied:
+        log.debug("CA bundle: %s", bundle.summary())
     try:
         return args.func(args)
     except ConfigError as exc:
