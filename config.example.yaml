@@ -51,110 +51,6 @@ waive:
   draft: true
   labels: ["blocked", "do-not-review"]
 
-# Launch an AI code-review command for an MR from a button on the dashboard.
-# The command is a template; radar fills placeholders and runs it locally
-# (shell=False), then shows stdout as the rendered review. Available
-# placeholders: {web_url} {mr_iid} {project_id} {source_branch}
-# {target_branch} {title} {author} {head_sha}, plus {source_root} when the skill
-# declares a `source:` (below).
-review:
-  enabled: false
-  # Invoke a prepared Claude Code skill headlessly. Make the run smooth AND safe:
-  #  1. Pre-approve a NARROW, read-only allowlist in ~/.claude/settings.json
-  #     under permissions.allow — e.g.
-  #       ["Read", "Grep", "Glob",
-  #        "WebFetch(domain:gitlab.yourco.com)",   # code review -> GitLab
-  #        "mcp__atlassian__*",                     # QA -> Jira via an Atlassian MCP
-  #        "WebFetch(domain:*.atlassian.net)"]      # QA -> Jira via WebFetch (alt)
-  #     For MCP tools the rule is mcp__<server>__<tool>; the "__*" wildcard
-  #     approves a whole server (a bare "mcp__atlassian" is rejected). Match
-  #     "atlassian" to your Jira MCP server's real name. Add "Bash(git *)" ONLY
-  #     if a skill reviews a local checkout. No blanket Bash or write/edit tools.
-  #     (Don't use --bare: it skips loading MCP servers.)
-  #  2. --permission-mode dontAsk : enforce that allowlist WITHOUT prompting.
-  #     Anything not on the list is auto-DENIED (fails closed), so the run never
-  #     blocks and never silently gains capabilities.
-  #     Do NOT use --permission-mode bypassPermissions: it allows everything
-  #     (fails open). Only consider it inside a locked-down sandbox (container /
-  #     firejail / nsjail) with no network to internal services and no secrets
-  #     in the environment.
-  #  3. --output-format stream-json --verbose : emit live events so the dashboard
-  #     shows real-time progress. Plain commands still work (stdout -> progress
-  #     log); they just aren't as granular.
-  command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/code-review"'
-  # Where to run the command. Leave null and radar runs it in the `source:`
-  # checkout resolved for this MR's project (below); null with no source = radar's
-  # CWD. Set it to override both (~ and $VARS expand).
-  working_dir: null
-  # Budget for the WHOLE job, not just the command: preparing a worktree and
-  # fetching the MR's context both talk to the network and are spent from this
-  # same clock, so a job can never outlast it. A slow fetch shortens what the
-  # command gets rather than being added on top.
-  timeout_seconds: 600
-  # include_context: radar fetches the MR title/description/diff itself (via
-  # GITLAB_URL/GITLAB_TOKEN) and pipes it to the skill on STDIN. The skill then
-  # needs NO GitLab access of its own and works on private/self-hosted GitLab —
-  # write your /code-review skill to read the diff from stdin (drop {web_url}).
-  include_context: false
-  # context takes a list, so one skill can be handed several backends at once:
-  # the diff AND the ticket that motivated it, in one document.
-  #   context: [gitlab_diff, jira]
-  #
-  # source: where this MR's project is checked out, so the skill can read the
-  # code the diff came from instead of guessing from the diff alone. It arrives
-  # three ways: the {source_root} placeholder, a "## Source" section on STDIN,
-  # and the command's working directory (so a Claude Code skill's Read/Grep land
-  # on the right tree). Machine-specific, so it comes from the environment and
-  # is never committed:
-  #   source: { env: HUB_REPO_ROOT }
-  # radar polls several projects and one checkout can't serve them all, so it
-  # also takes a mapping keyed by project path or numeric id, with a fallback:
-  #   source:
-  #     group/hub-backend: { env: HUB_REPO_ROOT }
-  #     group/hub-web:     ~/src/hub-web
-  #     "42":              /srv/checkouts/legacy
-  #     default:           { env: FALLBACK_REPO }
-  # Keys match the project path from the MR's URL or its numeric id. An MR whose
-  # project matches nothing REFUSES to run rather than quietly reviewing without
-  # a checkout — add `default:` if the skill should run without one elsewhere.
-  # A root that is SET BUT WRONG refuses the job rather than launching it: every
-  # read the agent tries would answer "no such file", which is indistinguishable
-  # from a clean repo — it would review having opened nothing and the run would
-  # look entirely normal. `radar check` reports the same thing ahead of time.
-  #
-  # checkout: what tree the job actually gets.
-  #   none      (default) run in the `source:` checkout, on whatever branch it
-  #             is sitting on — usually NOT this merge request's code, and shared
-  #             by every job started from the board.
-  #   worktree  give each job its own detached `git worktree` at the MR's head
-  #             commit, removed when the job ends. {source_root} then names that
-  #             worktree. The commit comes from GitLab's per-MR ref
-  #             (refs/merge-requests/<iid>/head), which resolves even for MRs
-  #             from forks, fetched from `remote:` using your own git
-  #             credentials — freshly, so the tree matches the diff radar hands
-  #             the skill rather than the older sha from the last poll. Your
-  #             working copy is untouched (no branch, no HEAD move), and
-  #             concurrent jobs get independent trees. A failed fetch FAILS THE
-  #             JOB rather than falling back to the current branch — a review of
-  #             the default branch presented as a review of the MR is
-  #             confidently wrong about other code. Cannot be combined with
-  #             working_dir: the worktree IS where the code is.
-  #   checkout: worktree
-  #   remote: origin
-  #
-  # inputs: anything else this skill needs, in three value forms:
-  #   inputs:
-  #     db_schema:    { file: ./references/schema.sql }  # contents, rel. to this file
-  #     api_spec_url: https://internal/api/spec.json     # a literal
-  #     cluster:      { env: CLUSTER_NAME, secret: false }
-  #     token:        { env: SKILL_TOKEN, required: true }
-  # A literal, a file's contents, and a `secret: false` env value are appended to
-  # the STDIN bundle. A plain `env:` value is NOT: that bundle is prompt text for
-  # an LLM agent, and a credential does not belong in a prompt or in the
-  # transcript it leaves behind — the skill inherits it from radar's environment
-  # instead. `required: true` refuses the job (and fails `radar check`) when the
-  # variable is unset, rather than discovering it mid-run.
-
 # Teams. Each team is a named set of GitLab usernames. The board's VIEW bar
 # then offers two filters per team: "<team> · authored" (MRs opened by a team
 # member) and "<team> · to review" (MRs where a team member is a requested
@@ -167,39 +63,157 @@ teams:
 
 # Jira association. radar recognises issue keys (PROJ-123) in each MR's branch,
 # title, and description, shows them as links on the board, and passes them to
-# the QA test-plan command. base_url builds the browse links; project_keys is
-# an optional filter so unrelated keys aren't picked up.
+# any skill via {jira_keys}. base_url builds the browse links; project_keys is
+# an optional filter so unrelated keys aren't picked up. Note this is NOT the
+# credential for fetching a ticket — that is JIRA_BASE_URL/JIRA_EMAIL/
+# JIRA_API_TOKEN in the environment, and the two should name the same server.
 jira:
   base_url: https://yourco.atlassian.net
   project_keys: [PROJ, BUG]
 
-# Launch a QA test-plan generator for an MR from a button on the dashboard.
-# Same shape as `review`. Extra placeholders: {jira_keys} (space-separated) and
-# {jira_keys_csv}. The skill fetches the ticket(s) itself and can write the plan
-# back to Jira; radar keeps a copy and shows it on the board.
-qa:
-  enabled: false
-  command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/qa-testplan"'
-  working_dir: null
-  timeout_seconds: 900
-  # include_context: radar fetches the linked Jira ticket(s) — and an epic's
-  # child issues — via JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN, and pipes them to
-  # the skill on STDIN. The skill needs no Jira access of its own.
-  include_context: false
-
-# Extra skills. `review` and `qa` above are the two built-ins; add any number of
-# your own here and each becomes another button on every MR row. Same shape and
-# placeholders as `review`/`qa`, plus these opt-in capabilities:
-#   context: gitlab_diff | jira | [both]  — with include_context, radar fetches
-#                                   those backends and pipes them to STDIN.
-#   stores_result: true          — persist the output and show a re-openable ✓
-#                                   badge (this is what qa uses).
-#   source: / inputs:            — the declared context bag (see `review` above).
-#                                   Every skill declares its own, so two skills on
-#                                   the same board can point at different trees.
-# A skills entry named `review` or `qa` overrides the block above (both forms
-# work). Every enabled skill also shows up in `radar check`.
+# ---------------------------------------------------------------------------
+# Skills — every dashboard button, in one list.
+#
+# A skill is an external command radar runs for one merge request, rendering its
+# stdout. Each enabled entry becomes a button on every MR row and appears in
+# `radar check`. The command is a template; radar fills placeholders and runs it
+# locally (shell=False — never through a shell). Placeholders:
+#   {web_url} {mr_iid} {project_id} {source_branch} {target_branch} {title}
+#   {author} {head_sha}, plus {source_root} once the skill declares a `source:`,
+#   and {jira_keys} / {jira_keys_csv} from the keys found on the MR.
+#
+# This list is the ONLY place a skill is declared. Two names arrive with
+# defaults, because they are capabilities no command line can advertise:
+#   review   context: gitlab_diff                — the MR diff is piped to STDIN
+#   qa       context: jira + stores_result: true — the linked ticket(s) are piped
+#            to STDIN, and the output is saved and re-openable from the board
+# Defaults, not magic: write `context:` or `stores_result:` yourself and yours
+# wins. Every other name starts with no capabilities at all. Declaring a skill
+# anywhere else (a top-level `review:` or `qa:` block, as older versions took)
+# is refused with a message telling you to move it here.
+# ---------------------------------------------------------------------------
 skills:
+  - name: review
+    enabled: false
+    # Invoke a prepared Claude Code skill headlessly. Make the run smooth AND safe:
+    #  1. Pre-approve a NARROW, read-only allowlist in ~/.claude/settings.json
+    #     under permissions.allow — e.g.
+    #       ["Read", "Grep", "Glob",
+    #        "WebFetch(domain:gitlab.yourco.com)",   # code review -> GitLab
+    #        "mcp__atlassian__*",                     # QA -> Jira via an Atlassian MCP
+    #        "WebFetch(domain:*.atlassian.net)"]      # QA -> Jira via WebFetch (alt)
+    #     For MCP tools the rule is mcp__<server>__<tool>; the "__*" wildcard
+    #     approves a whole server (a bare "mcp__atlassian" is rejected). Match
+    #     "atlassian" to your Jira MCP server's real name. Add "Bash(git *)" ONLY
+    #     if a skill reviews a local checkout. No blanket Bash or write/edit tools.
+    #     (Don't use --bare: it skips loading MCP servers.)
+    #  2. --permission-mode dontAsk : enforce that allowlist WITHOUT prompting.
+    #     Anything not on the list is auto-DENIED (fails closed), so the run never
+    #     blocks and never silently gains capabilities.
+    #     Do NOT use --permission-mode bypassPermissions: it allows everything
+    #     (fails open). Only consider it inside a locked-down sandbox (container /
+    #     firejail / nsjail) with no network to internal services and no secrets
+    #     in the environment.
+    #  3. --output-format stream-json --verbose : emit live events so the dashboard
+    #     shows real-time progress. Plain commands still work (stdout -> progress
+    #     log); they just aren't as granular.
+    command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/code-review"'
+    # Where to run the command. Leave null and radar runs it in the `source:`
+    # checkout resolved for this MR's project (below); null with no source =
+    # radar's CWD. Set it to override both (~ and $VARS expand).
+    working_dir: null
+    # Budget for the WHOLE job, not just the command: preparing a worktree and
+    # fetching the MR's context both talk to the network and are spent from this
+    # same clock, so a job can never outlast it. A slow fetch shortens what the
+    # command gets rather than being added on top.
+    timeout_seconds: 600
+    # include_context: radar fetches the MR title/description/diff itself (via
+    # GITLAB_URL/GITLAB_TOKEN) and pipes it to the skill on STDIN. The skill then
+    # needs NO GitLab access of its own and works on private/self-hosted GitLab —
+    # write your /code-review skill to read the diff from stdin (drop {web_url}).
+    include_context: false
+    # context takes a list, so one skill can be handed several backends at once:
+    # the diff AND the ticket that motivated it, in one document. `review`
+    # already implies gitlab_diff; naming it here replaces that default.
+    #   context: [gitlab_diff, jira]
+    #
+    # source: where this MR's project is checked out, so the skill can read the
+    # code the diff came from instead of guessing from the diff alone. It arrives
+    # three ways: the {source_root} placeholder, a "## Source" section on STDIN,
+    # and the command's working directory (so a Claude Code skill's Read/Grep land
+    # on the right tree). Machine-specific, so it comes from the environment and
+    # is never committed:
+    #   source: { env: HUB_REPO_ROOT }
+    # radar polls several projects and one checkout can't serve them all, so it
+    # also takes a mapping keyed by project path or numeric id, with a fallback:
+    #   source:
+    #     group/hub-backend: { env: HUB_REPO_ROOT }
+    #     group/hub-web:     ~/src/hub-web
+    #     "42":              /srv/checkouts/legacy
+    #     default:           { env: FALLBACK_REPO }
+    # Keys match the project path from the MR's URL or its numeric id. An MR whose
+    # project matches nothing REFUSES to run rather than quietly reviewing without
+    # a checkout — add `default:` if the skill should run without one elsewhere.
+    # A root that is SET BUT WRONG refuses the job rather than launching it: every
+    # read the agent tries would answer "no such file", which is indistinguishable
+    # from a clean repo — it would review having opened nothing and the run would
+    # look entirely normal. `radar check` reports the same thing ahead of time.
+    #
+    # checkout: what tree the job actually gets.
+    #   none      (default) run in the `source:` checkout, on whatever branch it
+    #             is sitting on — usually NOT this merge request's code, and shared
+    #             by every job started from the board.
+    #   worktree  give each job its own detached `git worktree` at the MR's head
+    #             commit, removed when the job ends. {source_root} then names that
+    #             worktree. The commit comes from GitLab's per-MR ref
+    #             (refs/merge-requests/<iid>/head), which resolves even for MRs
+    #             from forks, fetched from `remote:` using your own git
+    #             credentials — freshly, so the tree matches the diff radar hands
+    #             the skill rather than the older sha from the last poll. Your
+    #             working copy is untouched (no branch, no HEAD move), and
+    #             concurrent jobs get independent trees. A failed fetch FAILS THE
+    #             JOB rather than falling back to the current branch — a review of
+    #             the default branch presented as a review of the MR is
+    #             confidently wrong about other code. Cannot be combined with
+    #             working_dir: the worktree IS where the code is.
+    #   checkout: worktree
+    #   remote: origin
+    #
+    # inputs: anything else this skill needs, in three value forms:
+    #   inputs:
+    #     db_schema:    { file: ./references/schema.sql }  # contents, rel. to this file
+    #     api_spec_url: https://internal/api/spec.json     # a literal
+    #     cluster:      { env: CLUSTER_NAME, secret: false }
+    #     token:        { env: SKILL_TOKEN, required: true }
+    # A literal, a file's contents, and a `secret: false` env value are appended to
+    # the STDIN bundle. A plain `env:` value is NOT: that bundle is prompt text for
+    # an LLM agent, and a credential does not belong in a prompt or in the
+    # transcript it leaves behind — the skill inherits it from radar's environment
+    # instead. `required: true` refuses the job (and fails `radar check`) when the
+    # variable is unset, rather than discovering it mid-run.
+
+  # The QA test plan. Extra placeholders: {jira_keys} (space-separated) and
+  # {jira_keys_csv}. Inherits context: jira and stores_result: true from its name,
+  # so radar keeps a copy of the output and the board shows a re-openable badge.
+  - name: qa
+    enabled: false
+    command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/qa-testplan"'
+    working_dir: null
+    timeout_seconds: 900
+    # include_context: radar fetches the linked Jira ticket(s) — and an epic's
+    # child issues — via JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN, and pipes them
+    # to the skill on STDIN. The skill needs no Jira access of its own.
+    include_context: false
+
+  # A skill of your own. No name means no inherited capabilities, so anything it
+  # needs is stated outright:
+  #   context: gitlab_diff | jira | [both]  — with include_context, radar fetches
+  #                                   those backends and pipes them to STDIN.
+  #   stores_result: true          — persist the output and show a re-openable ✓
+  #                                   badge (this is what qa inherits).
+  #   source: / inputs:            — the declared context bag (see `review`).
+  #                                   Every skill declares its own, so two skills
+  #                                   on one board can point at different trees.
   - name: dba              # url/id slug; must be unique
     label: DBA review      # panel heading / long name
     button: DBA            # short button text (optional; defaults to label)
@@ -208,6 +222,7 @@ skills:
     command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/dba"'
     working_dir: null      # null = the resolved source checkout, else radar's CWD
     timeout_seconds: 600
+    # context: gitlab_diff
     # source: { env: HUB_REPO_ROOT }
     # inputs:
     #   db_schema: { file: ./references/schema.sql }

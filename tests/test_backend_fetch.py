@@ -170,13 +170,14 @@ gitlab: {projects: [g/p]}
 calendar: {workdays: [mon], work_hours: {start: "09:00", end: "18:00"}, default_timezone: UTC}
 slas: [{match: {}, first_response_business_hours: 16, approval_business_hours: 24}]
 waive: {}
-review: {enabled: true, command: "claude -p /x", include_context: true}
+skills:
+  - {name: review, enabled: true, command: "claude -p /x", include_context: true}
 """,
         encoding="utf-8",
     )
     cfg = load_config(path)
-    assert cfg.review.include_context is True
-    assert cfg.qa.include_context is False
+    assert cfg.skill_by_name("review").include_context is True
+    assert cfg.skill_by_name("qa") is None  # undeclared means absent, not disabled
 
 
 def test_jira_credentials(monkeypatch):
@@ -203,11 +204,12 @@ calendar:
   default_timezone: America/New_York
 slas: [{{match: {{}}, first_response_business_hours: 16, approval_business_hours: 24}}]
 waive: {{draft: true}}
-review:
-  enabled: true
-  command: '{ECHO_STDIN}'
-  include_context: true
-  timeout_seconds: 30
+skills:
+  - name: review
+    enabled: true
+    command: '{ECHO_STDIN}'
+    include_context: true
+    timeout_seconds: 30
 """,
         encoding="utf-8",
     )

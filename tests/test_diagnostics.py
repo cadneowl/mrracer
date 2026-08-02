@@ -55,12 +55,25 @@ def test_database_check_reports_counts(tmp_path):
 
 
 def test_commands_check(tmp_path):
-    ok_cfg = _config(tmp_path, extra=f"review: {{enabled: true, command: '{PY} -c \"print(1)\"'}}")
+    ok_cfg = _config(
+        tmp_path,
+        extra=(
+            "skills:\n"
+            f"  - {{name: review, enabled: true, command: '{PY} -c \"print(1)\"'}}\n"
+            "  - {name: qa, command: 'x'}\n"
+        ),
+    )
     checks = {c.name: c for c in _check_commands(ok_cfg)}
     assert checks["review.command"].status == "ok"      # sys.executable is on PATH
-    assert checks["qa.command"].status == "skip"        # disabled
+    assert checks["qa.command"].status == "skip"        # declared but not enabled
 
-    bad = _config(tmp_path, extra="qa: {enabled: true, command: 'no-such-binary-xyz {jira_keys}'}")
+    bad = _config(
+        tmp_path,
+        extra=(
+            "skills:\n"
+            "  - {name: qa, enabled: true, command: 'no-such-binary-xyz {jira_keys}'}\n"
+        ),
+    )
     assert {c.name: c for c in _check_commands(bad)}["qa.command"].status == "warn"
 
 

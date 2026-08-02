@@ -34,10 +34,11 @@ waive: {{draft: true}}
 jira:
   base_url: https://yourco.atlassian.net
   project_keys: [PROJ]
-qa:
-  enabled: true
-  command: '{qa_command}'
-  timeout_seconds: 30
+skills:
+  - name: qa
+    enabled: true
+    command: '{qa_command}'
+    timeout_seconds: 30
 """,
         encoding="utf-8",
     )
