@@ -452,6 +452,25 @@ $env:GITLAB_URL = "https://gitlab.example.com"
 $env:GITLAB_TOKEN = "glpat-xxxxxxxxxxxxxxxxxxxx"
 ```
 
+Or keep them in a **`.env` file beside `config.yaml`**, which radar reads at
+startup (`radar -c /etc/radar/config.yaml` reads `/etc/radar/.env`, falling back
+to `./.env`):
+
+```
+GITLAB_URL=https://gitlab.example.com
+GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx
+JIRA_BASE_URL=https://yourco.atlassian.net
+JIRA_EMAIL=you@yourco.com
+JIRA_API_TOKEN=...
+REQUESTS_CA_BUNDLE=/path/to/corp-root.pem
+```
+
+Add it to `.gitignore`. An exported variable wins over the file — except an
+exported *empty* one, which is treated as an open slot rather than an answer, so
+a `VAR=` left in a shell profile can't quietly suppress the file's value.
+`radar check` prints an `env.dotenv` line naming which variables came from the
+file and which the shell overrode (names only, never values).
+
 ### 2. Behind a TLS-inspecting proxy (Zscaler & co.)
 
 Skip this unless HTTPS is intercepted on your network. If it is, every call must
@@ -473,6 +492,9 @@ both stacks and any skill it launches agree:
 ```bash
 export REQUESTS_CA_BUNDLE=/path/to/corp-root.pem   # any one of the four
 ```
+
+A `.env` beside `config.yaml` works just as well, and is read *before* the copy
+happens, so a bundle named only there still reaches both stacks.
 
 A variable you set yourself is never overwritten, so pointing the two stacks at
 different bundles deliberately still works. A path that doesn't exist is *not*
