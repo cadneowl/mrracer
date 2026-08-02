@@ -84,11 +84,19 @@ review:
   enabled: true
   command: 'claude -p "/code-review {web_url}"'   # e.g. a Claude Code skill, headless
   working_dir: /path/to/checkout                  # optional; where to run it
-  timeout_seconds: 600
+  timeout_seconds: 600                            # budget for the whole job
 ```
 
+`timeout_seconds` bounds the **whole job**, not just the command: preparing a
+checkout and fetching the MR's context both talk to the network and are spent
+from the same clock, so a job can never outlast its budget — a hung fetch fails
+it rather than leaving the panel tailing a job that will never end.
+
 Placeholders filled from the MR: `{web_url}`, `{mr_iid}`, `{project_id}`,
-`{source_branch}`, `{target_branch}`, `{title}`, `{author}`. The command runs
+`{source_branch}`, `{target_branch}`, `{title}`, `{author}`, `{head_sha}`, plus
+`{source_root}` if the skill declares a
+[`source:`](#tell-a-skill-where-the-code-is-source-and-inputs).
+The command runs
 **locally on the same machine as `radar serve`**, with `shell=False`, and the
 template is tokenized *before* substitution — so an MR field can never inject
 shell metacharacters or extra arguments. As a further guard, if a substituted
@@ -205,6 +213,128 @@ command). The tokens stay inside radar's process; they're still stripped from
 the child's environment. The fetch runs inside the job (you'll see a "fetching
 context…" line), and a fetch failure surfaces as a clear job error.
 
+`context:` takes a **list**, so one skill can be given both:
+
+```yaml
+review:
+  enabled: true
+  include_context: true
+  context: [gitlab_diff, jira]   # the diff *and* the ticket that motivated it
+```
+
+### Tell a skill where the code is (`source:` and `inputs:`)
+
+A review skill that can only see a diff is reviewing through a keyhole: it can't
+check whether a changed function has other callers, or whether the pattern it's
+flagging is used everywhere else in the repo. Point it at the checkout:
+
+```yaml
+skills:
+  - name: dba
+    enabled: true
+    command: 'claude -p --permission-mode dontAsk "/dba"'
+    source: { env: HUB_REPO_ROOT }        # where this project is checked out
+    inputs:                               # anything else the skill needs
+      db_schema:    { file: ./references/schema.sql }
+      api_spec_url: https://internal/api/spec.json
+```
+
+The skill then gets the path three ways: as the `{source_root}` placeholder, as
+a **`## Source`** section in its stdin bundle, and as the process's **working
+directory** — so a Claude Code skill's `Read`/`Grep`/`Glob` land on the right
+tree with no extra wiring. An explicit `working_dir` still wins if you set one.
+
+**Value forms.** Each entry is one of three things:
+
+| form | meaning | shown to the skill? |
+|---|---|---|
+| `a literal` (string, list, map) | the value as written | yes |
+| `{ file: ./path }` | the file's contents, relative to `config.yaml` | yes |
+| `{ env: NAME }` | that environment variable | **no** — see below |
+| `{ env: NAME, secret: false }` | that environment variable | yes |
+
+An `env:` value is treated as a **credential or a machine-local path** and is
+resolved but *not* written into the stdin bundle — that bundle is prompt text for
+an LLM agent, and a token does not belong in a prompt (or in the transcript it
+leaves behind). A skill that needs a credential already inherits it from the
+environment that launched `radar serve`. Add `secret: false` for things that are
+genuinely just settings (a base URL, a cluster name). Add `required: true` to
+anything the skill cannot work without.
+
+**One skill, several projects.** radar polls several GitLab projects, and one
+checkout can't serve them all, so `source:` also takes a mapping keyed by project
+path or numeric id:
+
+```yaml
+    source:
+      group/hub-backend: { env: HUB_REPO_ROOT }
+      group/hub-web:     ~/src/hub-web
+      "42":              /srv/checkouts/legacy
+      default:           { env: FALLBACK_REPO }
+```
+
+Each job resolves the root for **its own** MR's project, so two projects reviewed
+by one skill run in their own checkouts. Keys match the project path from the
+MR's URL (a GitLab served under a sub-path still matches, on a path boundary) or
+the numeric project id. An MR whose project matches **no** entry refuses to run —
+add `default:` if the skill should run without a checkout on the rest.
+
+**Nothing is resolved quietly.** A `required` input that is unset, or a source
+root that is set but is not a directory, **refuses the job before the command
+launches** — the panel shows why. That failure mode is the reason it's strict: an
+agent pointed at a path that doesn't exist gets "no such file" from every read,
+which is indistinguishable from a clean repository, so it would review having
+opened nothing and the run would look entirely normal. `radar check` reports the
+same thing ahead of time, per project, with `env:` values shown as `<env:NAME>`
+rather than their contents.
+
+### Give each job the MR's own code (`checkout: worktree`)
+
+A `source:` on its own hands the skill whatever the checkout is sitting on —
+usually the default branch, and never reliably the MR under review. Two jobs
+started from the board share that one working tree, so they'd read each other's
+checkout. Turn on per-job worktrees:
+
+```yaml
+skills:
+  - name: dba
+    enabled: true
+    command: 'claude -p --permission-mode dontAsk "/dba"'
+    source: { env: HUB_REPO_ROOT }
+    checkout: worktree     # default: none
+    remote: origin         # which git remote to fetch the MR ref from
+```
+
+radar creates a **detached `git worktree`** at the merge request's head commit,
+runs the job in it, and removes it when the job ends. `{source_root}` and the
+`## Source` section then name that worktree, not the shared clone. `working_dir`
+and `checkout: worktree` are rejected together — they contradict each other, and
+silently honouring one would tell the skill about a tree it isn't running in.
+
+The commit is the one **just fetched**, not the SHA from radar's last poll: the
+diff a skill is handed comes from GitLab live, so pinning the tree to a snapshot
+up to `poll_interval_minutes` old would show it a diff of code it can't see.
+`{head_sha}` is the fallback if the fetch fails. Each job fetches into a ref of
+its own, so concurrent jobs can't be served each other's commit.
+
+The commit comes from GitLab's `refs/merge-requests/<iid>/head`, which every
+GitLab server publishes and which resolves **even for MRs from forks** — where
+the source branch doesn't exist on the target repo at all. The fetch uses your
+normal git credentials for that remote; radar's own GitLab token is not involved.
+
+Your working copy is not touched: a worktree adds no branch, moves no `HEAD`, and
+leaves nothing behind once removed. Concurrent jobs get independent trees.
+
+If the fetch or the worktree fails, **the job fails** — it does not fall back to
+the current branch, because a review of the default branch presented as a review
+of the MR is a confidently wrong answer about other code. `radar check` verifies
+git is on `PATH` and that each resolved source is really a repository.
+
+Independently of the checkout mode, `{head_sha}` is available as a placeholder
+(recorded on each poll), and with `include_context` the bundle carries a
+`## Commits` section with the MR's `base`/`head`/`start` SHAs — so a skill can
+pin its own comparison.
+
 ### Add your own skills (custom board buttons)
 
 `review` and `qa` are just the two **built-in** skills. You can add any number of
@@ -227,11 +357,16 @@ A skill in the list takes the **same fields** as `review`/`qa` and the same
 placeholders, safety guards, streaming, and sanitized-markdown output. Two
 capabilities are opt-in via extra fields:
 
-- `context: gitlab_diff` or `context: jira` — pair with `include_context: true`
-  to have radar fetch that backend and pipe it to the skill on stdin (see above).
-  Omit `context` for a skill that needs no backend fetch.
+- `context: gitlab_diff` / `context: jira` / `context: [gitlab_diff, jira]` — pair
+  with `include_context: true` to have radar fetch those backends and pipe them to
+  the skill on stdin (see above). Omit `context` for a skill that needs no fetch.
 - `stores_result: true` — persist the output and show a **✓** badge that re-opens
   it (this is what `qa` uses for saved test plans).
+- `source:` / `inputs:` — the skill's declared context bag: where the code is
+  checked out, plus any other input it needs (see above). Every skill declares its
+  own, so several skills on the same board can point at different trees.
+- `checkout: worktree` (+ optional `remote:`) — give each job its own worktree at
+  the MR's head commit instead of sharing the configured checkout (see above).
 
 The built-in `review`/`qa` skills can also be written as `skills:` entries (by
 `name`) instead of the legacy top-level `review:`/`qa:` blocks — both forms work,

@@ -13,7 +13,8 @@
       <a class="modal-close" href="#" hx-get="/{{ kind }}/close" hx-target="#command-panel" hx-swap="innerHTML">✕</a>
     </div>
     <div class="modal-body">
-      {% if job.status == "running" %}
+      {# `status`/`error`, not `job.*`: one read of the job's state per render — see _panel. #}
+      {% if status == "running" %}
       <div class="review-loading"><span class="spinner"></span> running your {{ heading|lower }} command…</div>
       <ul class="progress-log" id="plog-{{ job.id }}" data-job-id="{{ job.id }}" data-kind="{{ kind }}"></ul>
       <script>
@@ -45,13 +46,13 @@
         es.onerror = finish;  // server closed the stream or a network hiccup
       })();
       </script>
-      {% elif job.status == "done" %}
+      {% elif status == "done" %}
       {% if job.persist_error %}<div class="save-warn">⚠ {{ job.persist_error }}</div>{% endif %}
       <article class="review-output">{{ output_html }}</article>
       {% else %}
       <div class="review-error">
         <strong>{{ heading }} failed.</strong>
-        <pre>{{ job.error }}</pre>
+        <pre>{{ error }}</pre>
       </div>
       {% endif %}
     </div>

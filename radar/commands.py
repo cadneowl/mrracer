@@ -11,6 +11,13 @@ turn tool_use / assistant events into friendly progress lines and take the final
 answer from the ``result`` event. Any other command works too: its stdout lines
 become the progress log and the accumulated text becomes the output.
 
+Before launching, the skill's declared context bag is resolved for this MR (see
+``skillcontext``): ``{source_root}`` becomes a placeholder like any other, and
+— unless ``working_dir`` overrides it — the child runs *in* that checkout, so an
+agent's own file tools land on the right tree. A required input that is unset,
+or a root that is not a directory, refuses the job instead of launching one that
+would review nothing.
+
 Safety: the template is split into argv with ``shlex`` *before* substitution and
 run with ``shell=False``, so an MR field can't inject shell metacharacters or
 extra arguments; a substituted value that would make a token start with ``-`` is
@@ -25,11 +32,14 @@ import os
 import shlex
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .config import CommandConfig
+from .skillcontext import SkillContextError, job_context
+from .worktree import WorktreeError, create_mr_worktree
 
 log = logging.getLogger("radar.commands")
 
@@ -56,7 +66,12 @@ PLACEHOLDER_KEYS = (
     "author",
     "jira_keys",       # space-separated, e.g. "PROJ-1 PROJ-2"
     "jira_keys_csv",   # comma-separated, e.g. "PROJ-1,PROJ-2"
+    "head_sha",        # the MR's head commit, as of the last poll
+    "source_root",     # the checkout for this job (see skillcontext / worktree)
 )
+
+# Placeholders filled from the MR snapshot; the rest are computed per job.
+SNAPSHOT_KEYS = tuple(k for k in PLACEHOLDER_KEYS if k != "source_root")
 
 
 class CommandError(ValueError):
@@ -84,7 +99,12 @@ def build_argv(command: str, ctx: dict) -> list[str]:
             token = token[1:-1]
         template_token = token
         for key in PLACEHOLDER_KEYS:
-            token = token.replace("{" + key + "}", str(ctx.get(key, "")))
+            # A snapshot column is nullable (an MR polled before `head_sha`
+            # existed, an MR with no author), and `str(None)` is the four-letter
+            # string "None" — which a skill would take for a real ref, branch or
+            # URL. An absent value is an empty one.
+            value = ctx.get(key)
+            token = token.replace("{" + key + "}", "" if value is None else str(value))
         if token.startswith("-") and not template_token.startswith("-"):
             raise CommandError(
                 "refusing to run: a substituted MR value would start with '-' and "
@@ -108,12 +128,44 @@ class CommandJob:
     persist_error: str = ""  # set if the result was produced but couldn't be saved
     returncode: int | None = None
     progress: list[dict] = field(default_factory=list)  # live log: {kind, text}
+    # Where the child runs. Per job, not per skill: the source root is resolved
+    # from the MR's project, so two projects reviewed by one skill run in their
+    # own checkouts (see `CommandRunner.start`).
+    cwd: str | None = None
 
 
 def _fail(job: CommandJob, message: str) -> None:
     """Move a job to a terminal error state (error text set before status)."""
     job.error = message[:8000]
     job.status = "error"
+
+
+def _with_deadline(fn: Callable[[], object], seconds: float, what: str) -> object:
+    """Run ``fn`` on a helper thread and give up on it after ``seconds``.
+
+    Preparing a job means calling out to GitLab or Jira, and a socket with no
+    answer coming back has no timeout of its own — the job would sit in
+    "running" forever and the panel would tail it just as long. There is no way
+    to interrupt a blocking read from outside, so the thread is abandoned
+    (daemon, so it cannot hold up shutdown) and the job is failed. The work it
+    was doing is a read; nothing is left half-written.
+    """
+    box: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            box["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=max(0.0, seconds))
+    if worker.is_alive():
+        raise TimeoutError(what)
+    if "error" in box:
+        raise box["error"]  # type: ignore[misc]
+    return box.get("value")
 
 
 def _feed_stdin(proc, text: str) -> None:
@@ -138,11 +190,16 @@ class CommandRunner:
         self._jobs: dict[str, CommandJob] = {}
         self._lock = threading.Lock()
 
+    @property
+    def checkout(self) -> str:
+        """"none" (run in the configured source) or "worktree" (one per job)."""
+        return getattr(self.config, "checkout", "none")
+
     def start(
         self,
         ctx: dict,
         on_success: Callable[[CommandJob], None] | None = None,
-        stdin_provider: Callable[[], str] | None = None,
+        stdin_provider: Callable[[str], str] | None = None,
     ) -> CommandJob:
         job = CommandJob(
             id=uuid.uuid4().hex[:12],
@@ -156,12 +213,25 @@ class CommandRunner:
             while len(self._jobs) > _MAX_JOBS:  # evict oldest so serve doesn't leak
                 self._jobs.pop(next(iter(self._jobs)))
         try:
-            argv = build_argv(self.config.command, ctx)
-        except CommandError as exc:
+            # Resolve the skill's declared context first: a required var that is
+            # unset, or a source root that is not a directory, refuses the job
+            # here rather than launching an agent that would review nothing.
+            # Cheap (env reads), so it stays on the request thread and the button
+            # reports a misconfiguration immediately.
+            resolved = job_context(self.config, job.project_id, str(ctx.get("web_url") or ""))
+            resolved.raise_for_problems()
+            if self.checkout == "worktree" and not resolved.source_root:
+                raise SkillContextError(
+                    "checkout: worktree needs a 'source:' that resolves to this project's "
+                    "checkout — there is nothing to make a worktree of"
+                )
+        except SkillContextError as exc:
             job.status, job.error = "error", str(exc)
             return job
         threading.Thread(
-            target=self._run, args=(job, argv, on_success, stdin_provider), daemon=True
+            target=self._run,
+            args=(job, ctx, resolved, on_success, stdin_provider),
+            daemon=True,
         ).start()
         return job
 
@@ -187,31 +257,79 @@ class CommandRunner:
 
     # --- execution ---------------------------------------------------------
 
-    def _run(self, job: CommandJob, argv: list[str], on_success, stdin_provider=None) -> None:
+    def _run(self, job: CommandJob, ctx: dict, resolved, on_success, stdin_provider=None) -> None:
         # Catch-all guarantees a terminal state; a worker crash must never leave
         # the job "running" (the UI would tail it forever).
+        #
+        # `timeout_seconds` is the budget for the whole job, not just for the
+        # command: fetching a checkout and fetching the MR's context happen
+        # before the command starts, and both talk to the network. Bounding only
+        # the child would leave the two phases most likely to hang unbounded.
+        deadline = time.monotonic() + self.config.timeout_seconds
+        worktree = None
         try:
-            self._execute(job, argv, on_success, stdin_provider)
+            if self.checkout == "worktree":
+                self._add(job, "log", "preparing this merge request's worktree…")
+                worktree = create_mr_worktree(
+                    resolved.source_root,
+                    job.mr_iid,
+                    str(ctx.get("head_sha") or "") or None,
+                    remote=getattr(self.config, "remote", "origin"),
+                    timeout_s=deadline - time.monotonic(),
+                )
+            source_root = str(worktree.path) if worktree else (resolved.source_root or "")
+            self._execute(job, ctx, source_root, resolved, deadline, on_success, stdin_provider)
+        except WorktreeError as exc:
+            _fail(job, str(exc))
+        except TimeoutError as exc:
+            _fail(job, f"{self.kind} timed out after {self.config.timeout_seconds}s ({exc})")
         except Exception as exc:  # noqa: BLE001 - last-resort terminal state
             log.exception("%s worker crashed", self.kind)
             _fail(job, f"unexpected error: {exc}")
+        finally:
+            if worktree is not None:
+                worktree.cleanup()
 
-    def _execute(self, job: CommandJob, argv: list[str], on_success, stdin_provider=None) -> None:
+    def _execute(
+        self,
+        job: CommandJob,
+        ctx: dict,
+        source_root: str,
+        resolved,
+        deadline: float,
+        on_success,
+        stdin_provider=None,
+    ) -> None:
+        # Built here, not in `start`, because a worktree's path is only known
+        # once the worker has made it — and `{source_root}` must name the tree
+        # the skill will actually read.
+        try:
+            argv = build_argv(self.config.command, {**ctx, "source_root": source_root})
+        except CommandError as exc:
+            _fail(job, str(exc))
+            return
         if not argv:
             _fail(job, f"{self.kind}.command is empty")
             return
+        # An explicit working_dir wins; otherwise the checkout is the natural
+        # place to run, so the agent's own file tools land on the right tree.
+        job.cwd = self.config.working_dir or source_root or None
 
         # Fetch backend context (MR diff / Jira ticket) to pipe on stdin. Runs in
         # this worker thread; a failure here surfaces as a job error.
         stdin_text: str | None = None
         if stdin_provider is not None:
             self._add(job, "log", "fetching context…")
-            stdin_text = stdin_provider()
+            stdin_text = _with_deadline(
+                lambda: stdin_provider(source_root, resolved.inputs.shown),
+                deadline - time.monotonic(),
+                "fetching context",
+            )
 
         try:
             proc = subprocess.Popen(
                 argv,
-                cwd=self.config.working_dir or None,
+                cwd=job.cwd,
                 stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -242,7 +360,11 @@ class CommandRunner:
         stderr_thread.start()
 
         timed_out = threading.Event()
-        timer = threading.Timer(self.config.timeout_seconds, lambda: (timed_out.set(), proc.kill()))
+        # What is left of the job's budget after preparing — never less than a
+        # second, so a command that only just made the deadline still gets to
+        # report something rather than being killed on the starting line.
+        remaining = max(1.0, deadline - time.monotonic())
+        timer = threading.Timer(remaining, lambda: (timed_out.set(), proc.kill()))
         timer.start()
 
         result_parts: list[str] = []  # final answer from stream-json 'result'

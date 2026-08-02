@@ -20,7 +20,7 @@ from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 
 from ..coach import build_coach
-from ..commands import PLACEHOLDER_KEYS, CommandJob, CommandRunner
+from ..commands import SNAPSHOT_KEYS, CommandJob, CommandRunner
 from ..config import Config
 from ..context import stdin_provider_for
 from ..db import Database
@@ -92,16 +92,27 @@ def create_app(config: Config, db_path: str) -> FastAPI:
 
     def _panel(request: Request, job, generated_at: str | None = None) -> HTMLResponse:
         skill = skills_by_name.get(job.kind)
+        # Read the job's mutable state ONCE, and render from that read. The
+        # worker thread flips status while this request is being served, so a
+        # template that re-read `job.status` could take the "done" branch with
+        # the output captured a moment earlier, while it was still running —
+        # and the done fragment stops polling, so the panel would stay empty.
+        # Status first: the runner publishes output and error *before* the
+        # status that advertises them, so "done" here always has its output.
+        status = job.status
+        output, error = job.output, job.error
         return templates.TemplateResponse(
             request,
             "_command_panel.html",
             {
                 "job": job,
+                "status": status,
+                "error": error,
                 "kind": job.kind,
                 "heading": skill.label if skill else job.kind,
                 "icon": skill.icon if skill else "▶",
                 "generated_at": generated_at,
-                "output_html": _render_markdown(job.output) if job.status == "done" else None,
+                "output_html": _render_markdown(output) if status == "done" else None,
             },
         )
 
@@ -111,7 +122,7 @@ def create_app(config: Config, db_path: str) -> FastAPI:
             config.jira.project_keys,
         )
         ctx = {"project_id": project_id, "mr_iid": mr_iid}
-        ctx.update({k: snap.get(k, "") for k in PLACEHOLDER_KEYS})
+        ctx.update({k: snap.get(k, "") for k in SNAPSHOT_KEYS})
         ctx["jira_keys"] = " ".join(keys)
         ctx["jira_keys_csv"] = ",".join(keys)
         return ctx, keys

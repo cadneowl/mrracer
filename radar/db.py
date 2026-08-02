@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS mr_snapshots (
     web_url        TEXT,
     source_branch  TEXT,
     target_branch  TEXT,
+    head_sha       TEXT,
     description    TEXT NOT NULL DEFAULT '',
     labels         TEXT NOT NULL DEFAULT '[]',
     draft          INTEGER NOT NULL DEFAULT 0,
@@ -125,6 +126,11 @@ class Database:
             self.conn.execute(
                 "ALTER TABLE mr_snapshots ADD COLUMN description TEXT NOT NULL DEFAULT ''"
             )
+        if "head_sha" not in cols:
+            # Nullable: an MR polled before this column existed has no recorded
+            # head commit until its next poll, and a skill must treat it as absent
+            # rather than as "no changes".
+            self.conn.execute("ALTER TABLE mr_snapshots ADD COLUMN head_sha TEXT")
 
         # test_plans gained `kind` in the primary key so multiple storing skills
         # don't share one row. SQLite can't ALTER a PK, so rebuild the table;
@@ -231,17 +237,19 @@ class Database:
         reviewers: list[str],
         created_at: str | None,
         updated_at: str | None,
+        head_sha: str | None = None,
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO mr_snapshots
                 (project_id, mr_iid, title, author, web_url, source_branch,
-                 target_branch, description, labels, draft, state, reviewers,
+                 target_branch, head_sha, description, labels, draft, state, reviewers,
                  created_at, updated_at, last_polled_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, mr_iid) DO UPDATE SET
                 title=excluded.title, author=excluded.author, web_url=excluded.web_url,
                 source_branch=excluded.source_branch, target_branch=excluded.target_branch,
+                head_sha=excluded.head_sha,
                 description=excluded.description, labels=excluded.labels, draft=excluded.draft,
                 state=excluded.state, reviewers=excluded.reviewers, created_at=excluded.created_at,
                 updated_at=excluded.updated_at, last_polled_at=excluded.last_polled_at
@@ -254,6 +262,7 @@ class Database:
                 web_url,
                 source_branch,
                 target_branch,
+                head_sha,
                 description or "",
                 json.dumps(labels),
                 1 if draft else 0,

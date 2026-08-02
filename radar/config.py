@@ -16,6 +16,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 
 from .business_time import WorkCalendar, parse_hhmm, parse_weekday
+from .skillcontext import (
+    Input,
+    SkillContextError,
+    SourceSpec,
+    parse_inputs,
+    parse_source,
+)
 
 
 class ConfigError(Exception):
@@ -69,12 +76,19 @@ class SkillConfig:
     board button. The command is a template filled with MR context.
 
     ``name`` is the URL/id slug; ``button``/``label``/``icon`` drive the board
-    button text, the panel heading, and the emoji. ``context`` names an optional
-    backend fetch whose output is piped to the command on stdin when
-    ``include_context`` is on — ``"gitlab_diff"`` (the MR diff) or ``"jira"``
+    button text, the panel heading, and the emoji. ``contexts`` names the backend
+    fetches whose output is piped to the command on stdin when
+    ``include_context`` is on — ``"gitlab_diff"`` (the MR diff) and/or ``"jira"``
     (the linked ticket(s)/epic) — so the skill needs no GitLab/Jira access of its
     own. ``stores_result`` persists the output so the board can re-open it later
     (used by the QA test plan).
+
+    ``source`` and ``inputs`` are the skill's declared context bag (see
+    ``skillcontext``): where this project's code is checked out, and any other
+    input the skill needs. Both are resolved per job, because the source root
+    varies by GitLab project. ``checkout: worktree`` gives each job its own
+    detached worktree of that source at the MR's head commit (see ``worktree``);
+    ``remote`` names the git remote to fetch the MR ref from.
     """
 
     name: str = ""
@@ -86,8 +100,12 @@ class SkillConfig:
     working_dir: str | None = None
     timeout_seconds: int = 600
     include_context: bool = False
-    context: str | None = None  # "gitlab_diff" | "jira" | None
+    contexts: tuple[str, ...] = ()  # subset of {"gitlab_diff", "jira"}
     stores_result: bool = False
+    source: SourceSpec | None = None
+    inputs: tuple[Input, ...] = ()
+    checkout: str = "none"  # "none" | "worktree"
+    remote: str = "origin"
 
 
 # Backwards-compatible aliases (older names for the same shape).
@@ -263,6 +281,7 @@ def _parse_slas(raw: object) -> tuple[SLARule, ...]:
 
 
 _VALID_CONTEXTS = {"gitlab_diff", "jira"}
+_VALID_CHECKOUTS = {"none", "worktree"}
 
 # A skill name is interpolated into dashboard routes and htmx URLs
 # (/{name}/{project_id}/{mr_iid}), so it must be a URL-safe slug and must not
@@ -277,16 +296,40 @@ _RESERVED_NAMES = frozenset({"status", "stream", "close", "stored"})
 _BUILTIN_SKILLS: dict[str, dict] = {
     "review": {
         "label": "AI review", "button": "review", "icon": "🔍",
-        "context": "gitlab_diff", "stores_result": False,
+        "context": ["gitlab_diff"], "stores_result": False,
     },
     "qa": {
         "label": "QA test plan", "button": "QA plan", "icon": "🧪",
-        "context": "jira", "stores_result": True,
+        "context": ["jira"], "stores_result": True,
     },
 }
 
 
-def _parse_skill(raw: object, name: str, ctx: str) -> SkillConfig:
+def _parse_contexts(raw: object, ctx: str) -> tuple[str, ...]:
+    """Parse ``context:`` — one backend fetch or several.
+
+    A scalar is still accepted (it is what every config in the wild says), so
+    ``context: gitlab_diff`` and ``context: [gitlab_diff, jira]`` both work: a
+    review skill can be given the diff *and* the linked ticket.
+    """
+    if raw is None:
+        return ()
+    values = raw if isinstance(raw, list) else [raw]
+    out: list[str] = []
+    for value in values:
+        value = str(value)
+        if value not in _VALID_CONTEXTS:
+            allowed = ", ".join(sorted(_VALID_CONTEXTS))
+            raise ConfigError(
+                f"{ctx}.context: unknown value {value!r} (expected one of {allowed}, "
+                "or omit it for a skill that needs no backend fetch)"
+            )
+        if value not in out:  # de-dup, keep order
+            out.append(value)
+    return tuple(out)
+
+
+def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfig:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -318,18 +361,10 @@ def _parse_skill(raw: object, name: str, ctx: str) -> SkillConfig:
     if timeout < 1:
         raise ConfigError(f"{ctx}.timeout_seconds: must be >= 1")
 
-    context = raw.get("context", builtin.get("context"))
-    if context is not None:
-        context = str(context)
-        if context not in _VALID_CONTEXTS:
-            allowed = ", ".join(sorted(_VALID_CONTEXTS))
-            raise ConfigError(
-                f"{ctx}.context: unknown value {context!r} (expected one of {allowed}, "
-                "or omit it for a skill that needs no backend fetch)"
-            )
+    contexts = _parse_contexts(raw.get("context", builtin.get("context")), ctx)
 
     include_context = bool(raw.get("include_context", False))
-    if include_context and context is None:
+    if include_context and not contexts:
         raise ConfigError(
             f"{ctx}.include_context is true but no 'context' source is set, so radar "
             "wouldn't know what to fetch. Set context: gitlab_diff or jira, or drop "
@@ -338,14 +373,46 @@ def _parse_skill(raw: object, name: str, ctx: str) -> SkillConfig:
 
     stores_result = bool(raw.get("stores_result", builtin.get("stores_result", False)))
 
+    # The declared context bag: where the code is, and any other input the skill
+    # needs. Shape errors are config errors; a value that is merely unset is a
+    # deployment problem, reported by `radar check` and refused at the click.
+    try:
+        source = parse_source(raw.get("source"), ctx, base_dir)
+        inputs = parse_inputs(raw.get("inputs"), ctx, base_dir)
+    except SkillContextError as exc:
+        raise ConfigError(str(exc)) from None
+
+    checkout = str(raw.get("checkout", "none"))
+    if checkout not in _VALID_CHECKOUTS:
+        allowed = ", ".join(sorted(_VALID_CHECKOUTS))
+        raise ConfigError(f"{ctx}.checkout: unknown value {checkout!r} (expected one of {allowed})")
+    if checkout == "worktree" and source is None:
+        raise ConfigError(
+            f"{ctx}.checkout is 'worktree' but no 'source:' is set, so there is no "
+            "repository to make a worktree of"
+        )
+    if checkout == "worktree" and working_dir is not None:
+        # Both set is a contradiction radar cannot resolve quietly: it would
+        # fetch and build the worktree, tell the skill (via {source_root} and
+        # the stdin bundle) that the code is there, and then run it somewhere
+        # else — so a skill whose tools follow the working directory would read
+        # one tree while being told about another.
+        raise ConfigError(
+            f"{ctx}: 'working_dir' and 'checkout: worktree' contradict each other — the "
+            "worktree is where the merge request's code is, but working_dir would run the "
+            "command elsewhere. Drop one."
+        )
+    remote = str(raw.get("remote", "origin")).strip() or "origin"
+
     return SkillConfig(
         name=name, label=label, button=button, icon=icon, enabled=enabled,
         command=command, working_dir=working_dir, timeout_seconds=timeout,
-        include_context=include_context, context=context, stores_result=stores_result,
+        include_context=include_context, contexts=contexts, stores_result=stores_result,
+        source=source, inputs=inputs, checkout=checkout, remote=remote,
     )
 
 
-def _parse_skills(raw_top: dict) -> tuple[SkillConfig, ...]:
+def _parse_skills(raw_top: dict, base_dir: Path) -> tuple[SkillConfig, ...]:
     """Build the ordered skill list: the built-in review + qa (always present,
     disabled unless configured), optionally overridden by legacy top-level
     ``review:``/``qa:`` blocks, plus any entries from a ``skills:`` list. A
@@ -355,12 +422,12 @@ def _parse_skills(raw_top: dict) -> tuple[SkillConfig, ...]:
 
     # Built-in baseline (disabled defaults), then legacy top-level blocks.
     for name in ("review", "qa"):
-        by_name[name] = _parse_skill({}, name, name)
+        by_name[name] = _parse_skill({}, name, name, base_dir)
         order.append(name)
     for name in ("review", "qa"):
         block = raw_top.get(name)
         if block is not None:
-            by_name[name] = _parse_skill(block, name, name)
+            by_name[name] = _parse_skill(block, name, name, base_dir)
 
     skills_raw = raw_top.get("skills")
     if skills_raw is not None:
@@ -386,7 +453,7 @@ def _parse_skills(raw_top: dict) -> tuple[SkillConfig, ...]:
             seen.add(name)
             if name not in by_name:
                 order.append(name)
-            by_name[name] = _parse_skill(entry, name, ctx)
+            by_name[name] = _parse_skill(entry, name, ctx, base_dir)
 
     return tuple(by_name[n] for n in order)
 
@@ -480,7 +547,8 @@ def load_config(path: str | Path) -> Config:
     calendar = _parse_calendar(_require(raw, "calendar", "config"))
     slas = _parse_slas(_require(raw, "slas", "config"))
     waive = _parse_waive(raw.get("waive"))
-    skills = _parse_skills(raw)
+    # A declared `file:` input is written relative to the config that names it.
+    skills = _parse_skills(raw, path.resolve().parent)
     jira = _parse_jira(raw.get("jira"))
     teams = _parse_teams(raw.get("teams"))
     gamification = raw.get("gamification") or {}
