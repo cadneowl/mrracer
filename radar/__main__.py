@@ -43,7 +43,7 @@ def _make_source(config):
 def cmd_poll_once(args) -> int:
     config = load_config(args.config)
     with Database(str(config.database_path)) as db:
-        result = poll_once(db, config, _make_source(config))
+        result = poll_once(db, config, _make_source(config), full=args.full)
         summary = run_recompute(db, config)
     print(
         f"polled {result.projects} project(s): {result.mrs_seen} MRs seen, "
@@ -136,7 +136,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("poll-once", help="one polling pass then exit").set_defaults(func=cmd_poll_once)
+    poll = sub.add_parser("poll-once", help="one polling pass then exit")
+    poll.add_argument(
+        "--full",
+        action="store_true",
+        help="re-fetch every open MR, ignoring the last-polled watermark "
+        "(use once after upgrading, to backfill discussion threads)",
+    )
+    poll.set_defaults(func=cmd_poll_once)
     sub.add_parser("recompute", help="re-derive obligations from events").set_defaults(
         func=cmd_recompute
     )

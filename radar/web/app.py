@@ -25,7 +25,7 @@ from ..config import Config
 from ..context import stdin_provider_for
 from ..db import Database
 from ..jira import extract_keys
-from ..service import build_dashboard
+from ..service import build_dashboard, build_threads
 
 _BASE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(_BASE / "templates"))
@@ -147,6 +147,22 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         # Auto-refresh preserves the remembered filter via the cookie.
         token = request.cookies.get(COOKIE_NAME) or None
         return templates.TemplateResponse(request, "_board.html", context(token))
+
+    # Declared ahead of the /{kind}/... routes: those all carry a literal second
+    # segment ('status', 'stored', 'close') so they cannot shadow this, but the
+    # order makes that independent of a skill ever being named "threads".
+    @app.get("/threads/{project_id}/{mr_iid}", response_class=HTMLResponse)
+    def threads(request: Request, project_id: int, mr_iid: int, author: str | None = None):
+        with Database(db_path) as db:
+            data = build_threads(db, project_id, mr_iid, author=author or None)
+        if data is None:
+            raise HTTPException(status_code=404, detail="unknown merge request")
+        # Comment bodies are markdown written by anyone who can see the MR, so
+        # they go through the same render-then-sanitize path as skill output.
+        for thread in data["threads"]:
+            for note in thread["notes"]:
+                note["body_html"] = _render_markdown(note["body"])
+        return templates.TemplateResponse(request, "_threads.html", data)
 
     @app.post("/{kind}/{project_id}/{mr_iid}", response_class=HTMLResponse)
     def start_command(request: Request, kind: str, project_id: int, mr_iid: int):

@@ -28,6 +28,88 @@
   {# Command modal target — outside #board so the 60s refresh can't clear it. #}
   <div id="command-panel"></div>
 
+  <script>
+  // Expanding a row shows its discussion inline, which puts it *inside* the
+  // board — and the 60s refresh replaces the board wholesale. So the open rows
+  // are remembered here and re-requested after each swap: the expansion
+  // survives, and it comes back with the poll's newest comments rather than a
+  // frozen copy of what was on screen a minute ago.
+  (function () {
+    var KEY = "radar.threads.open";  // { "<projectId>-<mrIid>": "<author>|''" }
+
+    function state() {
+      try { return JSON.parse(sessionStorage.getItem(KEY) || "{}"); } catch (e) { return {}; }
+    }
+    function save(s) {
+      try { sessionStorage.setItem(KEY, JSON.stringify(s)); } catch (e) { /* private mode */ }
+    }
+    function url(key, author) {
+      var parts = key.split("-");  // both halves are integers, so this is safe
+      var u = "/threads/" + parts[0] + "/" + parts[1];
+      return author ? u + "?author=" + encodeURIComponent(author) : u;
+    }
+    // `author` is the one whose threads are showing, or null for none. Every
+    // control on the row is checked, not just the one clicked: they are
+    // alternatives (this person / the whole MR), so lighting up more than one
+    // would claim the row is showing threads it is not.
+    function mark(key, author) {
+      var sel = '[data-thread-key="' + key + '"]';
+      document.querySelectorAll(sel).forEach(function (el) {
+        var mine = (el.dataset.threadAuthor || "") === author;
+        el.classList.toggle("is-open", author !== null && mine);
+      });
+    }
+    function expand(key, author) {
+      var row = document.getElementById("threads-" + key);
+      if (!row) return;  // remembered from a board that no longer lists this MR
+      row.hidden = false;
+      var cell = row.querySelector(".thread-cell");
+      cell.innerHTML = '<div class="threads-loading">loading discussion…</div>';
+      if (window.htmx) htmx.ajax("GET", url(key, author), { target: cell, swap: "innerHTML" });
+      mark(key, author);
+    }
+    function collapse(key) {
+      var row = document.getElementById("threads-" + key);
+      if (row) {
+        row.hidden = true;
+        row.querySelector(".thread-cell").innerHTML = "";
+      }
+      mark(key, null);
+    }
+    function restore() {
+      var s = state();
+      Object.keys(s).forEach(function (key) { expand(key, s[key]); });
+    }
+
+    document.addEventListener("click", function (e) {
+      var toggle = e.target.closest && e.target.closest("[data-thread-toggle]");
+      if (!toggle) return;
+      e.preventDefault();
+      var key = toggle.dataset.threadKey, author = toggle.dataset.threadAuthor || "";
+      var s = state();
+      if (key in s && s[key] === author) {
+        delete s[key];             // same control again -> close
+        collapse(key);
+      } else {
+        s[key] = author;           // open, or switch between all / one person
+        expand(key, author);
+      }
+      save(s);
+    });
+
+    document.body.addEventListener("htmx:afterSwap", function (e) {
+      if (!e.target || e.target.id !== "board") return;  // not the board refresh
+      restore();
+    });
+
+    // And on a full page load too — clicking a view pill or hitting reload is a
+    // navigation, not a swap. Without this the remembered rows come back
+    // collapsed while the memory still calls them open, so the next click reads
+    // as "close" and the control looks dead.
+    restore();
+  })();
+  </script>
+
   <footer class="foot">
     Breach summaries are shown at team level only. Per-reviewer breach detail lives in the
     <a class="foot-link" href="/coach">coach view</a> (manager-only).

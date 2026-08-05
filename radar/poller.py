@@ -22,6 +22,7 @@ from .db import Database
 from .events import Event, EventType
 from .gitlab_client import MRSource, normalize_mr
 from .notes import events_from_discussions, parse_gitlab_time
+from .threads import threads_from_discussions
 
 log = logging.getLogger("radar.poller")
 
@@ -99,18 +100,24 @@ def _terminal_events(mr: dict) -> list[Event]:
     ]
 
 
-def poll_once(db: Database, config: Config, source: MRSource) -> PollResult:
+def poll_once(db: Database, config: Config, source: MRSource, full: bool = False) -> PollResult:
     """Run one polling pass over all configured projects.
 
     Each project is isolated: a failure fetching one project is logged and the
     remaining projects still run.
+
+    ``full`` ignores the stored high-water mark and re-fetches every open MR.
+    Normal polling skips MRs that have not changed since the last pass, which is
+    exactly right for events (they are already stored) and wrong the first time
+    radar wants something it never kept before — a quiet MR would keep its gap
+    forever. It is safe to run at any time: events dedup, caches are replaced.
     """
     total_new = 0
     mrs_seen = 0
 
     for project in config.gitlab.projects:
         try:
-            seen, new = _poll_project(db, config, source, str(project))
+            seen, new = _poll_project(db, config, source, str(project), full=full)
             mrs_seen += seen
             total_new += new
         except Exception:  # noqa: BLE001 - isolate a bad project from the rest
@@ -119,16 +126,22 @@ def poll_once(db: Database, config: Config, source: MRSource) -> PollResult:
     return PollResult(projects=len(config.gitlab.projects), mrs_seen=mrs_seen, new_events=total_new)
 
 
-def _poll_project(db: Database, config: Config, source: MRSource, key: str) -> tuple[int, int]:
+def _poll_project(
+    db: Database, config: Config, source: MRSource, key: str, full: bool = False
+) -> tuple[int, int]:
     pstate = db.get_poll_state(key)
-    updated_after = pstate["last_updated_after"] if pstate else None
+    stored_mark = pstate["last_updated_after"] if pstate else None
+    updated_after = None if full else stored_mark
     # First poll (no high-water mark): only open MRs, to avoid pulling all
     # history. After that, fetch all states so merge/close transitions since the
     # mark are recorded and their obligations resolve.
     state = "all" if updated_after else "opened"
 
     raw_mrs = source.list_merge_requests(key, updated_after, state)
-    max_updated = updated_after
+    # Seeded from the stored mark even in a full pass: a full pass sees only
+    # open MRs, so taking the max of what it fetched could move the mark back
+    # behind an MR that has since merged and make the next pass redo its work.
+    max_updated = stored_mark
     project_id_for_state = pstate["project_id"] if pstate else None
     seen = 0
     new = 0
@@ -158,6 +171,10 @@ def _poll_project(db: Database, config: Config, source: MRSource, key: str) -> t
         )
 
         discussions = source.list_discussions(pid, iid)
+        # One fetch, two uses: the immutable facts become events, and the
+        # conversation itself is cached so the board can show *why* a reviewer
+        # is waiting without a trip to GitLab.
+        db.replace_threads(pid, iid, threads_from_discussions(pid, iid, discussions))
         events = events_from_discussions(pid, iid, discussions)
         if mr["state"] == "opened":
             events += _reconcile_reviewers(db, mr, events)

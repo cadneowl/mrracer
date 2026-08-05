@@ -67,9 +67,12 @@ def _wall_age(created_at: str | None, now: datetime) -> str:
     return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
-def _obligation_view(o: ObligationState) -> dict:
+def _obligation_view(o: ObligationState, open_threads: int = 0) -> dict:
     return {
         "reviewer": o.reviewer,
+        # Threads this reviewer opened that nobody has resolved — the concrete
+        # thing a "waiting on author" chip is waiting for.
+        "open_threads": open_threads,
         "round": o.round,
         "chip_state": o.chip_state,
         "status_text": o.status_text,
@@ -151,6 +154,7 @@ def build_dashboard(
     """Assemble the board, optionally filtered by a view token (a reviewer's
     personal view, or a team's authored / review-requested filter)."""
     now = now or datetime.now(UTC)
+    thread_counts = db.thread_counts()
 
     all_rows: list[dict] = []
     for snap in db.open_snapshots():
@@ -158,7 +162,11 @@ def build_dashboard(
         obligations = derive_mr(events, snap, config, now)
         if not obligations:
             continue
-        views = [_obligation_view(o) for o in obligations]
+        counts = thread_counts.get(
+            (snap["project_id"], snap["mr_iid"]), {"total": 0, "open": 0, "by_author": {}}
+        )
+        by_author = counts["by_author"]
+        views = [_obligation_view(o, by_author.get(o.reviewer, 0)) for o in obligations]
         keys = extract_keys(
             [snap.get("title"), snap.get("source_branch"), snap.get("description")],
             config.jira.project_keys,
@@ -179,6 +187,7 @@ def build_dashboard(
                 "min_urgency": _row_min_urgency(views),
                 "jira": [{"key": k, "url": browse_url(config.jira.base_url, k)} for k in keys],
                 "stored_kinds": stored_kinds,
+                "threads": {"total": counts["total"], "open": counts["open"]},
             }
         )
 
@@ -213,6 +222,72 @@ def build_dashboard(
         "teams": [t.name for t in config.teams],
         "view": {"token": view or "", "kind": kind, "label": label},
         "generated_at": now,
+    }
+
+
+def _note_view(note: dict, web_url: str | None, now: datetime) -> dict:
+    return {
+        "author": note.get("author"),
+        "age": _wall_age(note.get("created_at"), now),
+        "body": note.get("body") or "",
+        "truncated": bool(note.get("truncated")),
+        "url": f"{web_url}#note_{note['id']}" if web_url and note.get("id") else None,
+    }
+
+
+def _thread_view(thread: dict, web_url: str | None, now: datetime) -> dict:
+    notes = [_note_view(n, web_url, now) for n in thread.get("notes", [])]
+    location = thread.get("file_path")
+    if location and thread.get("line"):
+        location = f"{location}:{thread['line']}"
+    return {
+        "discussion_id": thread["discussion_id"],
+        "author": thread.get("author"),
+        "age": _wall_age(thread.get("created_at"), now),
+        "created_at": thread.get("created_at") or "",
+        "resolvable": thread["resolvable"],
+        "resolved": thread["resolved"],
+        "resolved_by": thread.get("resolved_by"),
+        "open": thread["resolvable"] and not thread["resolved"],
+        "location": location,
+        # Deep-link to the first note: GitLab scrolls to the anchor, so "open in
+        # GitLab" lands on the thread rather than the top of a long MR.
+        "url": notes[0]["url"] if notes else web_url,
+        "notes": notes,
+    }
+
+
+def build_threads(
+    db: Database,
+    project_id: int,
+    mr_iid: int,
+    author: str | None = None,
+    now: datetime | None = None,
+) -> dict | None:
+    """The discussion on one MR, ready to render. None if the MR is unknown.
+
+    Unresolved threads come first: the board sends you here to find out what a
+    reviewer is still waiting on, and burying that under a settled argument from
+    last week defeats the point. ``author`` narrows it to the threads one person
+    opened — which is what clicking their chip asks for.
+    """
+    now = now or datetime.now(UTC)
+    snap = db.get_snapshot(project_id, mr_iid)
+    if snap is None:
+        return None
+    web_url = _safe_url(snap.get("web_url"))
+    threads = [_thread_view(t, web_url, now) for t in db.threads_for(project_id, mr_iid)]
+    threads.sort(key=lambda t: (not t["open"], t["created_at"]))
+    shown = [t for t in threads if t["author"] == author] if author else threads
+    return {
+        "project_id": project_id,
+        "mr_iid": mr_iid,
+        "title": snap.get("title") or "",
+        "web_url": web_url,
+        "threads": shown,
+        "total": len(threads),
+        "open_total": sum(1 for t in threads if t["open"]),
+        "filter_author": author,
     }
 
 
