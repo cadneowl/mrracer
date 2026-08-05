@@ -90,6 +90,59 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .chip-at_risk  { background: var(--amber); }
 .chip-breached { background: var(--red);   color: #fff; }
 
+/* Discussion threads (expanded board row) */
+.chip-wrap { display: inline-flex; align-items: center; }
+.chip-threads {
+  margin: 2px 6px 2px -4px; padding: 3px 7px; font-size: 11px; font-weight: 700;
+  border-radius: 0 20px 20px 0; cursor: pointer; line-height: 1.5;
+  background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); border-left: none;
+}
+.chip-threads:hover, .chip-threads.is-open { background: var(--panel); color: var(--text); border-color: var(--amber); }
+.thread-btn {
+  padding: 2px 9px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  background: var(--panel-2); color: var(--muted); border: 1px solid var(--line);
+}
+.thread-btn:hover, .thread-btn.is-open { border-color: var(--amber); color: var(--text); }
+.thread-btn-live { color: var(--amber); border-color: rgba(245,158,11,.4); }
+
+.thread-row > .thread-cell { background: var(--bg); padding: 0 14px; }
+/* Every MR row is trailed by its (usually hidden) discussion row, so the last
+   *visible* row is the second-to-last child — without this the table keeps a
+   stray border below its final row. */
+.board tbody tr:nth-last-child(2) td { border-bottom: none; }
+.threads-loading, .threads-empty { color: var(--muted); padding: 14px 4px; font-size: 13px; }
+.threads-head { color: var(--muted); font-size: 12px; padding: 12px 4px 0; }
+.threads-all { color: var(--green); text-decoration: none; margin-left: 10px; font-weight: 600; }
+
+.thread {
+  border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 8px;
+  background: var(--panel); margin: 12px 0; padding: 10px 14px;
+}
+.thread:last-child { margin-bottom: 14px; }
+.thread-open { border-left-color: var(--amber); }
+.thread-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  font-size: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line);
+}
+.thread-state { color: var(--muted); font-weight: 600; }
+.thread-open .thread-state { color: var(--amber); }
+.thread-author { font-weight: 700; color: var(--text); }
+.thread-loc { background: var(--bg); border: 1px solid var(--line); border-radius: 5px;
+  padding: 1px 6px; font-size: 11.5px; color: #9fb4d8; }
+.thread-link { margin-left: auto; color: var(--muted); text-decoration: none; font-weight: 600; }
+.thread-link:hover { color: var(--text); }
+.thread-note { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.thread-note:last-child { border-bottom: none; padding-bottom: 2px; }
+.thread-note-head { display: flex; gap: 8px; font-size: 12px; margin-bottom: 4px; }
+.thread-body { font-size: 13px; line-height: 1.55; }
+.thread-body p { margin: 0 0 8px; }
+.thread-body p:last-child { margin-bottom: 0; }
+.thread-body pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  padding: 10px; overflow-x: auto; white-space: pre-wrap; font-size: 12.5px; }
+.thread-body code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+.thread-body pre code { background: none; padding: 0; }
+.thread-trunc { font-size: 11.5px; font-style: italic; margin-top: 4px; }
+
 .empty { padding: 40px; text-align: center; color: var(--muted);
   background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; }
 .empty code, .foot code, .gen code { background: var(--panel-2); padding: 1px 6px; border-radius: 5px; }

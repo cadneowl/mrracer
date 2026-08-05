@@ -43,6 +43,30 @@ Rows are sorted **most-overdue first**, and the board auto-refreshes every 60s
 via htmx. Breach counts are surfaced at **team level only** — there is
 deliberately no per-person breach list on the main board.
 
+### Read the discussion without leaving the board
+
+A chip tells you a reviewer is waiting; it does not tell you what *for*. Expand
+the row and radar shows the conversation inline:
+
+* **💬 n** next to the MR title — every thread on the MR (unresolved first,
+  then resolved, then plain comments). The number is the unresolved count.
+* **💬 n** attached to a reviewer's chip — just the threads *that person*
+  opened and nobody has resolved. This is the usual case: a paused chip means
+  they commented and are waiting on the author, and this is the comment.
+
+Each thread shows who opened it, the file and line, every reply, and a **reply
+on GitLab** deep-link to that exact note. Comment bodies are rendered as
+markdown and sanitized the same way skill output is.
+
+Threads are cached by the poller from the discussions it already fetches, so
+this costs no extra GitLab API calls. They follow GitLab: resolve a thread there
+and it stops counting here on the next poll. An expanded row survives the 60s
+auto-refresh and reloads with it, so a thread resolved mid-read updates in place.
+
+> After upgrading, run **`radar poll-once --full`** once. Normal polling skips
+> MRs that haven't changed since the last pass — which is exactly the quiet,
+> stalled MR whose threads you most want to read.
+
 ### Coach view (manager-only)
 
 Per the "no surveillance" principle, individual breach detail lives *only* on a
@@ -529,6 +553,7 @@ event log is on disk in SQLite).
 | Command | What it does |
 |---------|--------------|
 | `radar poll-once` | One polling pass, then exit (also refreshes the derived snapshot). |
+| `radar poll-once --full` | Same, but ignores the last-polled watermark and re-fetches **every open MR**. Safe any time (events dedup, caches are replaced); run it once after upgrading to backfill discussion threads. |
 | `radar serve [--host H] [--port P]` | Run the dashboard and the background poller. |
 | `radar recompute` | Re-derive every obligation from the event log under the current config. Run after changing SLA rules. |
 | `radar validate` | Validate `config.yaml` and exit. |
@@ -596,6 +621,8 @@ GitLab REST ─▶ gitlab_client ─▶ poller ─▶ [ events ]  (append-only, 
 - `business_time.py` — pure business-hours math (no I/O).
 - `config.py` — validated config loading; credentials from env only.
 - `events.py` / `notes.py` — event model and GitLab note/discussion parsing.
+- `threads.py` — the human comments from those same discussions, cached (not
+  derived: `resolved` is mutable state only GitLab knows).
 - `db.py` — hand-written SQLite repository (no ORM).
 - `derive.py` — replay events → obligation states.
 - `poller.py` / `scheduler.py` — ingestion and the in-process loop.

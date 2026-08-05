@@ -1,0 +1,55 @@
+{# The discussion on one MR, loaded on demand into the expanded board row.
+   Lives inside #board, so the 60s refresh replaces it — dashboard.html
+   remembers which rows were open and re-requests them after the swap. #}
+{% if filter_author %}
+<div class="threads-head">
+  Threads opened by <strong>{{ filter_author }}</strong>
+  {% if total > threads|length %}
+  <a class="threads-all" href="#"
+     data-thread-toggle data-thread-key="{{ project_id }}-{{ mr_iid }}">
+    show all {{ total }} on this MR
+  </a>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if not threads %}
+<div class="threads-empty">
+  {% if filter_author %}
+  No comments from <strong>{{ filter_author }}</strong> on this MR.
+  {% else %}
+  No comments recorded yet. Threads arrive with the next poll — run
+  <code>radar poll-once --full</code> to backfill MRs that have not changed since.
+  {% endif %}
+</div>
+{% endif %}
+
+{% for t in threads %}
+<article class="thread {% if t.open %}thread-open{% endif %}">
+  <div class="thread-head">
+    <span class="thread-state">
+      {%- if t.resolved %}✓ resolved{% if t.resolved_by %} by {{ t.resolved_by }}{% endif %}
+      {%- elif t.resolvable %}● unresolved
+      {%- else %}comment{% endif -%}
+    </span>
+    <span class="thread-author">{{ t.author or "—" }}</span>
+    {% if t.location %}<code class="thread-loc">{{ t.location }}</code>{% endif %}
+    <span class="muted">{{ t.age }} ago</span>
+    {% if t.url %}
+    <a class="thread-link" href="{{ t.url }}" target="_blank" rel="noopener">reply on GitLab ↗</a>
+    {% endif %}
+  </div>
+  {% for n in t.notes %}
+  <div class="thread-note">
+    <div class="thread-note-head">
+      <span class="thread-author">{{ n.author or "—" }}</span>
+      <span class="muted">{{ n.age }} ago</span>
+    </div>
+    <div class="thread-body">{{ n.body_html }}</div>
+    {% if n.truncated %}
+    <div class="thread-trunc muted">… long comment cut short — open it on GitLab for the rest</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</article>
+{% endfor %}

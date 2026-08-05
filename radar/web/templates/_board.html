@@ -60,6 +60,11 @@
           {% else %}<span class="tag tag-jira">{{ j.key }}</span>{% endif %}
         {% endfor %}
         <span class="row-actions">
+        {% if row.threads.total %}
+        <button class="thread-btn {% if row.threads.open %}thread-btn-live{% endif %}"
+                data-thread-toggle data-thread-key="{{ row.project_id }}-{{ row.mr_iid }}"
+                title="{{ row.threads.open }} unresolved of {{ row.threads.total }} thread(s) — read them here">💬 {{ row.threads.open or row.threads.total }}</button>
+        {% endif %}
         {% for s in enabled_skills %}
         <button class="review-btn"
                 hx-post="/{{ s.name }}/{{ row.project_id }}/{{ row.mr_iid }}"
@@ -83,14 +88,27 @@
       <td class="col-age muted">{{ row.age }}</td>
       <td class="col-obl">
         {% for o in row.obligations %}
-        <a class="chip chip-{{ o.chip_state|lower }}"
-           href="/?view={{ o.reviewer }}"
-           title="{{ o.status_text }} · {{ o.elapsed_hours }}h of {{ o.budget_hours }}h budget · tz {{ o.reviewer_tz }}{% if o.round > 1 %} · round {{ o.round }}{% endif %} · click for {{ o.reviewer }}'s MRs">
-          <span class="chip-name">{{ o.reviewer }}</span>
-          <span class="chip-time">{{ o.remaining_label }}</span>
-        </a>
+        <span class="chip-wrap">
+          <a class="chip chip-{{ o.chip_state|lower }}"
+             href="/?view={{ o.reviewer }}"
+             title="{{ o.status_text }} · {{ o.elapsed_hours }}h of {{ o.budget_hours }}h budget · tz {{ o.reviewer_tz }}{% if o.round > 1 %} · round {{ o.round }}{% endif %} · click for {{ o.reviewer }}'s MRs">
+            <span class="chip-name">{{ o.reviewer }}</span>
+            <span class="chip-time">{{ o.remaining_label }}</span>
+          </a>
+          {% if o.open_threads %}
+          <button class="chip-threads"
+                  data-thread-toggle
+                  data-thread-key="{{ row.project_id }}-{{ row.mr_iid }}"
+                  data-thread-author="{{ o.reviewer }}"
+                  title="{{ o.open_threads }} unresolved thread(s) opened by {{ o.reviewer }} — read them here">💬{{ o.open_threads }}</button>
+          {% endif %}
+        </span>
         {% endfor %}
       </td>
+    </tr>
+    {# Expanded discussion, filled on demand; see the toggle script in dashboard.html. #}
+    <tr class="thread-row" id="threads-{{ row.project_id }}-{{ row.mr_iid }}" hidden>
+      <td class="thread-cell" colspan="5"></td>
     </tr>
     {% endfor %}
   </tbody>

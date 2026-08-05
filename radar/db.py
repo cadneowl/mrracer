@@ -69,6 +69,31 @@ CREATE TABLE IF NOT EXISTS test_plans (
     PRIMARY KEY (project_id, mr_iid, kind)
 );
 
+-- Discussion threads, as GitLab currently has them. A cache like mr_snapshots,
+-- not truth: `resolved` is mutable state radar cannot derive, so each poll
+-- replaces an MR's rows outright rather than appending.
+CREATE TABLE IF NOT EXISTS mr_threads (
+    project_id    INTEGER NOT NULL,
+    mr_iid        INTEGER NOT NULL,
+    discussion_id TEXT NOT NULL,
+    author        TEXT,
+    created_at    TEXT,
+    updated_at    TEXT,
+    resolvable    INTEGER NOT NULL DEFAULT 0,
+    resolved      INTEGER NOT NULL DEFAULT 0,
+    resolved_by   TEXT,
+    resolved_at   TEXT,
+    file_path     TEXT,
+    line          INTEGER,
+    notes         TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (project_id, mr_iid, discussion_id)
+);
+-- Covers thread_counts() outright: every column the board's tally reads is in
+-- the index, so counting never touches the table and never pages in a comment
+-- body. The (project_id, mr_iid) prefix serves threads_for()'s lookup too.
+CREATE INDEX IF NOT EXISTS idx_mr_threads_counts
+    ON mr_threads (project_id, mr_iid, author, resolvable, resolved);
+
 CREATE TABLE IF NOT EXISTS poll_state (
     project_key        TEXT PRIMARY KEY,
     project_id         INTEGER,
@@ -93,6 +118,14 @@ CREATE TABLE IF NOT EXISTS obligations (
     PRIMARY KEY (project_id, mr_iid, reviewer, round)
 );
 """
+
+
+# Named so a test can check its query plan: this runs on every board render and
+# is only cheap while idx_mr_threads_counts covers it (see Database.thread_counts).
+THREAD_COUNT_SQL = (
+    "SELECT project_id, mr_iid, author, resolvable, resolved, count(*) AS n "
+    "FROM mr_threads GROUP BY project_id, mr_iid, author, resolvable, resolved"
+)
 
 
 def _now_utc_iso() -> str:
@@ -275,6 +308,81 @@ class Database:
         )
         self.conn.commit()
 
+    # --- discussion threads (a cache of GitLab's current state) ------------
+
+    def replace_threads(self, project_id: int, mr_iid: int, threads: Iterable) -> int:
+        """Make this MR's stored threads exactly ``threads``.
+
+        Delete-then-insert, not upsert: a thread that was resolved or deleted on
+        GitLab is gone from the fetch, and leaving a stale row behind would show
+        an open thread nobody can act on. One transaction, so a reader never
+        sees the empty middle.
+        """
+        rows = [
+            (
+                t.project_id,
+                t.mr_iid,
+                t.discussion_id,
+                t.author,
+                t.created_at,
+                t.updated_at,
+                1 if t.resolvable else 0,
+                1 if t.resolved else 0,
+                t.resolved_by,
+                t.resolved_at,
+                t.file_path,
+                t.line,
+                json.dumps(t.notes),
+            )
+            for t in threads
+        ]
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM mr_threads WHERE project_id=? AND mr_iid=?", (project_id, mr_iid)
+            )
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO mr_threads
+                    (project_id, mr_iid, discussion_id, author, created_at, updated_at,
+                     resolvable, resolved, resolved_by, resolved_at, file_path, line, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def threads_for(self, project_id: int, mr_iid: int) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM mr_threads WHERE project_id=? AND mr_iid=? "
+            "ORDER BY created_at, discussion_id",
+            (project_id, mr_iid),
+        )
+        return [_thread_row(r) for r in rows]
+
+    def thread_counts(self) -> dict[tuple[int, int], dict]:
+        """Per-MR thread tallies for the board, in one query.
+
+        The board needs a count for every row and a per-reviewer count for every
+        chip, on every render — so this must not read comment bodies to produce
+        a handful of numbers. It doesn't: the column list is exactly
+        ``idx_mr_threads_counts``, which SQLite answers as a covering-index scan.
+        Adding a column here that the index lacks would silently turn this back
+        into a full table scan.
+        """
+        rows = self.conn.execute(THREAD_COUNT_SQL)
+        counts: dict[tuple[int, int], dict] = {}
+        for row in rows:
+            entry = counts.setdefault(
+                (row["project_id"], row["mr_iid"]), {"total": 0, "open": 0, "by_author": {}}
+            )
+            entry["total"] += row["n"]
+            if row["resolvable"] and not row["resolved"]:
+                entry["open"] += row["n"]
+                if row["author"]:
+                    by_author = entry["by_author"]
+                    by_author[row["author"]] = by_author.get(row["author"], 0) + row["n"]
+        return counts
+
     # --- stored skill results (QA test plans, etc.) ------------------------
 
     def save_test_plan(
@@ -396,6 +504,14 @@ def _row_to_event(row: sqlite3.Row) -> Event:
         reviewer=row["reviewer"],
         payload=json.loads(row["payload"]),
     )
+
+
+def _thread_row(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["notes"] = json.loads(data.get("notes") or "[]")
+    data["resolvable"] = bool(data.get("resolvable"))
+    data["resolved"] = bool(data.get("resolved"))
+    return data
 
 
 def _snapshot_row(row: sqlite3.Row) -> dict:
