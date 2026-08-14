@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import markdown as md
@@ -68,7 +69,18 @@ def _render_markdown(text: str) -> Markup:
     return Markup(clean)
 
 
-def create_app(config: Config, db_path: str) -> FastAPI:
+def create_app(
+    config: Config,
+    db_path: str,
+    poll_now: Callable[[], object] | None = None,
+) -> FastAPI:
+    """Build the dashboard app.
+
+    ``poll_now`` runs one GitLab polling pass and returns when it has stored
+    what it found; ``radar serve`` passes the background poller's own pass.
+    Without it (no GitLab credentials, or a test) the board is read-only over
+    existing data and the refresh button is not offered.
+    """
     app = FastAPI(title="radar", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=str(_BASE / "static")), name="static")
     skills_by_name = {s.name: s for s in config.skills}
@@ -86,6 +98,7 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         with Database(db_path) as db:
             data = build_dashboard(db, config, view=view)
         data["poll_interval_minutes"] = config.gitlab.poll_interval_minutes
+        data["can_refresh"] = poll_now is not None
         data["enabled_skills"] = [_skill_view(s) for s in config.skills if s.enabled]
         data["storing_skills"] = storing_skills
         return data
@@ -147,6 +160,20 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         # Auto-refresh preserves the remembered filter via the cookie.
         token = request.cookies.get(COOKIE_NAME) or None
         return templates.TemplateResponse(request, "_board.html", context(token))
+
+    @app.post("/refresh", response_class=HTMLResponse)
+    def refresh(request: Request):
+        """Poll GitLab now, then answer with the board built from what it stored.
+
+        Synchronous on purpose. The click means "someone just asked me to review
+        something — show it", so what gets swapped in has to be the board *after*
+        the pass, not a promise that one is coming: a fire-and-forget kick would
+        return the same stale board the button was pressed to escape.
+        """
+        if poll_now is None:
+            raise HTTPException(status_code=404, detail="polling is not configured")
+        poll_now()
+        return board(request)
 
     # Declared ahead of the /{kind}/... routes: those all carry a literal second
     # segment ('status', 'stored', 'close') so they cannot shadow this, but the

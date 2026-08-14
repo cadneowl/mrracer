@@ -14,6 +14,19 @@
       <span class="subtitle">review SLA board</span>
     </div>
     <div class="meta">
+      {% if can_refresh %}
+      {# Doesn't wait for the next tick: fetches from GitLab and swaps in the
+         board built from it, for the MR someone just asked you to review. #}
+      <button class="refresh-btn"
+              hx-post="/refresh"
+              hx-target="#board"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this"
+              title="Fetch from GitLab now, instead of waiting for the next {{ poll_interval_minutes }}m poll">
+        <span class="refresh-idle">↻ refresh now</span>
+        <span class="refresh-busy"><span class="spinner"></span> polling GitLab…</span>
+      </button>
+      {% endif %}
       auto-refresh 60s · poll every {{ poll_interval_minutes }}m
     </div>
   </header>

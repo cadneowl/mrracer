@@ -29,7 +29,24 @@ body {
 .brand .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
   background: var(--green); margin-right: 8px; box-shadow: 0 0 8px var(--green); }
 .brand .subtitle { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 10px; }
-.topbar .meta { color: var(--muted); font-size: 12px; }
+.topbar .meta { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 12px; }
+
+.refresh-btn {
+  padding: 4px 12px; border-radius: 20px; font-size: 12px; cursor: pointer;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+}
+.refresh-btn:hover { border-color: var(--green); color: var(--green); }
+/* :hover is included — the pointer is still on the button you just pressed, and
+   a green "ready" outline over a spinner reads as if the click didn't take. */
+.refresh-btn:disabled, .refresh-btn:disabled:hover {
+  cursor: progress; color: var(--muted); border-color: var(--line);
+}
+/* htmx marks the button .htmx-request for the life of the poll, which is long
+   enough (a GitLab round trip per project) to need saying out loud. */
+.refresh-btn .refresh-busy { display: none; }
+.refresh-btn.htmx-request .refresh-idle { display: none; }
+.refresh-btn.htmx-request .refresh-busy { display: inline-flex; align-items: center; gap: 6px; }
+.refresh-btn .spinner { width: 11px; height: 11px; border-width: 2px; }
 
 main { padding: 18px 22px; }
 

@@ -75,19 +75,24 @@ def cmd_serve(args) -> int:
     # Ensure schema exists before the first request.
     Database(db_path).close()
 
-    app = create_app(config, db_path)
-
+    # The poller is built first: the board's "refresh now" button runs the same
+    # pass on demand, so the app needs a handle on it. No credentials -> no
+    # runner -> the app serves read-only and hides the button.
+    runner = None
     scheduler = None
     try:
         source = _make_source(config)
-        from .scheduler import make_scheduler
+        from .scheduler import PollRunner, make_scheduler
 
-        scheduler = make_scheduler(config, db_path, lambda: source)
+        runner = PollRunner(config, db_path, lambda: source)
+        scheduler = make_scheduler(runner, config.gitlab.poll_interval_minutes)
         scheduler.start()
         log.info("background poller started (every %d min)", config.gitlab.poll_interval_minutes)
     except ConfigError as exc:
         log.warning("background poller disabled: %s", exc.args[0].splitlines()[0])
         log.warning("serving read-only from existing data; set GITLAB_URL/GITLAB_TOKEN to poll")
+
+    app = create_app(config, db_path, poll_now=runner.run if runner else None)
 
     try:
         # Single worker on purpose: the poller (APScheduler) and the in-memory

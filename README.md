@@ -43,6 +43,13 @@ Rows are sorted **most-overdue first**, and the board auto-refreshes every 60s
 via htmx. Breach counts are surfaced at **team level only** — there is
 deliberately no per-person breach list on the main board.
 
+**↻ refresh now** (top right) polls GitLab immediately rather than waiting for
+the next `poll_interval_minutes` tick — for when someone asks you to review an
+MR that radar has not seen yet. The button waits for the pass to finish and
+answers with the board built from it, so the MR is there when it returns. It
+appears only when `serve` has a poller (i.e. GitLab credentials are set); the
+60s auto-refresh alone only re-renders what is already in SQLite.
+
 ### Read the discussion without leaving the board
 
 A chip tells you a reviewer is waiting; it does not tell you what *for*. Expand
@@ -543,8 +550,9 @@ uv run radar serve               # dashboard at http://127.0.0.1:8000 + backgrou
 ```
 
 Open <http://127.0.0.1:8000>. `serve` polls GitLab every
-`poll_interval_minutes` in-process; killing and restarting loses nothing (the
-event log is on disk in SQLite).
+`poll_interval_minutes` in-process, and the board's **↻ refresh now** button
+runs that same pass on demand; killing and restarting loses nothing (the event
+log is on disk in SQLite).
 
 ---
 
