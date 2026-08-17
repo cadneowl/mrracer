@@ -26,6 +26,7 @@ Each obligation runs through two phases against two budgets:
 |-------|-------------|-------------|
 | **first response** | from the review request until the reviewer's first qualifying response | a diff thread, `changes_requested`, or an approval |
 | **approval** | until approval — but **pauses while the ball is in the author's court** (reviewer asked for changes / opened a thread and the author hasn't pushed or replied since) | an approval |
+| **assignment** | from the moment an MR was opened with **no reviewers at all** (see [MRs with no reviewers](#mrs-with-no-reviewers)) | anyone being added as a reviewer |
 
 The board shows a single chip per obligation, tracking **whichever clock is
 currently live** (most-urgent, auto-switching), colored by how much of its
@@ -49,6 +50,44 @@ MR that radar has not seen yet. The button waits for the pass to finish and
 answers with the board built from it, so the MR is there when it returns. It
 appears only when `serve` has a poller (i.e. GitLab credentials are set); the
 60s auto-refresh alone only re-renders what is already in SQLite.
+
+### MRs with no reviewers
+
+An MR nobody was asked to review has no review obligation, so nothing above has
+anything to say about it — and it is exactly the MR most likely to be forgotten.
+Give the SLA rules an `assignment_business_hours` budget and each one appears on
+the board carrying a single hollow **NO REVIEWERS** chip:
+
+```yaml
+slas:
+  - match: {} # every rule needs the key, or none of them
+    first_response_business_hours: 16
+    approval_business_hours: 24
+    assignment_business_hours: 4 # half a business day to find a reviewer
+```
+
+The chip is colored by the same green / amber / red buckets. Its clock runs in
+business hours from the point the MR last became something someone could have
+been asked to review — when it was opened, when it was **marked ready**, or when
+its **last reviewer was removed**, whichever is latest. So a week spent as a
+draft is not billed the moment the draft flag clears, and an MR left orphaned is
+not billed for the days somebody was on it.
+
+The chip carries no name and does not link anywhere, because nobody was given
+the job; the row's **Author** column says who still owes it, and the MR counts
+toward their pill in the VIEW bar and their personal view (an MR of yours that
+needs a reviewer *is* waiting on you).
+
+Three cases deliberately produce no chip at all: a **draft** (shown blue and
+waived under the usual `waive:` rules, since it is not expected to have
+reviewers yet), an MR that has **already been approved** (it is waiting to
+merge, not waiting for someone to look at it, even if the approver was later
+removed), and any MR once it is merged or closed. The chip also never reaches
+the *team · to review* filter or the coach view, both of which are about reviews
+people were actually asked for.
+
+Omit `assignment_business_hours` everywhere and none of this happens — the check
+is off and unassigned MRs stay off the board, as before.
 
 ### Read the discussion without leaving the board
 
@@ -587,6 +626,7 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `calendar.default_timezone` | Timezone for reviewers not in the map. |
 | `calendar.reviewer_timezones` | Per-reviewer timezone overrides. |
 | `slas` | Ordered rules; **first match wins**. Each has a `match` (optional `target_branch` glob and/or required `labels`) and `first_response_business_hours` / `approval_business_hours`. The last rule must be the default `match: {}`. |
+| `slas[].assignment_business_hours` | Optional budget for getting **any** reviewer onto an MR that has none — the [NO REVIEWERS](#mrs-with-no-reviewers) chip. Omitted everywhere, the check is off. Set it on **every** rule or none: first match wins outright, so a partial config would silently skip MRs matching the rules that lack it (radar refuses to load one). |
 | `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is **currently** a draft, or the MR carries any `labels` listed here. (Only the current draft state waives; historical draft periods are not subtracted from the clock.) |
 | `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`. The names `review` and `qa` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
 | `jira` | `base_url` (builds the `PROJ-123` browse links on the board) and `project_keys` (optional filter so `UTF-8`-shaped tokens aren't matched). Not a credential — fetching a ticket uses `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` from the environment. |

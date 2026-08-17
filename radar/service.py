@@ -17,6 +17,7 @@ from .derive import (
     CHIP_IN_SLA,
     CHIP_PENDING,
     CHIP_WAIVED,
+    KIND_REVIEW,
     ObligationState,
     derive_mr,
 )
@@ -69,7 +70,11 @@ def _wall_age(created_at: str | None, now: datetime) -> str:
 
 def _obligation_view(o: ObligationState, open_threads: int = 0) -> dict:
     return {
+        # For an assignment obligation this is the author who owes one, not
+        # somebody who was asked to review; the board reads `kind` to tell them
+        # apart rather than putting a name on a chip nobody was given.
         "reviewer": o.reviewer,
+        "kind": o.kind,
         # Threads this reviewer opened that nobody has resolved — the concrete
         # thing a "waiting on author" chip is waiting for.
         "open_threads": open_threads,
@@ -103,6 +108,8 @@ def _people_index(rows: list[dict]) -> list[dict]:
     for row in rows:
         for o in row["obligations"]:
             name = o["reviewer"]
+            if not name:  # an unassigned MR whose author GitLab did not report
+                continue
             p = people.setdefault(name, {"username": name, "waiting": 0, "total": 0})
             p["total"] += 1
             if o["chip_state"] in _WAITING_STATES:
@@ -166,7 +173,13 @@ def build_dashboard(
             (snap["project_id"], snap["mr_iid"]), {"total": 0, "open": 0, "by_author": {}}
         )
         by_author = counts["by_author"]
-        views = [_obligation_view(o, by_author.get(o.reviewer, 0)) for o in obligations]
+        views = [
+            # Only a reviewer's own threads belong on their chip. An assignment
+            # obligation names the author, whose threads are not what a missing
+            # reviewer is waiting on.
+            _obligation_view(o, by_author.get(o.reviewer, 0) if o.kind == KIND_REVIEW else 0)
+            for o in obligations
+        ]
         keys = extract_keys(
             [snap.get("title"), snap.get("source_branch"), snap.get("description")],
             config.jira.project_keys,
@@ -198,8 +211,14 @@ def build_dashboard(
         # Personal view: MRs waiting on one person, narrowed to their obligation.
         rows = _filter_obligations(all_rows, lambda o: o["reviewer"] == value)
     elif kind == "team_review":
+        # Requested reviewers only: an unassigned MR was never asked of anyone,
+        # so it does not belong in a "review requested from team X" list even
+        # though its assignment obligation is booked against its author.
         members = value.member_set
-        rows = _filter_obligations(all_rows, lambda o: o["reviewer"] in members)
+        rows = _filter_obligations(
+            all_rows,
+            lambda o: o["kind"] == KIND_REVIEW and o["reviewer"] in members,
+        )
     elif kind == "team_authored":
         members = value.member_set
         rows = [r for r in all_rows if r["author"] in members]

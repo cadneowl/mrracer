@@ -108,6 +108,51 @@ waive: {}
         load_config(_write(tmp_path, text))
 
 
+def test_assignment_budget_is_optional(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID))
+    assert cfg.slas[-1].assignment_business_hours is None  # unassigned check off
+
+    on = VALID.replace(
+        "approval_business_hours: 24",
+        "approval_business_hours: 24\n    assignment_business_hours: 4",
+    )
+    assert load_config(_write(tmp_path, on)).slas[-1].assignment_business_hours == 4.0
+
+
+def test_business_hours_reject_a_boolean(tmp_path):
+    """`false` is the obvious-looking way to switch a budget off, and float(False)
+    would make it 0 — a zero-hour budget, i.e. the harshest setting there is."""
+    bad = VALID.replace(
+        "approval_business_hours: 24",
+        "approval_business_hours: 24\n    assignment_business_hours: false",
+    )
+    with pytest.raises(ConfigError, match="leave its key out"):
+        load_config(_write(tmp_path, bad))
+
+
+def test_assignment_budget_must_be_on_every_rule_or_none(tmp_path):
+    """Set on some rules only, an MR matching one of the others would silently
+    go unchecked — so the parser names the rules that are missing it."""
+    text = """
+gitlab: {projects: [g/p]}
+calendar:
+  workdays: [mon]
+  work_hours: {start: "09:00", end: "18:00"}
+  default_timezone: UTC
+slas:
+  - match: {labels: ["hotfix"]}
+    first_response_business_hours: 4
+    approval_business_hours: 8
+  - match: {}
+    first_response_business_hours: 16
+    approval_business_hours: 24
+    assignment_business_hours: 4
+waive: {}
+"""
+    with pytest.raises(ConfigError, match=r"slas\[0\]"):
+        load_config(_write(tmp_path, text))
+
+
 def test_bad_timezone(tmp_path):
     bad = VALID.replace("America/New_York", "Mars/Phobos")
     with pytest.raises(ConfigError, match="timezone"):

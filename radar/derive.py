@@ -19,6 +19,12 @@ moves through two phases against two budgets:
 
 The single chip shows whichever clock is currently live (most-urgent,
 auto-switching), colored by fraction of its budget consumed.
+
+One obligation names no reviewer, because its whole point is that nobody is on
+the hook: an open MR with an empty reviewer list carries an *assignment*
+obligation, owed by its author, against ``assignment_business_hours``. Without
+it such an MR is invisible here — no review was ever requested, so none of the
+above has anything to say about it.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from datetime import datetime
 from .business_time import business_hours_between
 from .config import Config
 from .events import Event, EventType
+from .notes import parse_gitlab_time
 from .slas import is_waived_by_mr, match_sla
 
 # Chip color buckets (the 5 dashboard colors).
@@ -38,6 +45,11 @@ CHIP_PENDING = "PENDING"  # grey  — paused (author's court) or resolved-awaiti
 CHIP_IN_SLA = "IN_SLA"  # green  — clock running, < 75% of budget
 CHIP_AT_RISK = "AT_RISK"  # amber — clock running, >= 75% of budget
 CHIP_BREACHED = "BREACHED"  # red   — clock running, over budget
+
+# What an obligation is owed for. Everything on the board is a review owed by a
+# named reviewer, except the one owed by an author who has named none.
+KIND_REVIEW = "review"
+KIND_ASSIGNMENT = "assignment"
 
 _RESOLVING_RESPONSES = {EventType.APPROVAL_ADDED, EventType.CHANGES_REQUESTED}
 
@@ -84,11 +96,18 @@ class ObligationState:
     thread_count: int
     urgency: float  # ascending sort key; most-overdue (most negative) first
     first_response_hours: float | None = None  # business hours requested -> first response
+    # KIND_REVIEW unless this is the "nobody is reviewing this" obligation, in
+    # which case ``reviewer`` is the author who owes an assignment, not a review.
+    kind: str = KIND_REVIEW
 
     def to_record(self) -> dict:
         return {
             "project_id": self.project_id,
             "mr_iid": self.mr_iid,
+            # Recorded so a reader of the table can tell an assignment owed by
+            # an author from a review owed by a reviewer. Both put a username in
+            # `reviewer`, and only one of them is a review record.
+            "kind": self.kind,
             "reviewer": self.reviewer,
             "round": self.round,
             "requested_at": self.requested_at.isoformat(),
@@ -342,7 +361,7 @@ def _compute_state(
 
 def _state(obl, config, chip, phase, status_text, budget, elapsed, remaining,
            fraction, *, paused, tz, resolved_at, resolution_type, within_sla,
-           urgency) -> ObligationState:
+           urgency, kind=KIND_REVIEW) -> ObligationState:
     return ObligationState(
         project_id=obl.project_id,
         mr_iid=obl.mr_iid,
@@ -364,6 +383,103 @@ def _state(obl, config, chip, phase, status_text, budget, elapsed, remaining,
         within_sla=within_sla,
         thread_count=obl.thread_count,
         urgency=urgency,
+        kind=kind,
+    )
+
+
+def _snapshot_time(value: str | None) -> datetime | None:
+    """Parse a snapshot's GitLab timestamp. None if absent or unparseable —
+    a timestamp radar cannot read is not worth failing a whole board over."""
+    if not value:
+        return None
+    try:
+        return parse_gitlab_time(value)
+    except ValueError:
+        return None
+
+
+def _restarts_assignment_clock(event: Event) -> bool:
+    """Whether this event left the MR newly in need of a reviewer."""
+    if event.event_type == EventType.REVIEWER_REMOVED:
+        return True
+    # Marked ready: what came before was a draft, which owes nobody anything.
+    return event.event_type == EventType.DRAFT_TOGGLED and not event.payload.get("draft")
+
+
+def _unassigned_since(events: list[Event], snapshot: dict) -> datetime | None:
+    """When this MR last became something somebody could have been asked to review.
+
+    Usually that is when it was opened, but two things restart the clock:
+
+    * losing its last reviewer — an MR left orphaned should not be billed for
+      the days somebody was on it;
+    * being marked ready — a draft is waived while it is one, so anchoring at
+      creation would bill the whole draft window the moment it clears and put
+      every draft-first MR on the board already breached.
+    """
+    candidates = [e.occurred_at for e in events if _restarts_assignment_clock(e)]
+    created = _snapshot_time(snapshot.get("created_at"))
+    if created is not None:
+        candidates.append(created)
+    return max(candidates, default=None)
+
+
+def _assignment_state(
+    events: list[Event],
+    snapshot: dict,
+    config: Config,
+    mr_waiver: str | None,
+    now: datetime,
+) -> ObligationState | None:
+    """The obligation to put *someone* on an open MR that has no reviewers.
+
+    None when the MR has reviewers, is no longer open (a merged MR nobody
+    reviewed is history, not a task), has already been approved, or the
+    matching SLA rule sets no assignment budget.
+    """
+    if snapshot.get("state", "opened") != "opened" or snapshot.get("reviewers"):
+        return None
+    if any(e.event_type == EventType.APPROVAL_ADDED for e in events):
+        # Somebody did review this and approved it. It is waiting to merge, not
+        # waiting for a reviewer, even if the approver has since been removed.
+        return None
+    rule = match_sla(config, snapshot.get("target_branch"), snapshot.get("labels", []))
+    budget = rule.assignment_business_hours
+    if budget is None:
+        return None
+    since = _unassigned_since(events, snapshot)
+    if since is None:
+        return None
+
+    author = snapshot.get("author") or ""
+    # Round 0: no review was ever requested, so this precedes every round the
+    # MR could go on to have, and never collides with one in the store.
+    obl = Obligation(
+        project_id=snapshot["project_id"],
+        mr_iid=snapshot["mr_iid"],
+        reviewer=author,
+        round=0,
+        requested_at=since,
+    )
+    tz = config.calendar.tz_for(author)
+    if mr_waiver is not None:
+        # A draft is not expected to have reviewers yet, so it says so in blue
+        # rather than running a clock nobody agreed to.
+        return _state(
+            obl, config, CHIP_WAIVED, "assignment",
+            f"no reviewers assigned — waived ({mr_waiver})", 0.0, 0.0, 0.0, 0.0,
+            paused=False, tz=tz, resolved_at=None, resolution_type=None,
+            within_sla=None, urgency=math.inf, kind=KIND_ASSIGNMENT,
+        )
+
+    elapsed = business_hours_between(since, now, config.calendar.calendar, tz)
+    fraction = elapsed / budget if budget > 0 else math.inf
+    remaining = budget - elapsed
+    return _state(
+        obl, config, _color_for_fraction(fraction), "assignment",
+        "no reviewers assigned", budget, elapsed, remaining, fraction,
+        paused=False, tz=tz, resolved_at=None, resolution_type=None,
+        within_sla=None, urgency=remaining, kind=KIND_ASSIGNMENT,
     )
 
 
@@ -374,11 +490,17 @@ def derive_mr(
     now: datetime,
 ) -> list[ObligationState]:
     """Derive obligation states for a single MR."""
-    if not events:
-        return []
     events = sorted(events, key=lambda e: (e.occurred_at, e.event_type))
     mr_waiver = is_waived_by_mr(
         config.waive, snapshot.get("draft", False), snapshot.get("labels", [])
     )
-    obligations = _build_obligations(events, snapshot.get("author"))
-    return [_derive_one(o, config, snapshot, mr_waiver, now) for o in obligations]
+    states = [
+        _derive_one(o, config, snapshot, mr_waiver, now)
+        for o in _build_obligations(events, snapshot.get("author"))
+    ]
+    # Derived from the snapshot, not the events, so a brand-new MR nobody has
+    # touched (and which therefore has no events at all) still gets one.
+    unassigned = _assignment_state(events, snapshot, config, mr_waiver, now)
+    if unassigned is not None:
+        states.append(unassigned)
+    return states

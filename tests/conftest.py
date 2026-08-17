@@ -50,6 +50,26 @@ def config(tmp_path):
     return load_config(path)
 
 
+@pytest.fixture
+def assign_config(tmp_path):
+    """The base config plus an assignment budget on every SLA rule, which is what
+    switches on tracking of MRs that have no reviewers at all.
+
+    A *different* budget per rule, so a test asserting the tighter one proves
+    the rule was actually matched rather than passing on the default's value.
+    """
+    per_rule = iter(["assignment_business_hours: 1", "assignment_business_hours: 2",
+                     "assignment_business_hours: 4"])
+    text = "".join(
+        f"{line}\n    {next(per_rule)}\n" if line.startswith("    approval_business_hours:")
+        else f"{line}\n"
+        for line in _BASE_CONFIG.splitlines()
+    )
+    path = tmp_path / "config-assign.yaml"
+    path.write_text(text, encoding="utf-8")
+    return load_config(path)
+
+
 def ny(y, m, d, hh, mm=0) -> datetime:
     return datetime(y, m, d, hh, mm, tzinfo=NY)
 

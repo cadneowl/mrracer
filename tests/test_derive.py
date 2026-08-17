@@ -8,6 +8,8 @@ from radar.derive import (
     CHIP_IN_SLA,
     CHIP_PENDING,
     CHIP_WAIVED,
+    KIND_ASSIGNMENT,
+    KIND_REVIEW,
     derive_mr,
 )
 from radar.events import EventType as ET
@@ -233,3 +235,97 @@ def test_hotfix_label_uses_tighter_sla(config):
     snap = snapshot(labels=["hotfix"])
     st = _one(events, config, now=ny(2026, 3, 2, 10), snap=snap)
     assert st.budget_hours == 4.0
+
+
+# --- assignment: an open MR with nobody reviewing it ------------------------
+# The default snapshot has no reviewers and was created 09:00Z = 04:00 New York,
+# so its assignment clock starts at 09:00 when the workday opens.
+
+
+def test_no_assignment_obligation_unless_config_asks_for_one(config):
+    # The base config sets no assignment_business_hours, so an MR nobody is
+    # reviewing stays invisible — exactly the behaviour before the check existed.
+    assert derive_mr([], snapshot(), config, now=ny(2026, 3, 2, 11)) == []
+
+
+def test_unassigned_mr_is_tracked_with_no_events_at_all(assign_config):
+    states = derive_mr([], snapshot(), assign_config, now=ny(2026, 3, 2, 11))
+    assert len(states) == 1
+    st = states[0]
+    assert st.kind == KIND_ASSIGNMENT
+    assert st.phase == "assignment"
+    assert st.status_text == "no reviewers assigned"
+    assert st.reviewer == "aviva"  # the author owes the assignment
+    assert st.round == 0
+    assert st.budget_hours == 4.0
+    assert st.elapsed_hours == 2.0
+    assert st.chip_state == CHIP_IN_SLA
+
+
+def test_unassigned_mr_goes_amber_then_red(assign_config):
+    at_risk = derive_mr([], snapshot(), assign_config, now=ny(2026, 3, 2, 12))[0]
+    assert at_risk.chip_state == CHIP_AT_RISK  # 3h of 4h
+    breached = derive_mr([], snapshot(), assign_config, now=ny(2026, 3, 2, 14))[0]
+    assert breached.chip_state == CHIP_BREACHED
+    assert breached.remaining_hours == -1.0
+    assert breached.urgency == -1.0  # sorts among the overdue, not after them
+
+
+def test_assigned_mr_has_no_assignment_obligation(assign_config):
+    events = [ev(ET.REVIEW_REQUESTED, ny(2026, 3, 2, 9), reviewer="dan")]
+    states = derive_mr(events, snapshot(reviewers=["dan"]), assign_config, now=ny(2026, 3, 2, 11))
+    assert [s.kind for s in states] == [KIND_REVIEW]
+
+
+def test_hotfix_label_tightens_the_assignment_budget_too(assign_config):
+    st = derive_mr([], snapshot(labels=["hotfix"]), assign_config, now=ny(2026, 3, 2, 11))[0]
+    assert st.budget_hours == 2.0  # the hotfix rule's own budget, not the default's 4
+
+
+def test_draft_with_no_reviewers_is_waived_not_clocked(assign_config):
+    # A draft is not expected to have reviewers yet, so it says so in blue.
+    st = derive_mr([], snapshot(draft=True), assign_config, now=ny(2026, 3, 4, 12))[0]
+    assert st.chip_state == CHIP_WAIVED
+    assert "draft" in st.status_text
+    assert st.elapsed_hours == 0.0
+
+
+def test_the_draft_window_is_not_billed_once_the_mr_is_marked_ready(assign_config):
+    """A draft owes nobody a reviewer, so the clock starts when it goes ready —
+    otherwise every draft-first MR would arrive on the board already breached."""
+    events = [ev(ET.DRAFT_TOGGLED, ny(2026, 3, 9, 10), actor="aviva", draft=False)]
+    # Opened a week before it was marked ready, budget 4h.
+    st = derive_mr(events, snapshot(), assign_config, now=ny(2026, 3, 9, 12))[0]
+    assert st.chip_state == CHIP_IN_SLA
+    assert st.elapsed_hours == 2.0
+    assert st.requested_at == ny(2026, 3, 9, 10)
+
+
+def test_approved_mr_is_not_asked_for_another_reviewer(assign_config):
+    """It was reviewed and approved; losing the reviewer afterwards leaves it
+    waiting to merge, not waiting for somebody to look at it."""
+    events = [
+        ev(ET.REVIEW_REQUESTED, ny(2026, 3, 2, 9), reviewer="dan"),
+        ev(ET.APPROVAL_ADDED, ny(2026, 3, 2, 10), reviewer="dan"),
+        ev(ET.REVIEWER_REMOVED, ny(2026, 3, 2, 11), reviewer="dan"),
+    ]
+    states = derive_mr(events, snapshot(), assign_config, now=ny(2026, 3, 4, 17))
+    assert [s.kind for s in states] == [KIND_REVIEW]
+
+
+def test_merged_mr_never_gets_an_assignment_obligation(assign_config):
+    # Nobody reviewed it and it is already merged: that is history, not a task.
+    assert derive_mr([], snapshot(state="merged"), assign_config, now=ny(2026, 3, 4, 12)) == []
+
+
+def test_clock_starts_when_the_last_reviewer_was_removed(assign_config):
+    events = [
+        ev(ET.REVIEW_REQUESTED, ny(2026, 3, 2, 9), reviewer="dan"),
+        ev(ET.REVIEWER_REMOVED, ny(2026, 3, 3, 12), reviewer="dan"),
+    ]
+    states = derive_mr(events, snapshot(), assign_config, now=ny(2026, 3, 3, 14))
+    unassigned = [s for s in states if s.kind == KIND_ASSIGNMENT]
+    assert len(unassigned) == 1
+    # 2h since dan was dropped, not the two days since the MR was opened.
+    assert unassigned[0].elapsed_hours == 2.0
+    assert unassigned[0].requested_at == ny(2026, 3, 3, 12)
