@@ -125,7 +125,9 @@ def create_app(
                 "heading": skill.label if skill else job.kind,
                 "icon": skill.icon if skill else "▶",
                 "generated_at": generated_at,
-                "output_html": _render_markdown(output) if status == "done" else None,
+                # Also rendered for a failed job: a run killed by the timeout
+                # keeps whatever it had written, and half a review beats none.
+                "output_html": _render_markdown(output) if output.strip() else None,
             },
         )
 

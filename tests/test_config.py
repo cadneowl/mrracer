@@ -119,6 +119,71 @@ def test_assignment_budget_is_optional(tmp_path):
     assert load_config(_write(tmp_path, on)).slas[-1].assignment_business_hours == 4.0
 
 
+def test_skill_env_parses(tmp_path):
+    text = VALID + (
+        "\nskills:\n"
+        "  - name: review\n"
+        "    enabled: true\n"
+        "    command: 'claude -p /x'\n"
+        "    env:\n"
+        "      MY_FLAG: 1\n"
+        "      MY_BOOL: true\n"
+        "    env_unset: [CLAUDE_CODE_DISABLE_BACKGROUND_TASKS]\n"
+    )
+    skill = load_config(_write(tmp_path, text)).skill_by_name("review")
+    # Values are written the way a shell reads them, not the way Python repr's them.
+    assert dict(skill.env) == {"MY_FLAG": "1", "MY_BOOL": "true"}
+    assert skill.env_unset == ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",)
+
+
+def test_skill_env_refuses_a_valueless_key(tmp_path):
+    """`FOO:` and `FOO: null` are one and the same to YAML, so neither can mean
+    "remove this" without the half-finished edit quietly meaning it too."""
+    text = VALID + (
+        "\nskills:\n"
+        "  - name: review\n"
+        "    enabled: true\n"
+        "    command: 'x'\n"
+        "    env:\n"
+        "      MY_TOKEN:\n"
+    )
+    with pytest.raises(ConfigError, match="env_unset"):
+        load_config(_write(tmp_path, text))
+
+
+def test_skill_env_refuses_a_non_scalar(tmp_path):
+    text = VALID + (
+        "\nskills:\n  - {name: review, enabled: true, command: 'x', "
+        "env: {EXTRA_ARGS: ['--fast', '--quiet']}}\n"
+    )
+    with pytest.raises(ConfigError, match="expected text or a number"):
+        load_config(_write(tmp_path, text))
+
+
+def test_skill_env_refuses_a_credential_in_any_case(tmp_path):
+    """Windows resolves variable names case-insensitively, so a lowercase
+    spelling would reach the child as the real credential."""
+    for spelling in ("GITLAB_TOKEN", "gitlab_token"):
+        text = VALID + (
+            f"\nskills:\n  - {{name: review, enabled: true, command: 'x', "
+            f"env: {{{spelling}: abc}}}}\n"
+        )
+        with pytest.raises(ConfigError, match="refusing to name"):
+            load_config(_write(tmp_path, text))
+
+    unset = VALID + (
+        "\nskills:\n  - {name: review, enabled: true, command: 'x', env_unset: [jira_email]}\n"
+    )
+    with pytest.raises(ConfigError, match="refusing to name"):
+        load_config(_write(tmp_path, unset))
+
+    bad = VALID + (
+        "\nskills:\n  - {name: review, enabled: true, command: 'x', env: {'2BAD': v}}\n"
+    )
+    with pytest.raises(ConfigError, match="not a usable variable name"):
+        load_config(_write(tmp_path, bad))
+
+
 def test_business_hours_reject_a_boolean(tmp_path):
     """`false` is the obvious-looking way to switch a budget off, and float(False)
     would make it 0 — a zero-hour budget, i.e. the harshest setting there is."""

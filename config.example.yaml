@@ -151,6 +151,29 @@ skills:
     # same clock, so a job can never outlast it. A slow fetch shortens what the
     # command gets rather than being added on top.
     timeout_seconds: 600
+    # env / env_unset: what THIS skill's subprocess gets on top of radar's own
+    # environment, and what it must not inherit. Values are exported as written
+    # (`true` stays `true`); a key with no value is refused rather than guessed
+    # at, which is what env_unset is for. radar's own credentials are stripped
+    # from every skill and are refused in both lists. Setting PATH here is not
+    # portable — Windows searches radar's PATH, not the child's — and `radar
+    # check` always resolves commands against radar's own.
+    #
+    # One variable is exported to every skill by default (unless you exported it
+    # yourself before starting radar, in which case yours stands):
+    #   CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
+    # A headless `claude -p` that hands work to a background subagent answers the
+    # turn straight away with a placeholder ("I'll report the findings when it
+    # completes") and reports its real findings only in a later result — if the
+    # run waits for them at all. That placeholder is what gets stored as your
+    # review. With the variable set, subagents run inline and the run's last word
+    # is its actual work. The cost is parallelism: work that fanned out now runs
+    # one after another, so raise timeout_seconds if a skill was already close to
+    # its budget. To keep the fan-out instead:
+    #   env:
+    #     CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0"   # never stop waiting for it
+    #   env_unset: [CLAUDE_CODE_DISABLE_BACKGROUND_TASKS]
+    #
     # include_context: radar fetches the MR title/description/diff itself (via
     # GITLAB_URL/GITLAB_TOKEN) and pipes it to the skill on STDIN. The skill then
     # needs NO GitLab access of its own and works on private/self-hosted GitLab —
