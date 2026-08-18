@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS poll_state (
 CREATE TABLE IF NOT EXISTS obligations (
     project_id             INTEGER NOT NULL,
     mr_iid                 INTEGER NOT NULL,
+    kind                   TEXT NOT NULL DEFAULT 'review',
     reviewer               TEXT NOT NULL,
     round                  INTEGER NOT NULL,
     requested_at           TEXT NOT NULL,
@@ -164,6 +165,15 @@ class Database:
             # head commit until its next poll, and a skill must treat it as absent
             # rather than as "no changes".
             self.conn.execute("ALTER TABLE mr_snapshots ADD COLUMN head_sha TEXT")
+
+        # obligations gained `kind`: an assignment obligation records the author
+        # who owes it in `reviewer`, so without this a stats query grouping by
+        # that column would count them as reviews nobody was asked for.
+        obl_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(obligations)")}
+        if obl_cols and "kind" not in obl_cols:
+            self.conn.execute(
+                "ALTER TABLE obligations ADD COLUMN kind TEXT NOT NULL DEFAULT 'review'"
+            )
 
         # test_plans gained `kind` in the primary key so multiple storing skills
         # don't share one row. SQLite can't ALTER a PK, so rebuild the table;
@@ -464,6 +474,7 @@ class Database:
             (
                 o["project_id"],
                 o["mr_iid"],
+                o.get("kind", "review"),
                 o["reviewer"],
                 o["round"],
                 o["requested_at"],
@@ -482,10 +493,10 @@ class Database:
         cur.executemany(
             """
             INSERT INTO obligations
-                (project_id, mr_iid, reviewer, round, requested_at, state, phase,
+                (project_id, mr_iid, kind, reviewer, round, requested_at, state, phase,
                  first_response_at, resolved_at, resolution_type, within_sla,
                  elapsed_business_hours, thread_count, computed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

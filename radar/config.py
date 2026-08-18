@@ -59,9 +59,17 @@ class SLAMatch:
 
 @dataclass(frozen=True)
 class SLARule:
+    """Budgets for one class of merge request.
+
+    ``assignment_business_hours`` is the budget for getting *any* reviewer onto
+    an MR that has none. It is optional, and None means radar does not track
+    unassigned MRs at all — the check is off until a config asks for it.
+    """
+
     match: SLAMatch
     first_response_business_hours: float
     approval_business_hours: float
+    assignment_business_hours: float | None = None
 
 
 @dataclass(frozen=True)
@@ -228,6 +236,29 @@ def _parse_calendar(raw: dict) -> CalendarConfig:
     )
 
 
+def _business_hours(value: object, ctx: str) -> float:
+    """One SLA budget, in business hours.
+
+    Booleans are refused rather than accepted as 1/0: YAML reads a bare `false`
+    as a bool, and the obvious-looking way to switch a budget off would
+    otherwise land as a zero-hour budget — the harshest setting there is, and
+    silently. Off is expressed by omitting the key, which only the optional
+    budgets allow.
+    """
+    if isinstance(value, bool):
+        raise ConfigError(
+            f"{ctx}: business-hours values must be numbers, not {str(value).lower()}. "
+            "To switch a budget off, leave its key out entirely."
+        )
+    try:
+        hours = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{ctx}: business-hours values must be numbers ({exc})") from None
+    if hours < 0:
+        raise ConfigError(f"{ctx}: business-hours values must be non-negative")
+    return hours
+
+
 def _parse_slas(raw: object) -> tuple[SLARule, ...]:
     if not isinstance(raw, list) or not raw:
         raise ConfigError("slas: expected a non-empty list of rules")
@@ -248,19 +279,17 @@ def _parse_slas(raw: object) -> tuple[SLARule, ...]:
             raise ConfigError(f"{ctx}.match.labels: expected a list of strings")
         labels = tuple(str(x) for x in labels_raw)
 
-        try:
-            first = float(_require(entry, "first_response_business_hours", ctx))
-            approval = float(_require(entry, "approval_business_hours", ctx))
-        except (TypeError, ValueError) as exc:
-            raise ConfigError(f"{ctx}: business-hours values must be numbers ({exc})") from None
-        if first < 0 or approval < 0:
-            raise ConfigError(f"{ctx}: business-hours values must be non-negative")
+        first = _business_hours(_require(entry, "first_response_business_hours", ctx), ctx)
+        approval = _business_hours(_require(entry, "approval_business_hours", ctx), ctx)
+        assignment_raw = entry.get("assignment_business_hours")
+        assignment = None if assignment_raw is None else _business_hours(assignment_raw, ctx)
 
         rules.append(
             SLARule(
                 match=SLAMatch(target_branch=target_branch, labels=labels),
                 first_response_business_hours=first,
                 approval_business_hours=approval,
+                assignment_business_hours=assignment,
             )
         )
 
@@ -273,6 +302,18 @@ def _parse_slas(raw: object) -> tuple[SLARule, ...]:
         raise ConfigError(
             "slas: the default rule (match: {}) must be last, since the first "
             "matching rule wins"
+        )
+    # All rules or none: the first matching rule wins outright, so a config that
+    # sets the assignment budget on only some rules would quietly stop tracking
+    # unassigned MRs whose branch or labels happen to match one of the others.
+    missing = [i for i, r in enumerate(rules) if r.assignment_business_hours is None]
+    if missing and len(missing) != len(rules):
+        where = ", ".join(f"slas[{i}]" for i in missing)
+        raise ConfigError(
+            f"slas: assignment_business_hours is set on some rules but not on {where}. "
+            "The first matching rule wins outright, so an MR matching one of those "
+            "would not be checked for having no reviewers at all. Add the key to "
+            "every rule, or to none of them to turn the check off."
         )
     return tuple(rules)
 

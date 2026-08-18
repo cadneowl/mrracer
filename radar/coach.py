@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 
 from .config import Config
 from .db import Database
-from .derive import CHIP_AT_RISK, CHIP_BREACHED, CHIP_WAIVED, derive_mr
+from .derive import CHIP_AT_RISK, CHIP_BREACHED, CHIP_WAIVED, KIND_REVIEW, derive_mr
 
 # A reviewer is flagged "chronic" with enough volume and a high breach rate.
 _CHRONIC_MIN_BREACHES = 3
@@ -56,6 +56,10 @@ def build_coach(db: Database, config: Config, now: datetime | None = None) -> di
         events = list(db.iter_events(snap["project_id"], snap["mr_iid"]))
         is_open = snap.get("state") == "opened"
         for st in derive_mr(events, snap, config, now):
+            if st.kind != KIND_REVIEW:
+                # An MR with no reviewers is nobody's review record: this page
+                # measures how people review, and no review was ever requested.
+                continue
             if st.chip_state == CHIP_WAIVED:
                 continue  # waived obligations are excluded from stats
             r = reviewers.setdefault(st.reviewer, _new_reviewer(st.reviewer))

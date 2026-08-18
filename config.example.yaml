@@ -41,16 +41,33 @@ calendar:
 # A `match` block may constrain by target_branch (glob) and/or labels
 # (obligation's MR must carry ALL listed labels). An empty match {} is the
 # catch-all default and should come last.
+#
+# assignment_business_hours is the budget for getting ANY reviewer onto an MR
+# that has none, and it is what makes such an MR visible at all: with nobody
+# requested there is no review obligation to show, so before this budget exists
+# the MR is simply absent from the board. Set it and each one appears with a
+# "NO REVIEWERS" chip. Its clock runs from whichever came last: the MR being
+# opened, being marked ready, or losing its final reviewer — so a long spell as
+# a draft is never billed retroactively. An MR that was already approved gets no
+# chip; it is waiting to merge, not waiting to be looked at.
+#
+# The key is optional, but it is all rules or none: the first matching rule wins
+# outright, so a config that set it on only some of them would quietly stop
+# checking MRs that match one of the others. Leave it off every rule to turn the
+# check off entirely.
 slas:
   - match: { target_branch: "release/*" }
     first_response_business_hours: 4
     approval_business_hours: 8
+    assignment_business_hours: 2
   - match: { labels: ["hotfix"] }
     first_response_business_hours: 4
     approval_business_hours: 8
+    assignment_business_hours: 2
   - match: {} # default
     first_response_business_hours: 16 # 2 business days
     approval_business_hours: 24
+    assignment_business_hours: 4 # half a business day to find a reviewer
 
 # Obligations matching any of these conditions are WAIVED (excluded from
 # stats, shown blue on the board).

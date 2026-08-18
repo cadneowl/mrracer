@@ -89,12 +89,22 @@
       <td class="col-obl">
         {% for o in row.obligations %}
         <span class="chip-wrap">
+          {% if o.kind == 'assignment' %}
+          {# Nobody was asked to review this one, so there is no name to show
+             and nowhere for the chip to link. #}
+          <span class="chip chip-{{ o.chip_state|lower }} chip-unassigned"
+                title="{{ o.status_text }}{% if o.chip_state != 'WAIVED' %} · {{ o.elapsed_hours }}h of {{ o.budget_hours }}h to assign one · tz {{ o.reviewer_tz }}{% endif %}{% if row.author %} · {{ row.author }} opened it{% endif %}">
+            <span class="chip-name">NO REVIEWERS</span>
+            <span class="chip-time">{{ o.remaining_label }}</span>
+          </span>
+          {% else %}
           <a class="chip chip-{{ o.chip_state|lower }}"
              href="/?view={{ o.reviewer }}"
              title="{{ o.status_text }} · {{ o.elapsed_hours }}h of {{ o.budget_hours }}h budget · tz {{ o.reviewer_tz }}{% if o.round > 1 %} · round {{ o.round }}{% endif %} · click for {{ o.reviewer }}'s MRs">
             <span class="chip-name">{{ o.reviewer }}</span>
             <span class="chip-time">{{ o.remaining_label }}</span>
           </a>
+          {% endif %}
           {% if o.open_threads %}
           <button class="chip-threads"
                   data-thread-toggle

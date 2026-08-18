@@ -106,6 +106,17 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .chip-in_sla   { background: var(--green); }
 .chip-at_risk  { background: var(--amber); }
 .chip-breached { background: var(--red);   color: #fff; }
+/* Nobody is on this MR: same urgency colour, but hollow and lettered so an
+   empty seat never reads as a person's name at a glance. */
+.chip-unassigned {
+  background: transparent; border: 1px dashed currentColor; cursor: default;
+  letter-spacing: .04em;
+}
+.chip-unassigned:hover { filter: none; }
+.chip-unassigned.chip-waived   { color: var(--blue);  }
+.chip-unassigned.chip-in_sla   { color: var(--green); }
+.chip-unassigned.chip-at_risk  { color: var(--amber); }
+.chip-unassigned.chip-breached { color: var(--red);   }
 
 /* Discussion threads (expanded board row) */
 .chip-wrap { display: inline-flex; align-items: center; }
