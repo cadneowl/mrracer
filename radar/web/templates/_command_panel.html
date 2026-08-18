@@ -54,6 +54,9 @@
         <strong>{{ heading }} failed.</strong>
         <pre>{{ error }}</pre>
       </div>
+      {# Whatever the run wrote before it failed — a timeout keeps its partial
+         answer rather than throwing it away. #}
+      {% if output_html %}<article class="review-output">{{ output_html }}</article>{% endif %}
       {% endif %}
     </div>
   </div>

@@ -8,7 +8,11 @@ The child's stdout is read line-by-line as it runs so the dashboard can show
 live progress (an SSE endpoint tails ``job.progress``). If the command speaks
 Claude Code's ``--output-format stream-json`` (line-delimited JSON events), we
 turn tool_use / assistant events into friendly progress lines and take the final
-answer from the ``result`` event. Any other command works too: its stdout lines
+answer from the ``result`` event. A run can report more than one of those, so the
+answer is every result event in order — which is also why the child is launched
+with background work turned off (see ``_DEFAULT_CHILD_ENV``): an agent that
+defers work to a background subagent reports a placeholder first and its actual
+findings only later, if at all. Any other command works too: its stdout lines
 become the progress log and the accumulated text becomes the output.
 
 Before launching, the skill's declared context bag is resolved for this MR (see
@@ -37,7 +41,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .config import CommandConfig
+from .config import SECRET_ENV_NAMES, CommandConfig
 from .skillcontext import SkillContextError, job_context
 from .worktree import WorktreeError, create_mr_worktree
 
@@ -48,9 +52,39 @@ log = logging.getLogger("radar.commands")
 # Jira credentials. When a skill needs context, radar fetches it and pipes it on
 # stdin (see context.py); a skill that fetches on its own must carry its own
 # credentials (e.g. an MCP server), not borrow radar's.
-_ENV_DENYLIST = frozenset(
-    {"GITLAB_TOKEN", "GITLAB_URL", "JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"}
-)
+_ENV_DENYLIST = SECRET_ENV_NAMES
+
+# Exported to every skill, on top of radar's own environment and before the
+# skill's `env:` block, which can override or drop any of it.
+#
+# CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: a headless `claude -p` that spawns a
+# background subagent answers the turn immediately with a placeholder ("I'll
+# report the findings when it completes") and emits that as a result, landing
+# the real answer in a later one — if it is waited for at all. Radar captures
+# every result event, so at best the placeholder is glued to the front of the
+# output and at worst it is the whole of it. Forcing subagents to run inline
+# makes the run's last word its actual work. A skill that would rather keep its
+# parallelism can set the variable to null in its own `env:`.
+_DEFAULT_CHILD_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+
+
+def _is_secret_env(name: str) -> bool:
+    """Whether a variable name is one of radar's own credentials.
+
+    Case-insensitive, because Windows resolves environment variables that way:
+    a child handed ``gitlab_token`` reads it back as ``GITLAB_TOKEN``.
+    """
+    return name.upper() in _ENV_DENYLIST
+
+
+def _unset_env(env: dict, name: str) -> None:
+    """Drop a variable from a child environment, matching the platform's own
+    name rules (Windows ignores case, so the uppercase twin must go too)."""
+    if os.name == "nt":
+        for key in [k for k in env if k.upper() == name.upper()]:
+            del env[key]
+    else:
+        env.pop(name, None)
 
 _MAX_OUTPUT = 200_000    # cap captured output to bound memory / stored plan size
 _MAX_JOBS = 256          # bound the in-memory job registry (evict oldest)
@@ -378,11 +412,17 @@ class CommandRunner:
         stderr_thread.join(timeout=1.0)
         job.returncode = proc.returncode
 
+        # Blank line between results: a run can report more than one, and gluing
+        # them together swallows the heading or list the next one opens with.
+        output = ("\n\n".join(result_parts) if result_parts else "".join(raw_parts))[:_MAX_OUTPUT]
+
         if timed_out.is_set():
+            # Keep what the run did manage to say. A long review that ran out of
+            # clock is more use half-written than replaced by the word "timeout".
+            job.output = output
             _fail(job, f"{self.kind} timed out after {self.config.timeout_seconds}s")
             return
 
-        output = ("".join(result_parts) if result_parts else "".join(raw_parts))[:_MAX_OUTPUT]
         if proc.returncode == 0 and output.strip():
             # Publish output BEFORE flipping status so a reader that sees "done"
             # always sees the output too.
@@ -435,6 +475,20 @@ class CommandRunner:
         # other event types (tool results, partial deltas) are ignored in the log
 
     def _child_env(self) -> dict:
-        env = {k: v for k, v in os.environ.items() if k not in _ENV_DENYLIST}
+        env = {k: v for k, v in os.environ.items() if not _is_secret_env(k)}
         env["PYTHONIOENCODING"] = "utf-8"  # nudge Python skills to emit UTF-8
+        # setdefault, not update: an operator who exported one of these before
+        # starting radar has said what they want, and radar is filling a gap
+        # rather than overruling them.
+        for name, value in _DEFAULT_CHILD_ENV.items():
+            env.setdefault(name, value)
+        # The skill's own env has the last word — except over the denylist. The
+        # config parser refuses those names too, but the promise that the child
+        # never sees radar's credentials belongs to the function that builds the
+        # child's environment, not to whoever happened to construct the config.
+        for name, value in dict(getattr(self.config, "env", ()) or ()).items():
+            if not _is_secret_env(name):
+                env[name] = value
+        for name in getattr(self.config, "env_unset", ()) or ():
+            _unset_env(env, name)
         return env

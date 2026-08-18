@@ -468,6 +468,45 @@ it under `skills:` and give it `- name: review`.
 Every enabled skill also appears in `radar check`, so you can confirm its command
 is on `PATH` before clicking it.
 
+### Headless agents and background work
+
+A skill that shells out to `claude -p` can hand its real work to a background
+subagent. When it does, the first thing it says is a placeholder — *"I'll report
+the findings when it completes"* — and the actual findings arrive only in a later
+result event, if the run waits for them at all. radar takes the answer from those
+result events, so the placeholder is at best glued to the front of your review and
+at worst is the entire thing that gets stored.
+
+So radar exports this to **every** skill it launches:
+
+```
+CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
+```
+
+Subagents then run inline and the run's last word is its actual work. The variable
+goes only into that subprocess's environment — your own interactive Claude Code
+sessions are untouched — and if you exported it yourself before starting radar,
+your value stands. Inside the child it is a blanket switch: background shells and
+async subagents are both unavailable there, **so a skill that fans work out now
+does it serially**. Raise that skill's `timeout_seconds` if it was already close
+to its budget.
+
+To keep the fan-out instead, drop the default and tell the CLI to wait
+indefinitely rather than giving up on background work partway:
+
+```yaml
+skills:
+  - name: review
+    env:
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0"
+    env_unset: [CLAUDE_CODE_DISABLE_BACKGROUND_TASKS]
+```
+
+radar's own budget then becomes the binding limit, and the placeholder text will
+appear in the output ahead of the real result — radar keeps every result a run
+reports, separated by a blank line. A run killed by the timeout keeps whatever it
+had written by then, shown under the error rather than thrown away.
+
 ### Business-hours math
 
 SLA budgets are in **business hours**. Weekends and off-hours never burn budget.
@@ -628,7 +667,8 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `slas` | Ordered rules; **first match wins**. Each has a `match` (optional `target_branch` glob and/or required `labels`) and `first_response_business_hours` / `approval_business_hours`. The last rule must be the default `match: {}`. |
 | `slas[].assignment_business_hours` | Optional budget for getting **any** reviewer onto an MR that has none — the [NO REVIEWERS](#mrs-with-no-reviewers) chip. Omitted everywhere, the check is off. Set it on **every** rule or none: first match wins outright, so a partial config would silently skip MRs matching the rules that lack it (radar refuses to load one). |
 | `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is **currently** a draft, or the MR carries any `labels` listed here. (Only the current draft state waives; historical draft periods are not subtracted from the clock.) |
-| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`. The names `review` and `qa` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
+| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `env`, `env_unset`. The names `review` and `qa` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
+| `skills[].env` / `skills[].env_unset` | Extra environment for that skill's subprocess, and names it must not inherit. Values export as written; a valueless key is refused (use `env_unset`). radar's own credentials are stripped and refused in both, in any case spelling. radar exports `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` to every skill unless you exported it yourself — see [Headless agents and background work](#headless-agents-and-background-work). |
 | `jira` | `base_url` (builds the `PROJ-123` browse links on the board) and `project_keys` (optional filter so `UTF-8`-shaped tokens aren't matched). Not a credential — fetching a ticket uses `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` from the environment. |
 | `teams` | Named GitLab-username groups; each becomes an *authored* / *to review* filter pill on the board. |
 | `gamification` | Consumed in Phase 3; carried verbatim for now. |

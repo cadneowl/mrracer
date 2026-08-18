@@ -29,6 +29,15 @@ class ConfigError(Exception):
     """Raised when config.yaml is missing, malformed, or invalid."""
 
 
+# The credential variables radar reads for itself. Named here once: they are
+# stripped from every skill's environment (see ``commands._ENV_DENYLIST``) and
+# refused in a skill's own ``env:`` block, so neither path can hand a skill
+# radar's GitLab PAT or Jira login.
+SECRET_ENV_NAMES = frozenset(
+    {"GITLAB_TOKEN", "GITLAB_URL", "JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"}
+)
+
+
 @dataclass(frozen=True)
 class GitLabSettings:
     projects: list[str]
@@ -97,6 +106,12 @@ class SkillConfig:
     varies by GitLab project. ``checkout: worktree`` gives each job its own
     detached worktree of that source at the MR's head commit (see ``worktree``);
     ``remote`` names the git remote to fetch the MR ref from.
+
+    ``env`` is what this skill's subprocess gets on top of radar's own
+    environment, and ``env_unset`` is what it must not inherit — including
+    anything radar exports by default (``commands._DEFAULT_CHILD_ENV``).
+    Credentials are refused in both: radar's own are stripped, and config files
+    are not where secrets go.
     """
 
     name: str = ""
@@ -114,6 +129,8 @@ class SkillConfig:
     inputs: tuple[Input, ...] = ()
     checkout: str = "none"  # "none" | "worktree"
     remote: str = "origin"
+    env: tuple[tuple[str, str], ...] = ()  # NAME -> value, exported to the child
+    env_unset: tuple[str, ...] = ()  # names the child must NOT inherit
 
 
 # Backwards-compatible aliases (older names for the same shape).
@@ -369,6 +386,77 @@ def _parse_contexts(raw: object, ctx: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _env_name(raw_name: object, ctx: str) -> str:
+    """Validate one environment variable name for a skill.
+
+    Credentials are matched without regard to case: Windows looks variables up
+    case-insensitively, so a lowercase ``gitlab_token`` here would reach the
+    child as the real thing and quietly undo the strip in ``commands``.
+    """
+    name = str(raw_name)
+    if not _ENV_NAME_RE.match(name):
+        raise ConfigError(
+            f"{ctx}: {name!r} is not a usable variable name (letters, digits and "
+            "underscore, not starting with a digit)"
+        )
+    if name.upper() in SECRET_ENV_NAMES:
+        raise ConfigError(
+            f"{ctx}: refusing to name {name}. radar keeps its own credentials out of "
+            "every skill's environment, and this file is not where secrets go — a skill "
+            "that needs its own credential should read it from the environment radar was "
+            "started with, under a different name."
+        )
+    return name
+
+
+def _parse_env(raw: object, ctx: str) -> tuple[tuple[str, str], ...]:
+    """Parse a skill's ``env:`` mapping into ordered (name, value) pairs.
+
+    Values are written the way a shell would read them, not the way Python
+    repr's them: a YAML ``true`` exports as ``true``. Anything that is not text
+    or a number is refused rather than str()'d, because ``['--fast']`` reaching
+    a child as the literal characters ``['--fast']`` is a config mistake worth
+    a message, not a value worth passing on.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{ctx}.env: expected a mapping of NAME: value")
+    out: list[tuple[str, str]] = []
+    for key, value in raw.items():
+        name = _env_name(key, f"{ctx}.env")
+        if value is None:
+            # `FOO:` and `FOO: null` are the same thing to YAML, so neither can
+            # mean "remove" without the other silently meaning it too.
+            raise ConfigError(
+                f"{ctx}.env.{name}: no value. A key with nothing after it is a "
+                f"half-finished edit — give it one, or list {name} under 'env_unset:' "
+                "to keep the skill from inheriting it."
+            )
+        if isinstance(value, bool):
+            out.append((name, "true" if value else "false"))
+        elif isinstance(value, (str, int, float)):
+            out.append((name, str(value)))
+        else:
+            raise ConfigError(
+                f"{ctx}.env.{name}: expected text or a number, got "
+                f"{type(value).__name__}. An environment variable is a string; quote it "
+                "if the literal text is what you meant."
+            )
+    return tuple(out)
+
+
+def _parse_env_unset(raw: object, ctx: str) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"{ctx}.env_unset: expected a list of variable names")
+    return tuple(_env_name(x, f"{ctx}.env_unset") for x in raw)
+
+
 def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfig:
     if raw is None:
         raw = {}
@@ -449,6 +537,8 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
         command=command, working_dir=working_dir, timeout_seconds=timeout,
         include_context=include_context, contexts=contexts, stores_result=stores_result,
         source=source, inputs=inputs, checkout=checkout, remote=remote,
+        env=_parse_env(raw.get("env"), ctx),
+        env_unset=_parse_env_unset(raw.get("env_unset"), ctx),
     )
 
 

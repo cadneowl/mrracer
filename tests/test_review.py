@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
@@ -155,6 +156,41 @@ def test_runner_parses_stream_json(tmp_path):
     assert any("WebFetch" in p["text"] for p in done.progress)
 
 
+def test_two_results_are_separated(tmp_path):
+    """A run can report more than one result; joined bare, the second one's
+    heading would be swallowed into the first one's paragraph."""
+    script = tmp_path / "two.py"
+    script.write_text(
+        "import json\n"
+        'print(json.dumps({"type": "result", "result": "working on it"}))\n'
+        'print(json.dumps({"type": "result", "result": "# Review\\n\\nLGTM"}))\n',
+        encoding="utf-8",
+    )
+    cfg = ReviewConfig(enabled=True, command=f'{PY} "{script}"', timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.output == "working on it\n\n# Review\n\nLGTM"
+
+
+def test_a_timed_out_run_keeps_what_it_wrote(tmp_path):
+    """Half a review beats the word "timeout": the partial answer is kept on the
+    job so the panel can still show it."""
+    script = tmp_path / "slow.py"
+    script.write_text(
+        "import json, sys, time\n"
+        'print(json.dumps({"type": "result", "result": "# Partial\\n\\nfound one bug"}))\n'
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    cfg = ReviewConfig(enabled=True, command=f'{PY} "{script}"', timeout_seconds=1)
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.status == "error"
+    assert "timed out" in done.error
+    assert done.output.startswith("# Partial")
+
+
 def test_runner_reports_error_on_nonzero():
     cmd = f'{PY} -c "import sys; sys.exit(3)"'
     cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=30)
@@ -175,6 +211,79 @@ def test_child_env_excludes_gitlab_token(monkeypatch):
     assert done.status == "done"
     assert "ABSENT" in done.output
     assert "super-secret-pat" not in done.output
+
+
+def _echo_env(name: str) -> str:
+    return f"{PY} -c \"import os; print(os.environ.get('{name}', 'ABSENT'))\""
+
+
+def test_background_tasks_are_off_for_every_skill():
+    """A headless agent that defers to a background subagent answers with a
+    placeholder and its real findings only later, so radar turns that off."""
+    cfg = ReviewConfig(
+        enabled=True, command=_echo_env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"),
+        timeout_seconds=30,
+    )
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.status == "done"
+    assert "1" in done.output
+
+
+def test_skill_env_overrides_and_unsets():
+    over = ReviewConfig(
+        enabled=True, command=_echo_env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"),
+        timeout_seconds=30, env=(("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "0"),),
+    )
+    runner = CommandRunner(over, "review")
+    assert "0" in _await(runner, runner.start({"project_id": 1, "mr_iid": 2})).output
+
+    off = ReviewConfig(
+        enabled=True, command=_echo_env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"),
+        timeout_seconds=30, env_unset=("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",),
+    )
+    runner = CommandRunner(off, "review")
+    assert "ABSENT" in _await(runner, runner.start({"project_id": 1, "mr_iid": 2})).output
+
+
+def test_an_operators_own_export_is_not_overruled(monkeypatch):
+    """radar fills a gap in the child's environment; it does not overrule
+    someone who set the variable themselves before starting radar."""
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "0")
+    cfg = ReviewConfig(
+        enabled=True, command=_echo_env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"),
+        timeout_seconds=30,
+    )
+    runner = CommandRunner(cfg, "review")
+    assert "0" in _await(runner, runner.start({"project_id": 1, "mr_iid": 2})).output
+
+
+def test_skill_env_cannot_resurrect_a_stripped_credential(monkeypatch):
+    """The denylist is not a default a skill can talk its way past. Config
+    refuses these names, but the promise belongs to _child_env, so it is tested
+    against a SkillConfig built by hand — which is how one reaches the runner in
+    every test and every future caller that isn't the YAML parser."""
+    monkeypatch.setenv("GITLAB_TOKEN", "super-secret-pat")
+    cfg = ReviewConfig(
+        enabled=True, command=_echo_env("GITLAB_TOKEN"), timeout_seconds=30,
+        env=(("GITLAB_TOKEN", "attacker-chosen"),),
+    )
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert "ABSENT" in done.output
+    assert "super-secret-pat" not in done.output and "attacker-chosen" not in done.output
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows resolves env names case-insensitively")
+def test_a_lowercase_credential_is_still_a_credential(monkeypatch):
+    monkeypatch.setenv("GITLAB_TOKEN", "super-secret-pat")
+    cfg = ReviewConfig(
+        enabled=True, command=_echo_env("GITLAB_TOKEN"), timeout_seconds=30,
+        env=(("gitlab_token", "attacker-chosen"),),
+    )
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert "ABSENT" in done.output and "attacker-chosen" not in done.output
 
 
 def test_runner_catchall_sets_terminal_state(monkeypatch):
