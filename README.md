@@ -477,35 +477,52 @@ result event, if the run waits for them at all. radar takes the answer from thos
 result events, so the placeholder is at best glued to the front of your review and
 at worst is the entire thing that gets stored.
 
-So radar exports this to **every** skill it launches:
+So radar exports these to **every** skill it launches:
 
 ```
-CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
+CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1     # run subagents inline
+CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0     # if one backgrounds anyway, wait forever
 ```
 
-Subagents then run inline and the run's last word is its actual work. The variable
-goes only into that subprocess's environment — your own interactive Claude Code
-sessions are untouched — and if you exported it yourself before starting radar,
-your value stands. Inside the child it is a blanket switch: background shells and
-async subagents are both unavailable there, **so a skill that fans work out now
-does it serially**. Raise that skill's `timeout_seconds` if it was already close
-to its budget.
+Subagents then run inline and the run's last word is its actual work. The first
+variable is a blanket switch inside the child: background shells and async
+subagents are both unavailable there, **so a skill that fans work out now does it
+serially** — raise that skill's `timeout_seconds` if it was already close to its
+budget. The second is the backstop: a skill can always reach the background some
+other way (opting out below, or shelling out to another `claude` itself), and
+without it the CLI gives up on background agents after 10 minutes and exits with
+only the placeholder. With the ceiling gone, radar's `timeout_seconds` is the
+only clock — size it to the skill's real duration. When that clock does run
+out, radar tries to take down the skill's **whole process tree**, not just the
+`claude` it launched: with the ceiling gone nothing else ever reaps a background
+agent, and one left behind would keep running (and spending API tokens) after
+the job was failed. Radar does the same if a run exits leaving something that
+still holds its output pipe, and sweeps anything still running when radar itself
+exits. All of that is best effort — a descendant that re-parents or puts itself
+in its own session is beyond reach on both platforms — so it is a strong default,
+not a guarantee. The timeout error also says when a background agent was what ran
+out of clock, so the fix — raise `timeout_seconds` — is named rather than guessed.
+Both variables go only into that subprocess's environment — your own
+interactive Claude Code sessions are untouched — and if you exported one
+yourself before starting radar, your value stands.
 
-To keep the fan-out instead, drop the default and tell the CLI to wait
-indefinitely rather than giving up on background work partway:
+To keep the fan-out instead, drop the inline default (the wait-forever backstop
+already covers the rest):
 
 ```yaml
 skills:
   - name: review
-    env:
-      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0"
     env_unset: [CLAUDE_CODE_DISABLE_BACKGROUND_TASKS]
 ```
 
-radar's own budget then becomes the binding limit, and the placeholder text will
-appear in the output ahead of the real result — radar keeps every result a run
-reports, separated by a blank line. A run killed by the timeout keeps whatever it
-had written by then, shown under the error rather than thrown away.
+The placeholder text will then appear in the output ahead of the real result —
+radar keeps every result a run reports, separated by a blank line. A run killed
+by the timeout keeps whatever it had written by then, shown under the error
+rather than thrown away. And whatever the skill's configuration, a run the CLI
+itself cut short — it reports "Background tasks still running" on stderr when
+an overridden ceiling elapses and it kills agents it was waiting for — is
+failed, not stored: its output is a deferral note, not your review, and it
+shows under the error together with which override to go looking for.
 
 ### Business-hours math
 
@@ -668,7 +685,7 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `slas[].assignment_business_hours` | Optional budget for getting **any** reviewer onto an MR that has none — the [NO REVIEWERS](#mrs-with-no-reviewers) chip. Omitted everywhere, the check is off. Set it on **every** rule or none: first match wins outright, so a partial config would silently skip MRs matching the rules that lack it (radar refuses to load one). |
 | `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is **currently** a draft, or the MR carries any `labels` listed here. (Only the current draft state waives; historical draft periods are not subtracted from the clock.) |
 | `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `env`, `env_unset`. The names `review` and `qa` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
-| `skills[].env` / `skills[].env_unset` | Extra environment for that skill's subprocess, and names it must not inherit. Values export as written; a valueless key is refused (use `env_unset`). radar's own credentials are stripped and refused in both, in any case spelling. radar exports `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` to every skill unless you exported it yourself — see [Headless agents and background work](#headless-agents-and-background-work). |
+| `skills[].env` / `skills[].env_unset` | Extra environment for that skill's subprocess, and names it must not inherit. Values export as written; a valueless key is refused (use `env_unset`). radar's own credentials are stripped and refused in both, in any case spelling. radar exports `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` to every skill unless you exported one yourself — the second removes the CLI's own 10-minute background-agent cutoff, leaving `timeout_seconds` as the only clock. See [Headless agents and background work](#headless-agents-and-background-work). |
 | `jira` | `base_url` (builds the `PROJ-123` browse links on the board) and `project_keys` (optional filter so `UTF-8`-shaped tokens aren't matched). Not a credential — fetching a ticket uses `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` from the environment. |
 | `teams` | Named GitLab-username groups; each becomes an *authored* / *to review* filter pill on the board. |
 | `gamification` | Consumed in Phase 3; carried verbatim for now. |

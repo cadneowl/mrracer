@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -10,7 +11,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from radar.commands import CommandError, CommandRunner, build_argv
+from radar.commands import _DEFAULT_CHILD_ENV, CommandError, CommandRunner, build_argv
 from radar.config import ReviewConfig, load_config
 from radar.db import Database
 from radar.events import EventType as ET
@@ -217,17 +218,177 @@ def _echo_env(name: str) -> str:
     return f"{PY} -c \"import os; print(os.environ.get('{name}', 'ABSENT'))\""
 
 
-def test_background_tasks_are_off_for_every_skill():
-    """A headless agent that defers to a background subagent answers with a
-    placeholder and its real findings only later, so radar turns that off."""
-    cfg = ReviewConfig(
-        enabled=True, command=_echo_env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"),
-        timeout_seconds=30,
-    )
+@pytest.mark.parametrize("name,value", sorted(_DEFAULT_CHILD_ENV.items()))
+def test_child_env_defaults_reach_every_skill(name, value, monkeypatch):
+    """Every default radar promises a skill (inline subagents, unbounded
+    background wait) must actually arrive in the child. Parametrized over the
+    dict itself so a future default cannot ship untested; the ambient variable
+    is scrubbed because setdefault deliberately yields to an operator export."""
+    monkeypatch.delenv(name, raising=False)
+    cfg = ReviewConfig(enabled=True, command=_echo_env(name), timeout_seconds=30)
     runner = CommandRunner(cfg, "review")
     done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
     assert done.status == "done"
-    assert "1" in done.output
+    assert done.output.strip() == value
+
+
+# --- background-agent runs must never masquerade as results -----------------
+
+
+def _survivor_cmd(body: str, sleep: int = 30) -> str:
+    """A child that leaves a process holding its inherited pipes, then exits."""
+    script = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', 'import time; time.sleep({sleep})']); "
+        + body
+    )
+    return f'{PY} -c "{script}"'
+
+
+def test_swept_background_agents_fail_the_job_and_are_not_persisted():
+    """If the CLI reports on stderr that it stopped waiting for background
+    tasks, the run's output is a deferral note, not the findings — keep it
+    visible under an error, never store it as the review."""
+    cmd = (
+        f"{PY} -c \"import sys; print('The review is running; findings later.'); "
+        "print('Background tasks still running after 600s; terminating.', file=sys.stderr)\""
+    )
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    saved = []
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}, on_success=saved.append))
+    assert done.status == "error"
+    assert "stopped waiting" in done.error
+    assert "findings later" in done.output  # the note stays visible under the error
+    assert saved == []                      # but is never stored as the review
+
+
+def test_sweep_is_detected_even_when_a_survivor_holds_stderr():
+    """The case the sweep guard exists for: the agent that outlived the CLI is
+    also holding the pipe the evidence arrives on. Reading stderr must not give
+    up before that survivor is stopped, or the note is stored as the review."""
+    cmd = _survivor_cmd(
+        "import sys; print('The review is running; findings later.'); "
+        "print('Background tasks still running after 600s; terminating.', file=sys.stderr)"
+    )
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=300)
+    runner = CommandRunner(cfg, "review")
+    saved = []
+    done = _await(
+        runner,
+        runner.start({"project_id": 1, "mr_iid": 2}, on_success=saved.append),
+        timeout=40.0,
+    )
+    assert done.status == "error"
+    assert "stopped waiting" in done.error
+    assert saved == []
+
+
+def test_job_completes_even_if_a_survivor_holds_the_stdout_pipe():
+    """EOF on the stdout pipe needs every write end closed; a survivor that
+    inherited it must not keep the job 'running' after the child exited."""
+    cmd = _survivor_cmd("print('parent done')", sleep=60)
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=300)
+    runner = CommandRunner(cfg, "review")
+    start = time.time()
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}), timeout=40.0)
+    # Finished on the child's exit and its own budget, not on the survivor's
+    # 60s life or the 300s timeout: the grace windows bound the wait.
+    assert done.status == "done"
+    assert "parent done" in done.output
+    assert time.time() - start < 30
+
+
+@pytest.mark.parametrize("bad_event", [
+    {"type": "assistant", "message": {"content": ["a bare string, not a block"]}},
+    {"type": "assistant", "message": "not a mapping at all"},
+    {"type": "assistant", "message": {"content": "not a list"}},
+    {"type": "user", "message": {"content": [None]}},
+])
+def test_odd_stream_shapes_do_not_cost_the_run_its_result(bad_event, tmp_path):
+    """The reader runs on its own thread: a shape radar didn't expect must not
+    kill it mid-stream and leave the fragment read so far to pass for the whole
+    run. The child's output is untrusted — surviving it is the reader's job."""
+    stream = tmp_path / "stream.jsonl"
+    stream.write_text(
+        json.dumps(bad_event) + "\n"
+        + json.dumps({"type": "result", "result": "REAL FINDINGS"}) + "\n",
+        encoding="utf-8",
+    )
+    cmd = f'{PY} -c "import sys; sys.stdout.write(open(sys.argv[1]).read())" "{stream}"'
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    saved = []
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}, on_success=saved.append))
+    assert done.status == "done"
+    assert "REAL FINDINGS" in done.output  # the event after the odd one still lands
+    assert len(saved) == 1
+
+
+def test_a_reader_that_fails_is_reported_not_passed_off_as_the_result(monkeypatch):
+    """If the reader does hit something it can't handle, the job must say so
+    rather than publish the fragment it managed to collect."""
+    import radar.commands as commands
+
+    def boom(self, job, line, result_parts, raw_parts, stats):
+        raise RuntimeError("reader exploded")
+
+    monkeypatch.setattr(commands.CommandRunner, "_ingest", boom)
+    cmd = f"{PY} -c \"print('anything')\""
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    saved = []
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}, on_success=saved.append))
+    assert done.status == "error"
+    assert "could not read" in done.error and "reader exploded" in done.error
+    assert saved == []
+
+
+def test_timeout_kills_the_whole_process_tree(tmp_path):
+    """With the wait ceiling defaulted to 0 the CLI never reaps its own
+    background agents, so radar's timeout must take down grandchildren too —
+    otherwise they keep running (and spending) after the job is failed."""
+    marker = tmp_path / "grandchild-was-alive.txt"
+    grandchild = (
+        "import time, os; time.sleep(3); "
+        "open(os.environ['RADAR_TEST_MARKER'], 'w').write('x')"
+    )
+    script = (
+        "import subprocess, sys, os, time; "
+        "subprocess.Popen([sys.executable, '-c', os.environ['RADAR_GRANDCHILD']]); "
+        "time.sleep(60)"
+    )
+    cmd = f'{PY} -c "{script}"'
+    cfg = ReviewConfig(
+        enabled=True, command=cmd, timeout_seconds=1,
+        env=(("RADAR_GRANDCHILD", grandchild), ("RADAR_TEST_MARKER", str(marker))),
+    )
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.status == "error" and "timed out" in done.error
+    # Poll past the grandchild's write time instead of sleeping through it: a
+    # live grandchild shows up as soon as it writes, and a killed one never does.
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        assert not marker.exists(), "grandchild survived the timeout kill"
+        time.sleep(0.1)
+
+
+def test_timeout_error_names_a_still_running_background_agent():
+    """When the stream showed a subagent dispatched to the background, a
+    timeout should say that's what ran out of clock, so the operator raises
+    timeout_seconds instead of hunting for a slow review."""
+    script = (
+        "import json, sys, time; "
+        "print(json.dumps({'type': 'user', 'status': 'async_launched'})); "
+        "sys.stdout.flush(); time.sleep(60)"
+    )
+    cmd = f'{PY} -c "{script}"'
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=2)
+    runner = CommandRunner(cfg, "review")
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+    assert done.status == "error"
+    assert "background agent" in done.error
 
 
 def test_skill_env_overrides_and_unsets():

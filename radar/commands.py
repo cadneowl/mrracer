@@ -30,10 +30,13 @@ refused. The child never inherits our GitLab PAT (see ``_ENV_DENYLIST``).
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
+import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -64,8 +67,20 @@ _ENV_DENYLIST = SECRET_ENV_NAMES
 # every result event, so at best the placeholder is glued to the front of the
 # output and at worst it is the whole of it. Forcing subagents to run inline
 # makes the run's last word its actual work. A skill that would rather keep its
-# parallelism can set the variable to null in its own `env:`.
-_DEFAULT_CHILD_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+# parallelism can drop the variable with `env_unset:`.
+#
+# CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: how long `claude -p` waits for still-
+# running background agents before killing them and exiting with whatever it
+# has (0 = wait forever; the CLI's default gives up after 10 minutes). Inert
+# while the variable above keeps everything inline, but a skill can always
+# escape to the background anyway — by opting out, or by shelling out to
+# another `claude` itself — and then this is the difference between findings
+# and a "still running" note. With the ceiling gone, the only clock left is
+# radar's own `timeout_seconds`, which the operator sizes to the skill.
+_DEFAULT_CHILD_ENV = {
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0",
+}
 
 
 def _is_secret_env(name: str) -> bool:
@@ -110,6 +125,141 @@ SNAPSHOT_KEYS = tuple(k for k in PLACEHOLDER_KEYS if k != "source_root")
 
 class CommandError(ValueError):
     """The command template + MR context can't be turned into a safe argv."""
+
+
+# The line `claude -p` prints on stderr when its background-agent wait ceiling
+# elapses and it kills agents that were still working. Radar's default ceiling
+# is 0 (wait forever), so seeing this means something overrode it — and that the
+# run's output is a deferral note, not the findings.
+#
+# Deliberately specific: a false positive throws away a finished review (the
+# branch skips `on_success`, so nothing is stored), while a false negative only
+# leaves today's behaviour of storing the note. So this matches the CLI's own
+# sentence at the start of a line, not the phrase wherever it appears — a review
+# that happens to discuss background tasks, or an MCP server logging about them,
+# must not cost the operator their result. The tail is left loose because the
+# sentence is undocumented and a release may reword it.
+_BG_SWEPT_RE = re.compile(r"(?im)^\s*background tasks still running after\b.*?\bterminat")
+
+# The status the Agent tool reports for a subagent dispatched to the background.
+_ASYNC_LAUNCH_STATUS = "async_launched"
+
+# How long to keep reading a pipe after the child itself has exited. Only in
+# play when something the child spawned inherited the pipe and outlived it.
+_DRAIN_GRACE = 5.0
+
+# Every live skill process, so radar can take them down when it exits: with the
+# wait ceiling at 0 the CLI never reaps its own background agents, and a job's
+# timeout dies with the process running it. Registered while a child is alive,
+# swept by the atexit hook below (which covers a clean exit and Ctrl-C; a
+# SIGKILLed radar can't run code at all).
+_LIVE: dict[int, tuple[subprocess.Popen, int | None]] = {}
+_LIVE_LOCK = threading.Lock()
+
+
+def _kill_tree(proc: subprocess.Popen, pgid: int | None) -> None:
+    """Kill the child and everything it spawned, not just the child.
+
+    ``proc.kill()`` alone ends the direct child while a backgrounded agent it
+    launched keeps running (and keeps spending API tokens) — and if that agent
+    inherited our stdout, keeps the pipe's write end open. On POSIX the child
+    leads its own process group (``start_new_session`` at launch) so the group
+    can be signalled as a unit; on Windows ``taskkill /T`` walks the tree.
+
+    Both are best effort, and neither reaches a descendant that put *itself* in
+    a new session or was re-parented after its own parent died. The direct
+    ``kill()`` stays as a backstop, which is why every step here is guarded: a
+    tree kill that raises must not skip it.
+
+    ``pgid`` is captured at spawn rather than read from ``proc.pid`` here,
+    because a caller may signal after the child was reaped and its pid could
+    then belong to somebody else. Callers only reach that path while a group
+    member is provably still alive, which keeps the id allocated.
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # missing from PATH, or wedged — fall through to kill()
+    elif pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:  # group already empty
+            pass
+    try:
+        proc.kill()
+    except OSError:  # pragma: no cover - already reaped
+        pass
+
+
+def _join_all(threads: list[threading.Thread], grace: float) -> bool:
+    """Wait up to ``grace`` for all of them together; True if any is still
+    running. One shared deadline, not one each: the point is to bound how long
+    a job can be held up by a pipe nobody is going to close."""
+    deadline = time.monotonic() + grace
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    return any(thread.is_alive() for thread in threads)
+
+
+def _sweep_live_children() -> None:
+    """Kill any skill still running when radar exits, so nothing outlives the
+    only supervisor it had."""
+    with _LIVE_LOCK:
+        live = list(_LIVE.values())
+    for proc, pgid in live:
+        if proc.poll() is None:
+            log.warning("radar is exiting; stopping skill process %s", proc.pid)
+            _kill_tree(proc, pgid)
+
+
+atexit.register(_sweep_live_children)
+
+
+def _content_blocks(obj: dict) -> list:
+    """The content blocks of a stream-json message event, or nothing.
+
+    Every shape here is the child's to choose and radar's to survive, so a
+    message that is a string, or content that is not a list, reads as empty
+    rather than raising on a reader thread.
+    """
+    message = obj.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    return content if isinstance(content, list) else []
+
+
+def _async_agent_launched(obj: dict) -> bool:
+    """Whether this stream-json event reports a subagent sent to the background.
+
+    Structural on purpose: the marker is advisory (it only sharpens a timeout
+    message), so matching the word anywhere in the line would be all cost and
+    no benefit — a diff, a tool result, or a review discussing this very code
+    would trip it and misdirect the operator.
+    """
+    if obj.get("status") == _ASYNC_LAUNCH_STATUS:
+        return True
+    for block in _content_blocks(obj):
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        content = block.get("content")
+        for part in content if isinstance(content, list) else [content]:
+            if isinstance(part, dict):
+                part = part.get("text")
+            if not isinstance(part, str) or _ASYNC_LAUNCH_STATUS not in part:
+                continue
+            try:
+                payload = json.loads(part)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(payload, dict) and payload.get("status") == _ASYNC_LAUNCH_STATUS:
+                return True
+    return False
 
 
 def build_argv(command: str, ctx: dict) -> list[str]:
@@ -372,6 +522,9 @@ class CommandRunner:
                 errors="replace",
                 bufsize=1,          # line-buffered, for live streaming
                 env=self._child_env(),
+                # Group leader on POSIX so a timeout can kill the whole tree
+                # (see _kill_tree); Windows gets the tree via taskkill instead.
+                start_new_session=(os.name != "nt"),
             )
         except FileNotFoundError:
             _fail(job, f"command not found: {argv[0]!r} (is it on PATH?)")
@@ -380,50 +533,133 @@ class CommandRunner:
             _fail(job, f"failed to launch {self.kind}: {exc}")
             return
 
+        # With start_new_session the child leads a new group whose id is its pid.
+        # Captured now, while the pid is certainly still the child's.
+        pgid = proc.pid if os.name != "nt" else None
+        with _LIVE_LOCK:
+            _LIVE[proc.pid] = (proc, pgid)
+
         if stdin_text is not None:
             # Write on a thread so a large bundle can't deadlock against stdout.
             threading.Thread(
                 target=_feed_stdin, args=(proc, stdin_text), daemon=True
             ).start()
 
-        # Drain stderr concurrently so a chatty child can't deadlock on a full pipe.
+        result_parts: list[str] = []  # final answer from stream-json 'result'
+        raw_parts: list[str] = []     # accumulated plain-text output
+        stats: dict = {}              # facts the drains gleaned about the run
         stderr_box: list[str] = []
-        stderr_thread = threading.Thread(
-            target=lambda: stderr_box.append(proc.stderr.read() or ""), daemon=True
-        )
-        stderr_thread.start()
+        # Both pipes are drained on their own threads. EOF needs every write end
+        # closed, and anything the child spawned that inherited a pipe can hold
+        # it open past the child's death — so the worker waits for the CHILD,
+        # which is the event the job actually depends on, and never blocks on a
+        # read that a survivor could stall forever.
+        drains = [
+            threading.Thread(
+                target=lambda: self._drain(
+                    job, proc.stdout, stats,
+                    lambda line: self._ingest(job, line, result_parts, raw_parts, stats),
+                ),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=lambda: self._drain(job, proc.stderr, stats, stderr_box.append),
+                daemon=True,
+            ),
+        ]
+        for drain in drains:
+            drain.start()
 
-        timed_out = threading.Event()
         # What is left of the job's budget after preparing — never less than a
         # second, so a command that only just made the deadline still gets to
         # report something rather than being killed on the starting line.
+        #
+        # The wait and the kill live on this one thread: a timer thread killing
+        # by pid races the reap here, and could signal a pid the OS had already
+        # handed to somebody else. Here the child is provably unreaped when the
+        # kill goes out, so its group id is still its own.
         remaining = max(1.0, deadline - time.monotonic())
-        timer = threading.Timer(remaining, lambda: (timed_out.set(), proc.kill()))
-        timer.start()
-
-        result_parts: list[str] = []  # final answer from stream-json 'result'
-        raw_parts: list[str] = []     # accumulated plain-text output
+        timed_out = False
         try:
-            for line in proc.stdout:
-                self._ingest(job, line, result_parts, raw_parts)
-        finally:
-            timer.cancel()
-        proc.wait()
-        stderr_thread.join(timeout=1.0)
+            proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            # Kills the tree: with the wait ceiling defaulted to 0 the CLI never
+            # reaps its own background agents, so this is the only thing that
+            # stops one from running (and spending) past the job.
+            _kill_tree(proc, pgid)
+            proc.wait()
+
+        if _join_all(drains, _DRAIN_GRACE):
+            # The child is gone but our pipes are still held: it left something
+            # behind. That survivor is both the reason a read can't finish and
+            # a process running on radar's behalf with nothing supervising it,
+            # so take the tree down and collect what the drains can still read.
+            # Safe to signal by group here — a live member keeps the id from
+            # being reused, and a live member is exactly what we just proved.
+            log.warning("%s left a process holding its pipes; stopping them", self.kind)
+            _kill_tree(proc, pgid)
+            still_held = _join_all(drains, _DRAIN_GRACE)
+            if still_held:
+                # Best effort ran out: a descendant that re-parented or put
+                # itself in a new session is beyond both kill paths. Say so in
+                # the log the panel tails rather than in the result, because the
+                # output collected so far is usually the whole of what the child
+                # wrote — the survivor is holding the pipe, not still filling it.
+                self._add(job, "log", (
+                    "a process this run left behind is still holding its output "
+                    "pipe; anything it writes from here on is not captured"
+                ))
+        with _LIVE_LOCK:
+            _LIVE.pop(proc.pid, None)
+
         job.returncode = proc.returncode
+        stderr_text = "".join(stderr_box)
 
         # Blank line between results: a run can report more than one, and gluing
         # them together swallows the heading or list the next one opens with.
         output = ("\n\n".join(result_parts) if result_parts else "".join(raw_parts))[:_MAX_OUTPUT]
 
-        if timed_out.is_set():
+        if timed_out:
             # Keep what the run did manage to say. A long review that ran out of
             # clock is more use half-written than replaced by the word "timeout".
             job.output = output
-            _fail(job, f"{self.kind} timed out after {self.config.timeout_seconds}s")
+            detail = f"{self.kind} timed out after {self.config.timeout_seconds}s"
+            if stats.get("async_agent"):
+                detail += (
+                    " while a background agent it launched was still working "
+                    "(the whole process tree was stopped). Raise timeout_seconds "
+                    "to outlast the work, or let radar's default env keep "
+                    "subagents inline."
+                )
+            _fail(job, detail)
+            return
+
+        # A drain that raised took the rest of that pipe with it, so whatever
+        # was captured is a fragment of the run. Report the fault instead of
+        # publishing the fragment as the result.
+        if stats.get("drain_error"):
+            job.output = output
+            _fail(job, f"could not read the {self.kind}'s output: {stats['drain_error']}")
             return
 
         if proc.returncode == 0 and output.strip():
+            if _BG_SWEPT_RE.search(stderr_text):
+                # The CLI killed background agents it was still waiting for and
+                # exited with a deferral note instead of the findings. Radar's
+                # default ceiling (0 = wait forever) makes this impossible, so
+                # something overrides it. Keep the note visible under the error,
+                # but never store it as the result.
+                job.output = output
+                _fail(job, (
+                    "the CLI stopped waiting for a background agent the skill "
+                    "launched and exited before it reported — the output below "
+                    "is the run's deferral note, not the findings. Something "
+                    "overrides radar's default CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 "
+                    "(wait forever): check this skill's env: and env_unset:, the "
+                    "shell radar runs in, and .env."
+                ))
+                return
             # Publish output BEFORE flipping status so a reader that sees "done"
             # always sees the output too.
             job.output = output
@@ -435,11 +671,43 @@ class CommandRunner:
                     job.persist_error = f"result was generated but could not be saved: {exc}"
             job.status = "done"
         else:
-            detail = "".join(stderr_box).strip() or output or f"exited with code {proc.returncode}"
+            detail = stderr_text.strip() or output or f"exited with code {proc.returncode}"
             _fail(job, detail.strip())
 
+    def _drain(self, job: CommandJob, pipe, stats: dict, consume: Callable[[str], object]) -> None:
+        """Read one of the child's pipes to EOF, handing each line to ``consume``.
+
+        Runs on its own thread, so an exception here would otherwise vanish and
+        take the rest of the pipe with it — leaving a fragment of the run to be
+        published as if it were the whole. Anything unexpected is recorded for
+        the worker to report; a torn-down pipe (the normal end of a killed run)
+        is not an error.
+        """
+        try:
+            for line in pipe:
+                consume(line)
+        except (OSError, ValueError):  # pipe torn down under us after a kill
+            pass
+        except Exception as exc:  # noqa: BLE001 - surfaced by the worker
+            log.exception("%s output reader failed", self.kind)
+            stats.setdefault("drain_error", f"{type(exc).__name__}: {exc}")
+        finally:
+            # Whoever read the pipe closes it. The worker cannot: closing takes
+            # the buffer's lock, which this thread holds while blocked on a read
+            # a survivor is keeping open — the worker would block behind it for
+            # exactly as long as it was trying to avoid waiting.
+            try:
+                pipe.close()
+            except (OSError, ValueError):  # pragma: no cover - already closed
+                pass
+
     def _ingest(
-        self, job: CommandJob, line: str, result_parts: list[str], raw_parts: list[str]
+        self,
+        job: CommandJob,
+        line: str,
+        result_parts: list[str],
+        raw_parts: list[str],
+        stats: dict,
     ) -> None:
         """Handle one line of the child's stdout: parse Claude stream-json into
         progress + final result, or treat it as plain output."""
@@ -456,9 +724,16 @@ class CommandRunner:
             raw_parts.append(line + "\n")
             return
 
+        # A subagent dispatched to the background: the findings then depend on
+        # that agent finishing, which is worth naming if the budget cuts it short.
+        if _async_agent_launched(obj):
+            stats["async_agent"] = True
+
         event_type = obj.get("type")
         if event_type == "assistant":
-            for block in (obj.get("message") or {}).get("content") or []:
+            for block in _content_blocks(obj):
+                if not isinstance(block, dict):
+                    continue
                 block_type = block.get("type")
                 if block_type == "tool_use":
                     self._add(job, "tool", f"using {block.get('name', 'tool')}")
