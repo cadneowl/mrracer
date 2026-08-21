@@ -11,7 +11,13 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from radar.commands import _DEFAULT_CHILD_ENV, CommandError, CommandRunner, build_argv
+from radar.commands import (
+    _DEFAULT_CHILD_ENV,
+    CommandError,
+    CommandJob,
+    CommandRunner,
+    build_argv,
+)
 from radar.config import ReviewConfig, load_config
 from radar.db import Database
 from radar.events import EventType as ET
@@ -155,6 +161,135 @@ def test_runner_parses_stream_json(tmp_path):
     kinds = {p["kind"] for p in done.progress}
     assert "tool" in kinds and "text" in kinds
     assert any("WebFetch" in p["text"] for p in done.progress)
+
+
+def _stream_job(tmp_path, events: list[dict], name: str = "stream.py"):
+    """Run a command that emits these stream-json events and return the job."""
+    script = tmp_path / name
+    script.write_text(
+        "import json\n"
+        + "".join(f"print(json.dumps({event!r}))\n" for event in events),
+        encoding="utf-8",
+    )
+    cfg = ReviewConfig(enabled=True, command=f'{PY} "{script}"', timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    return _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
+
+
+def _tool_use(name: str, tool_input: dict) -> dict:
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": name, "input": tool_input},
+    ]}}
+
+
+@pytest.mark.parametrize("name,tool_input,expected", [
+    ("Bash", {"command": "git diff --stat"}, "Bash: git diff --stat"),
+    # A human-written description says more than the machinery it wraps.
+    ("Bash", {"command": "rg -n foo", "description": "Find the callers"},
+     "Bash: Find the callers"),
+    ("Read", {"file_path": "/src/api/users.py"}, "Read: /src/api/users.py"),
+    ("Grep", {"pattern": "TODO", "path": "radar/"}, "Grep: TODO in radar/"),
+    ("WebFetch", {"url": "https://example.test/x"}, "WebFetch: https://example.test/x"),
+    ("Task", {"subagent_type": "code-reviewer"}, "Task: code-reviewer"),
+    ("TodoWrite", {"todos": [1, 2]}, "TodoWrite"),   # nothing worth naming
+    ("Bash", "not-a-mapping", "Bash"),
+])
+def test_progress_names_what_a_tool_is_doing(tmp_path, name, tool_input, expected):
+    """"using Bash" forty times tells an operator nothing about where a long
+    review has got to; the command it ran does."""
+    done = _stream_job(tmp_path, [_tool_use(name, tool_input)])
+    assert any(p["text"] == expected for p in done.progress), done.progress
+
+
+def test_a_repeated_line_is_collapsed_into_a_count(tmp_path):
+    """A true repeat is one line worth seeing as a loop, not twenty identical
+    ones scrolling the rest of the log out of view."""
+    done = _stream_job(tmp_path, [_tool_use("Bash", {"command": "pytest -q"})] * 3)
+    tools = [p for p in done.progress if p["kind"] == "tool"]
+    assert len(tools) == 1
+    assert tools[0]["text"] == "Bash: pytest -q (×3)"
+
+
+def test_only_a_real_session_start_is_logged_as_one(tmp_path):
+    """Every system event logged as "session started" reads like the run keeps
+    restarting — which is what the panel was showing."""
+    done = _stream_job(tmp_path, [
+        {"type": "system", "subtype": "init"},
+        {"type": "system", "subtype": "compact_boundary"},
+        {"type": "result", "result": "done"},
+    ])
+    texts = [p["text"] for p in done.progress]
+    assert texts.count("session started") == 1
+    assert "compact boundary" in texts
+
+
+def test_a_system_event_without_a_subtype_still_shows_a_session_line(tmp_path):
+    """A CLI that stops labelling its init event must not make the session line
+    disappear — silently showing less is the failure this whole area is about."""
+    done = _stream_job(tmp_path, [
+        {"type": "system"},
+        {"type": "result", "result": "done"},
+    ])
+    assert "session started" in [p["text"] for p in done.progress]
+
+
+def test_a_child_cannot_flood_the_log_with_one_giant_line(tmp_path):
+    """Every other line here is bounded; a subtype comes from the child too."""
+    done = _stream_job(tmp_path, [
+        {"type": "system", "subtype": "x" * 5000},
+        {"type": "result", "result": "done"},
+    ])
+    assert all(len(p["text"]) <= 100 for p in done.progress), done.progress
+
+
+def test_progress_items_keep_stable_ids_for_live_updates(tmp_path):
+    """The stream keys lines by id, not by position: the log is trimmed from the
+    front, and a collapsed repeat has to update the line the browser drew."""
+    done = _stream_job(tmp_path, [
+        _tool_use("Read", {"file_path": "/a.py"}),
+        _tool_use("Read", {"file_path": "/b.py"}),
+    ])
+    ids = [p["id"] for p in done.progress]
+    assert ids == sorted(set(ids))  # unique and ascending
+
+
+def test_a_collapsed_count_still_reaches_a_reader_that_is_behind():
+    """The bug this revision counter exists for: a reader that has already seen
+    a line must still be told its count went up, even when newer lines arrived
+    in the same breath — otherwise the browser shows the stale line forever."""
+    cfg = ReviewConfig(enabled=True, command="unused", timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    job = CommandJob(id="j1", kind="review", project_id=1, mr_iid=2)
+    with runner._lock:
+        runner._jobs[job.id] = job
+
+    runner._add(job, "tool", "Bash: pytest")
+    items, _ = runner.progress_since(job.id, 0)
+    seen = max(item["rev"] for item in items)
+    assert [item["text"] for item in items] == ["Bash: pytest"]
+
+    # The repeat collapses onto the line already sent, and a different line is
+    # appended after it — all before the reader comes back.
+    runner._add(job, "tool", "Bash: pytest")
+    runner._add(job, "tool", "Read: /a.py")
+
+    items, _ = runner.progress_since(job.id, seen)
+    texts = {item["text"] for item in items}
+    assert "Bash: pytest (×2)" in texts, "the collapsed count never reached the reader"
+    assert "Read: /a.py" in texts
+
+
+def test_progress_items_carry_only_what_a_reader_draws():
+    """The collapse bookkeeping is server-side; it should not ride along in
+    every frame of a stream that re-sends on each change."""
+    cfg = ReviewConfig(enabled=True, command="unused", timeout_seconds=30)
+    runner = CommandRunner(cfg, "review")
+    job = CommandJob(id="j2", kind="review", project_id=1, mr_iid=2)
+    with runner._lock:
+        runner._jobs[job.id] = job
+    runner._add(job, "tool", "Bash: pytest")
+    items, _ = runner.progress_since(job.id, 0)
+    assert set(items[0]) == {"id", "rev", "kind", "text"}
 
 
 def test_two_results_are_separated(tmp_path):
@@ -540,6 +675,45 @@ def test_review_button_and_flow(tmp_path):
 
     # Close returns empty content to dismiss the modal.
     assert client.get("/review/close").text == ""
+
+
+def test_running_panel_shows_a_countdown_and_the_stream_re_anchors_it(tmp_path):
+    """The operator watching a long review needs to know how much of the budget
+    is left, and the browser's own tick must be corrected by the worker's clock
+    rather than trusted on its own."""
+    slow = f'{PY} -c "import time; time.sleep(2); print(chr(35),42)"'
+    config = _review_config(tmp_path, slow)
+    db_path = tmp_path / "r.db"
+    db = Database(db_path)
+    _seed(db)
+    db.close()
+
+    client = TestClient(create_app(config, str(db_path)))
+    start = client.post("/review/1/7")
+    job_id = re.search(r'data-job-id="([0-9a-f]+)"', start.text).group(1)
+
+    # Rendered with seconds left, from the same budget the worker enforces —
+    # and with its text already in place, so the pill is never a blank box.
+    countdown = re.search(
+        r'class="countdown[^"]*"[^>]*data-remaining="(\d+)"[^>]*>([^<]*)<', start.text
+    )
+    assert countdown, start.text
+    assert 0 < int(countdown.group(1)) <= 30
+    assert re.fullmatch(r"\d+:\d\d left", countdown.group(2).strip()), countdown.group(2)
+
+    # The stream re-anchors that number as the run proceeds. A real number has
+    # to arrive: an all-None stream would mean the countdown silently vanished.
+    with client.stream("GET", f"/review/stream/{job_id}") as stream:
+        clocks = []
+        for line in stream.iter_lines():
+            if line.startswith("data:") and "remaining_s" in line:
+                clocks.append(json.loads(line[5:])["remaining_s"])
+            if line == "event: end" or len(clocks) >= 2:
+                break
+    numbers = [c for c in clocks if isinstance(c, int)]
+    assert numbers, f"no real countdown value on the stream: {clocks}"
+    assert all(0 <= c <= 30 for c in numbers)
+    assert numbers == sorted(numbers, reverse=True)  # counts down, never up
 
 
 def test_review_disabled_hides_button_and_blocks_endpoint(config, tmp_path):

@@ -262,6 +262,33 @@ def _async_agent_launched(obj: dict) -> bool:
     return False
 
 
+# Which of a tool's inputs actually says what the agent is doing. "Bash" alone,
+# forty times over, tells an operator watching a long review nothing; the command
+# it ran tells them where the review has got to. First key present wins, so the
+# human-written description beats the machinery when a tool offers both.
+_TOOL_DETAIL_KEYS = (
+    "description", "command", "file_path", "notebook_path", "pattern",
+    "query", "url", "prompt", "path", "skill", "subagent_type",
+)
+
+
+def _tool_detail(name: str, tool_input: object) -> str:
+    """One line naming what this tool call is doing, e.g. ``Bash: git diff``."""
+    if not isinstance(tool_input, dict):
+        return name
+    for key in _TOOL_DETAIL_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            detail = _short(value, 90)
+            # Grep/Glob read as a pattern applied somewhere; the path is the
+            # half that says which part of the tree is being looked at.
+            where = tool_input.get("path") or tool_input.get("glob")
+            if key == "pattern" and isinstance(where, str) and where.strip():
+                detail = f"{detail} in {_short(where, 40)}"
+            return f"{name}: {detail}"
+    return name
+
+
 def build_argv(command: str, ctx: dict) -> list[str]:
     """Split a command template into argv, then substitute placeholders into
     each token (never re-splitting substituted values).
@@ -312,6 +339,16 @@ class CommandJob:
     persist_error: str = ""  # set if the result was produced but couldn't be saved
     returncode: int | None = None
     progress: list[dict] = field(default_factory=list)  # live log: {kind, text}
+    # The panel's countdown, measured on the same clock the worker enforces the
+    # budget with. Wall clock would drift from it across a host suspend or an
+    # NTP step and show time the run does not actually have.
+    started_mono: float = 0.0
+    budget_s: int = 0
+    # Progress items carry a stable `id` (identity, so the browser can update a
+    # line it already drew) and a `rev` from this counter (bumped on append AND
+    # on a collapse, so "what changed since?" has one answer covering both).
+    progress_next_id: int = 0
+    progress_rev: int = 0
     # Where the child runs. Per job, not per skill: the source root is resolved
     # from the MR's project, so two projects reviewed by one skill run in their
     # own checkouts (see `CommandRunner.start`).
@@ -391,6 +428,8 @@ class CommandRunner:
             project_id=int(ctx["project_id"]),
             mr_iid=int(ctx["mr_iid"]),
             title=str(ctx.get("title", "")),
+            started_mono=time.monotonic(),
+            budget_s=self.config.timeout_seconds,
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -423,18 +462,53 @@ class CommandRunner:
         with self._lock:
             return self._jobs.get(job_id)
 
-    def progress_since(self, job_id: str, since: int) -> tuple[list[dict], str] | None:
-        """New progress items from index ``since`` plus the job's status, or
-        None if the job is unknown."""
+    def progress_since(self, job_id: str, after_rev: int) -> tuple[list[dict], str] | None:
+        """Progress items changed since ``after_rev``, plus the job's status, or
+        None if the job is unknown.
+
+        Filtering on the revision rather than on the id covers both things that
+        can happen to the log: a new line appended, and an existing line's count
+        going up when its event repeats. A reader tracking ids alone would never
+        learn about the second, and the line it drew would sit there stale.
+
+        ``id`` identifies the line across those updates — the log is capped by
+        dropping from the front, so list positions shift and ids don't. The
+        bookkeeping a collapse needs stays server-side; a reader gets only what
+        it draws.
+        """
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return None
-            return list(job.progress[since:]), job.status
+            items = [
+                {"id": item["id"], "rev": item["rev"], "kind": item["kind"], "text": item["text"]}
+                for item in job.progress
+                if item["rev"] > after_rev
+            ]
+            return items, job.status
 
     def _add(self, job: CommandJob, kind: str, text: str) -> None:
         with self._lock:
-            job.progress.append({"kind": kind, "text": text})
+            # Collapse an immediate repeat into a count on the line already
+            # there. A run that reads twenty files says twenty different things
+            # now, so a true repeat is a loop worth seeing as one line rather
+            # than as twenty identical ones scrolling the rest off the panel.
+            job.progress_rev += 1
+            last = job.progress[-1] if job.progress else None
+            if last is not None and last["kind"] == kind and last["base"] == text:
+                last["count"] += 1
+                last["text"] = f"{text} (×{last['count']})"
+                last["rev"] = job.progress_rev
+                return
+            job.progress.append({
+                "id": job.progress_next_id,
+                "rev": job.progress_rev,
+                "kind": kind,
+                "text": text,
+                "base": text,   # what to compare a repeat against
+                "count": 1,
+            })
+            job.progress_next_id += 1
             overflow = len(job.progress) - _MAX_PROGRESS
             if overflow > 0:
                 del job.progress[:overflow]
@@ -736,7 +810,11 @@ class CommandRunner:
                     continue
                 block_type = block.get("type")
                 if block_type == "tool_use":
-                    self._add(job, "tool", f"using {block.get('name', 'tool')}")
+                    name = block.get("name")
+                    self._add(job, "tool", _tool_detail(
+                        name if isinstance(name, str) and name else "tool",
+                        block.get("input"),
+                    ))
                 elif block_type == "text" and str(block.get("text", "")).strip():
                     self._add(job, "text", _short(block["text"]))
         elif event_type == "result":
@@ -746,7 +824,18 @@ class CommandRunner:
             if obj.get("is_error"):
                 self._add(job, "log", "run reported an error")
         elif event_type == "system":
-            self._add(job, "log", "session started")
+            # Only the one that means a session actually started says so. A run
+            # emits other system events as it goes (context compaction, and
+            # whatever a later CLI adds), and logging them all as "session
+            # started" reads like the run keeps restarting. An event with no
+            # subtype keeps the old wording rather than vanishing: a CLI that
+            # stops labelling its init should still show a session line.
+            subtype = obj.get("subtype")
+            if not isinstance(subtype, str) or not subtype.strip() or subtype == "init":
+                self._add(job, "log", "session started")
+            else:
+                # Child-controlled text, so bounded like every other line here.
+                self._add(job, "log", _short(subtype.replace("_", " "), 90))
         # other event types (tool results, partial deltas) are ignored in the log
 
     def _child_env(self) -> dict:

@@ -214,7 +214,16 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
   list-style: none; margin: 0; padding: 0; max-height: 320px; overflow-y: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
 }
-.progress-log li { padding: 3px 2px; border-bottom: 1px solid var(--line); color: var(--muted); }
+.countdown {
+  margin-left: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 10px; padding: 2px 8px;
+}
+.countdown.low { color: var(--red); border-color: currentColor; }
+.progress-log li {
+  padding: 3px 2px; border-bottom: 1px solid var(--line); color: var(--muted);
+  white-space: pre-wrap; word-break: break-word;
+}
 .progress-log li.plog-tool { color: var(--text); }
 .progress-log li.plog-text { color: #9fb4d8; }
 .progress-log li:last-child { border-bottom: none; }
