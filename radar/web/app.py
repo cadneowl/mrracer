@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -56,6 +57,34 @@ _ALLOWED_ATTRS = {
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+_STREAM_TICK = 0.4      # seconds between progress polls on the SSE stream
+_CLOCK_EVERY = 12       # ticks between countdown re-anchors (~5s)
+
+
+def _remaining_s(job: CommandJob | None, status: str | None = None) -> int | None:
+    """Seconds left of a running job's budget, or None if it has no clock left
+    to show (unknown job, or one that already finished).
+
+    ``status`` is passed in by a caller that already read it, so a worker
+    flipping the job mid-render can't have the panel take the running branch
+    while this one decides there is no clock — the two would disagree and the
+    countdown would silently not render. Measured on the monotonic clock the
+    worker enforces the budget with, not on wall time.
+    """
+    if job is None or not job.budget_s:
+        return None
+    if (status if status is not None else job.status) != "running":
+        return None
+    return max(0, int(job.started_mono + job.budget_s - time.monotonic()))
+
+
+def _clock_text(remaining_s: int | None) -> str:
+    """"7:03 left", rendered server-side so the pill is never a blank box."""
+    if remaining_s is None:
+        return ""
+    return f"{remaining_s // 60}:{remaining_s % 60:02d} left"
 
 
 def _render_markdown(text: str) -> Markup:
@@ -114,6 +143,7 @@ def create_app(
         # status that advertises them, so "done" here always has its output.
         status = job.status
         output, error = job.output, job.error
+        remaining_s = _remaining_s(job, status)
         return templates.TemplateResponse(
             request,
             "_command_panel.html",
@@ -125,6 +155,11 @@ def create_app(
                 "heading": skill.label if skill else job.kind,
                 "icon": skill.icon if skill else "▶",
                 "generated_at": generated_at,
+                # Seconds left of the worker's budget, for the panel's
+                # countdown; None once there is no clock left to show. Uses the
+                # status read above, not a fresh one — see _remaining_s.
+                "remaining_s": remaining_s,
+                "clock_text": _clock_text(remaining_s),
                 # Also rendered for a failed job: a run killed by the timeout
                 # keeps whatever it had written, and half a review beats none.
                 "output_html": _render_markdown(output) if output.strip() else None,
@@ -233,21 +268,33 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown kind")
         runner = runners[kind]
 
+        # Outlive the job it is tailing: a skill given a long timeout_seconds
+        # would otherwise have its stream cut mid-review and the panel would
+        # reconnect for no reason. Still bounded, so a wedged job can't hold a
+        # connection open forever.
+        ticks = int((runner.config.timeout_seconds + 120) / _STREAM_TICK)
+
         async def gen():
-            sent = 0
-            for _ in range(1500):  # ~10min safety cap at 0.4s/iteration
-                snap = runner.progress_since(job_id, sent)
+            seen = 0
+            for tick in range(ticks):
+                snap = runner.progress_since(job_id, seen)
                 if snap is None:
                     yield _sse("end", {"status": "error"})
                     return
                 items, status = snap
                 for item in items:
+                    seen = max(seen, item.pop("rev"))
                     yield _sse("progress", item)
-                sent += len(items)
+                # The countdown ticks in the browser every second; this only has
+                # to correct it, so it goes out every few seconds rather than on
+                # every poll — a long-running skill would otherwise spend
+                # thousands of frames saying nothing new.
+                if tick % _CLOCK_EVERY == 0 or status != "running":
+                    yield _sse("clock", {"remaining_s": _remaining_s(runner.get(job_id))})
                 if status != "running":
                     yield _sse("end", {"status": status})
                     return
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(_STREAM_TICK)
             yield _sse("end", {"status": "timeout"})
 
         return StreamingResponse(

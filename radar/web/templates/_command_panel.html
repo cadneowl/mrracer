@@ -15,7 +15,15 @@
     <div class="modal-body">
       {# `status`/`error`, not `job.*`: one read of the job's state per render — see _panel. #}
       {% if status == "running" %}
-      <div class="review-loading"><span class="spinner"></span> running your {{ heading|lower }} command…</div>
+      <div class="review-loading">
+        <span class="spinner"></span> running your {{ heading|lower }} command…
+        {% if remaining_s is not none %}
+        {# Rendered with its text already in place: the value is known here, so
+           the pill never paints as an empty bordered box waiting for JS. #}
+        <span class="countdown{% if remaining_s <= 60 %} low{% endif %}"
+              id="clock-{{ job.id }}" data-remaining="{{ remaining_s }}">{{ clock_text }}</span>
+        {% endif %}
+      </div>
       <ul class="progress-log" id="plog-{{ job.id }}" data-job-id="{{ job.id }}" data-kind="{{ kind }}"></ul>
       <script>
       (function () {
@@ -23,12 +31,44 @@
         if (!el) return;
         var kind = el.dataset.kind, id = el.dataset.jobId;
         var icons = { tool: "🔧", text: "✍", log: "•" };
+        var seen = {};  // progress id -> its <li>, so a collapsed repeat updates in place
+
+        var clock = document.getElementById("clock-{{ job.id }}");
+        var left = clock ? parseInt(clock.dataset.remaining, 10) : null;
+        function paint() {
+          if (!clock || left === null || isNaN(left)) return;
+          var m = Math.floor(left / 60), s = left % 60;
+          clock.textContent = m + ":" + (s < 10 ? "0" : "") + s + " left";
+          clock.classList.toggle("low", left <= 60);
+        }
+        // One heartbeat, doing two jobs. It ticks the countdown locally so the
+        // number moves every second (the server's `clock` event re-anchors it —
+        // the budget belongs to the worker, not to this tab), and it notices
+        // when the panel has been swapped away. Closing the modal replaces
+        // #command-panel wholesale, which runs no code of ours: without this
+        // check the interval and the EventSource would both outlive the DOM
+        // they belong to, and a handful of opens would exhaust the browser's
+        // connections to radar.
+        paint();
+        var ticker = setInterval(function () {
+          if (!document.body.contains(el)) { finish(); return; }
+          if (left !== null && left > 0) { left -= 1; paint(); }
+        }, 1000);
+
         var es = new EventSource("/" + kind + "/stream/" + id);
+        es.addEventListener("clock", function (e) {
+          var d = JSON.parse(e.data);
+          if (d.remaining_s !== null && d.remaining_s !== undefined) { left = d.remaining_s; paint(); }
+        });
         es.addEventListener("progress", function (e) {
           var d = JSON.parse(e.data);
-          var li = document.createElement("li");
+          var text = (icons[d.kind] || "•") + " " + d.text;
+          var li = seen[d.id];
+          if (li) { li.textContent = text; return; }  // a repeat, now counted
+          li = document.createElement("li");
           li.className = "plog-" + (d.kind || "log");
-          li.textContent = (icons[d.kind] || "•") + " " + d.text;
+          li.textContent = text;
+          seen[d.id] = li;
           el.appendChild(li);
           el.scrollTop = el.scrollHeight;
         });
@@ -36,8 +76,11 @@
         function finish() {
           if (done) return;
           done = true;
+          clearInterval(ticker);
           es.close();
-          if (window.htmx) {
+          // Only redraw a panel that is still on screen. Reaching here because
+          // the operator closed it means the run's result is not wanted back.
+          if (document.body.contains(el) && window.htmx) {
             htmx.ajax("GET", "/" + kind + "/status/" + id,
                       { target: "#command-panel", swap: "innerHTML" });
           }

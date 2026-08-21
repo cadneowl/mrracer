@@ -217,11 +217,15 @@ ask for tool permissions. Run the skill with permissions pre-resolved:
   inside a locked-down sandbox with no internal-network access and no secrets in
   the environment.
 - `--output-format stream-json --verbose` — makes Claude emit live events, so
-  the modal shows **real-time progress** (a log of tool uses and drafting) while
-  the run is in flight, then renders the final result. radar reads the child's
-  stdout line-by-line and streams it to the browser over SSE. Commands that
-  don't speak stream-json still work — their stdout lines become the progress
-  log; they just aren't as granular.
+  the modal shows **real-time progress** while the run is in flight, then
+  renders the final result. radar reads the child's stdout line-by-line and
+  streams it to the browser over SSE. Each tool use is logged with what it is
+  actually doing (`Bash: git diff --stat`, `Grep: TODO in radar/`) rather than
+  just the tool's name, an immediate repeat collapses into a count (`×3`) so a
+  loop doesn't scroll the log away, and the panel counts down the time left of
+  that skill's `timeout_seconds`. Commands that don't speak stream-json still
+  work — their stdout lines become the progress log; they just aren't as
+  granular. The countdown shows for those too.
 
 Authentication comes from your normal Claude Code setup (`~/.claude/settings.json`
 gateway/token, or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the
