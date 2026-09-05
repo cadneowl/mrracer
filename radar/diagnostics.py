@@ -13,7 +13,13 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Config, ConfigError, gitlab_credentials, jira_credentials
+from .config import (
+    Config,
+    ConfigError,
+    gitlab_credentials,
+    jenkins_credentials,
+    jira_credentials,
+)
 from .db import Database
 from .dotenv import candidates, load_dotenv
 from .skillcontext import resolve_inputs, resolve_source
@@ -26,6 +32,12 @@ class Check:
     name: str
     status: str  # ok / warn / fail / skip
     detail: str
+
+
+# Per-job ceiling for the Jenkins check. Deliberately below the 10s the
+# background monitor allows itself: nothing is printed until every check has
+# returned, so this one is bounded by what a person will sit and watch.
+_JENKINS_CHECK_TIMEOUT_S = 5
 
 
 def _first_token(command: str) -> str | None:
@@ -169,26 +181,32 @@ def _check_jenkins(config: Config) -> list[Check]:
     if not config.jenkins.jobs:
         return [Check("jenkins", "skip", "no jobs configured")]
 
-    from .jenkins import NEVER, UNKNOWN, JenkinsClient, map_status
+    from .jenkins import NEVER, UNKNOWN, JenkinsClient, JobStatus, fetch_all
 
-    user = os.environ.get("JENKINS_USER", "").strip()
-    secret = os.environ.get("JENKINS_TOKEN", "").strip()
-    if user and secret:
-        out = [Check("jenkins.env", "ok", f"authenticated as {user}")]
-    elif user or secret:
-        # Half a credential is the failure that looks like no credential at all.
-        missing = "JENKINS_TOKEN" if user else "JENKINS_USER"
-        out = [Check("jenkins.env", "warn", f"{missing} is not set — connecting anonymously")]
+    credentials = jenkins_credentials()
+    if credentials:
+        out = [Check("jenkins.env", "ok", f"authenticated as {credentials[0]}")]
     else:
-        out = [Check("jenkins.env", "skip", "no credentials set — connecting anonymously")]
+        # jenkins_credentials() folds a half-set pair into "anonymous", which is
+        # the right call for the client and the wrong thing to say here: one of
+        # the two set alone is a mistake that looks exactly like setting neither.
+        half = [n for n in ("JENKINS_USER", "JENKINS_TOKEN") if os.environ.get(n, "").strip()]
+        if half:
+            missing = "JENKINS_TOKEN" if half[0] == "JENKINS_USER" else "JENKINS_USER"
+            out = [Check("jenkins.env", "warn", f"{missing} is not set — connecting anonymously")]
+        else:
+            out = [Check("jenkins.env", "skip", "no credentials set — connecting anonymously")]
 
-    client = JenkinsClient(credentials=(user, secret) if user and secret else None)
+    # Shorter than the background loop's budget, and fetched together: this is a
+    # one-shot report an operator is watching, and `run_checks` prints nothing
+    # until every check has returned.
+    client = JenkinsClient(credentials=credentials, timeout=_JENKINS_CHECK_TIMEOUT_S)
+    results = fetch_all(client, config.jenkins.jobs)
     for job in config.jenkins.jobs:
         name = f"jenkins.job[{job.name}]"
-        try:
-            status = map_status(client.fetch(job), job)
-        except Exception as exc:  # noqa: BLE001 - report, never crash the run
-            out.append(Check(name, "fail", f"{job.url}: {exc}"))
+        status = results[job.name]
+        if not isinstance(status, JobStatus):
+            out.append(Check(name, "fail", f"{job.url}: {status}"))
             continue
         if status.state == UNKNOWN:
             out.append(Check(name, "fail", f"{job.url}: {status.message}"))

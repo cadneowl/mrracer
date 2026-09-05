@@ -730,8 +730,14 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
         name = _job_name(entry, url)
         if name in seen:
             # Names key the strip's chips, and two chips with one name is a board
-            # nobody can read.
-            raise ConfigError(f"{ctx}: duplicate job name {name!r}")
+            # nobody can read. Say how to fix it: the default name is the job's
+            # last path segment, so watching the `main` branch of two
+            # multibranch projects collides without either entry looking wrong.
+            raise ConfigError(
+                f"{ctx}: duplicate job name {name!r} — give one of them an explicit "
+                "'name:' (the default is the job's last path segment, so two jobs "
+                "ending in the same branch name collide)"
+            )
         seen.add(name)
         jobs.append(JenkinsJob(name=name, url=url))
     return JenkinsConfig(jobs=tuple(jobs), poll_interval_seconds=interval)

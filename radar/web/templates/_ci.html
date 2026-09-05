@@ -16,7 +16,7 @@
     <span class="ci-dot dot-{{ job.state }}"></span>
     {% endif %}
     <span class="ci-name">{{ job.name }}</span>
-    {% if job.stale %}<span class="ci-warn">!</span>{% endif %}
+    {% if job.warn %}<span class="ci-warn">!</span>{% endif %}
   </a>
   {% endfor %}
 

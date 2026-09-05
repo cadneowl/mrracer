@@ -7,6 +7,8 @@ or a monkeypatched urlopen for the two tests that are *about* the HTTP layer.
 from __future__ import annotations
 
 import base64
+import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
@@ -25,6 +27,7 @@ from radar.jenkins import (
     JenkinsClient,
     JenkinsError,
     JenkinsMonitor,
+    fetch_all,
     job_view,
     map_status,
     strip_view,
@@ -190,12 +193,47 @@ def test_refresh_survives_an_error_no_one_predicted():
     assert monitor.snapshot().jobs[0].state == UNKNOWN
 
 
-def test_the_strip_reads_in_configured_order_and_starts_out_honest():
+def test_the_strip_reads_in_configured_order():
     monitor = JenkinsMonitor([JOB, OTHER], _client())
-    view = strip_view(monitor.snapshot(), NOW)
+    assert [job["name"] for job in strip_view(monitor.snapshot(), NOW)["jobs"]] == [
+        "backend-ci",
+        "nightly-e2e",
+    ]
 
-    assert [job["name"] for job in view["jobs"]] == ["backend-ci", "nightly-e2e"]
-    assert view["checked"] == "checking…"  # no pass has completed yet
+
+def test_a_board_opened_before_the_first_pass_does_not_cry_outage():
+    """The chips are unknown for the second before the first pass lands, but
+    that is radar not having looked yet — announcing an outage on every freshly
+    started board would teach people to ignore the real one."""
+    view = strip_view(JenkinsMonitor([JOB, OTHER], _client()).snapshot(), NOW)
+
+    assert view["summary"] == "checking…"
+    assert "unreachable" not in view["summary"]
+
+
+def test_jobs_are_fetched_together_rather_than_one_after_another():
+    """Serially a pass costs one timeout per unreachable job: at the minimum 15s
+    interval two dead jobs already overrun it, and the scheduler then drops the
+    passes it cannot start while the board silently ages."""
+    guard = threading.Lock()
+    state = {"inside": 0, "most_at_once": 0}
+
+    def getter(url: str) -> dict:
+        with guard:
+            state["inside"] += 1
+            state["most_at_once"] = max(state["most_at_once"], state["inside"])
+        try:
+            time.sleep(0.05)
+            return _payload(_build())
+        finally:
+            with guard:
+                state["inside"] -= 1
+
+    jobs = [JenkinsJob(f"j{i}", f"https://jenkins.example.com/job/j{i}") for i in range(4)]
+    results = fetch_all(JenkinsClient(getter=getter), jobs)
+
+    assert state["most_at_once"] > 1
+    assert [r.state for r in results.values()] == [SUCCESS] * 4
 
 
 def test_all_green_is_only_claimed_when_everything_is_green():
@@ -231,6 +269,38 @@ def test_a_running_build_shows_elapsed_against_the_usual_time():
     assert detail == "#129 · running 1m00s · usually 3m00s"
 
 
+def test_a_jenkins_clock_ahead_of_ours_never_renders_negative_elapsed():
+    """Routine drift between two hosts, and guaranteed for the first seconds of
+    a build when Jenkins' clock is a little fast. "running -42s" reads as a bug
+    in radar, not as a fact about the build."""
+    started_in_the_future = _build(129, None, building=True, ago_min=-2, duration_s=None)
+    detail = job_view(map_status(_payload(started_in_the_future), JOB), NOW)["detail"]
+
+    assert detail == "#129 · running 0s"
+
+
+def test_the_tree_query_asks_for_every_field_the_fixtures_carry():
+    """Jenkins returns exactly the fields `tree` names, so a fixture carrying one
+    the query never asks for exercises a payload production cannot receive. That
+    is how a missing `duration` hid: real tooltips lost "took 3m12s" and dated
+    builds from their start rather than their finish, and every test passed."""
+    from radar.jenkins import _TREE
+
+    requested = set(_TREE.split("lastBuild[", 1)[1].split("]", 1)[0].split(","))
+    assert set(_build(est_s=1)) <= requested
+
+
+def test_a_folder_url_is_flagged_rather_than_left_looking_like_a_new_job():
+    """Unknown and never-built both mean "no build to show", but only one of
+    them means radar could not tell — a misconfigured URL must not read as a
+    healthy job waiting for its first run."""
+    folder = job_view(map_status({"_class": "...Folder"}, JOB), NOW)
+    never = job_view(map_status(_payload(None), JOB), NOW)
+
+    assert (folder["state"], folder["warn"]) == (UNKNOWN, True)
+    assert (never["state"], never["warn"]) == (NEVER, False)
+
+
 # --- the HTTP layer --------------------------------------------------------
 
 
@@ -248,14 +318,23 @@ class _FakeResponse:
         return False
 
 
+def _answer_with(monkeypatch, body: bytes | BaseException, seen: list | None = None):
+    """Stand in for the network at the opener, which is the layer the client
+    actually calls (it builds its own, to strip auth across a redirect)."""
+
+    def fake_open(self, req, timeout=None):
+        if seen is not None:
+            seen.append(dict(req.headers))
+        if isinstance(body, BaseException):
+            raise body
+        return _FakeResponse(body)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+
+
 def test_credentials_are_sent_as_basic_auth_and_omitted_when_absent(monkeypatch):
     seen: list[dict] = []
-
-    def fake_urlopen(req, timeout=None):
-        seen.append(dict(req.headers))
-        return _FakeResponse(b'{"lastBuild": null}')
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _answer_with(monkeypatch, b'{"lastBuild": null}', seen)
 
     JenkinsClient(credentials=("ci-bot", "shhh")).fetch(JOB)
     JenkinsClient().fetch(JOB)
@@ -263,6 +342,48 @@ def test_credentials_are_sent_as_basic_auth_and_omitted_when_absent(monkeypatch)
     expected = "Basic " + base64.b64encode(b"ci-bot:shhh").decode()
     assert seen[0]["Authorization"] == expected
     assert "Authorization" not in seen[1]  # anonymous read, no header at all
+
+
+def test_a_redirect_off_the_host_does_not_carry_the_token(monkeypatch):
+    """urllib copies every header but content-length/content-type onto a
+    redirect target, so a Jenkins fronted by a proxy that 302s /api/json to an
+    SSO host would be handed radar's API token — for a host nobody named."""
+    from radar.jenkins import _DropAuthOffHost
+
+    handler = _DropAuthOffHost()
+    req = urllib.request.Request(
+        f"{JOB.url}/api/json", headers={"Authorization": "Basic zzz", "Accept": "*/*"}
+    )
+
+    off_host = handler.redirect_request(req, None, 302, "Found", {}, "https://sso.example.com/in")
+    same_host = handler.redirect_request(
+        req, None, 302, "Found", {}, "https://jenkins.example.com/job/hub/"
+    )
+
+    assert "Authorization" not in off_host.headers
+    assert off_host.headers["Accept"] == "*/*"  # only the credential is dropped
+    assert same_host.headers["Authorization"] == "Basic zzz"  # http->https still works
+
+
+def test_a_login_page_is_reported_as_auth_rather_than_as_an_outage(monkeypatch):
+    """An SSO proxy answers 200 with HTML, never a 4xx, so the status-code path
+    never fires — and "unreachable: Expecting value: line 1 column 1" sends the
+    operator hunting for a firewall."""
+    _answer_with(monkeypatch, b"<html><body>Please sign in</body></html>")
+
+    with pytest.raises(JenkinsError) as exc:
+        JenkinsClient().fetch(JOB)
+    assert "not JSON" in str(exc.value) and "JENKINS_USER" in str(exc.value)
+
+
+def test_a_connection_dying_mid_body_is_still_a_jenkins_error(monkeypatch):
+    """urlopen wraps connect-time failures in URLError, but the body is read
+    after it returns: a reset there (routine through a proxy) would otherwise
+    escape this module's contract as a raw traceback on every pass."""
+    _answer_with(monkeypatch, ConnectionResetError(104, "Connection reset by peer"))
+
+    with pytest.raises(JenkinsError, match="unreachable"):
+        JenkinsClient().fetch(JOB)
 
 
 def test_failure_messages_survive_a_windows_console():
@@ -281,10 +402,7 @@ def test_failure_messages_survive_a_windows_console():
     [(403, "JENKINS_USER"), (404, "not a build"), (500, "HTTP 500")],
 )
 def test_an_http_failure_says_what_to_do_about_it(monkeypatch, code, expected):
-    def boom(req, timeout=None):
-        raise urllib.error.HTTPError(req.full_url, code, "nope", {}, None)
-
-    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    _answer_with(monkeypatch, urllib.error.HTTPError(JOB.url, code, "nope", {}, None))
 
     with pytest.raises(JenkinsError) as exc:
         JenkinsClient().fetch(JOB)

@@ -276,7 +276,9 @@ def test_no_jenkins_block_means_no_strip(tmp_path):
         ("jenkins:\n  poll_interval_seconds: 5\n  jobs: []\n", ">= 15"),
         (
             "jenkins:\n  jobs:\n    - {url: 'https://j/job/a'}\n    - {url: 'https://j/job/a'}\n",
-            "duplicate job name",
+            # and says how to fix it: two multibranch projects' `main` branches
+            # would otherwise collide with neither entry looking wrong.
+            "give one of them an explicit 'name:'",
         ),
         (
             "jenkins:\n  base_url: https://j\n  jobs:\n    - {url: 'https://j/job/a', path: a}\n",

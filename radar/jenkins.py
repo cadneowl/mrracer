@@ -28,6 +28,7 @@ urllib, like ``jira_client``, so there is no new dependency and the CA bundle
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import logging
 import threading
@@ -35,8 +36,10 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
 
 from .config import JenkinsJob
 
@@ -74,9 +77,12 @@ _SUMMARY_WORD = (
     (UNKNOWN, "unreachable"),
 )
 
-# One request per job, carrying only what the strip renders.
+# One request per job, carrying only what the strip renders. Every field
+# `map_status`/`_status` reads has to be named here: Jenkins returns exactly
+# what the tree asks for, so a field left out arrives as absent rather than as
+# an error, and the chip quietly loses whatever it was for.
 _TREE = (
-    "displayName,lastBuild[number,building,result,timestamp,estimatedDuration],"
+    "displayName,lastBuild[number,building,result,timestamp,duration,estimatedDuration],"
     "lastCompletedBuild[number,result,timestamp,duration]"
 )
 
@@ -127,6 +133,23 @@ class Snapshot:
 # --- fetching --------------------------------------------------------------
 
 
+class _DropAuthOffHost(urllib.request.HTTPRedirectHandler):
+    """Strip the Authorization header from a redirect that leaves the host.
+
+    urllib copies every header but content-length/content-type onto the redirect
+    target, so a Jenkins fronted by a proxy that 302s ``/api/json`` to an SSO
+    host would be handed radar's API token — silently, and for a host the
+    operator never named. Same-host redirects (http -> https, a trailing slash)
+    keep it, which is the only case that needs it.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urlparse(newurl).netloc != urlparse(req.full_url).netloc:
+            new.headers.pop("Authorization", None)
+        return new
+
+
 class JenkinsClient:
     """Reads one job's status. ``getter`` is injectable so tests never use the network."""
 
@@ -145,6 +168,7 @@ class JenkinsClient:
             self._auth_header = f"Basic {encoded}"
         self._getter = getter or self._http_get
         self._timeout = timeout or self.HTTP_TIMEOUT_S
+        self._opener = urllib.request.build_opener(_DropAuthOffHost())
 
     @classmethod
     def from_env(cls) -> JenkinsClient:
@@ -161,13 +185,29 @@ class JenkinsClient:
             headers["Authorization"] = self._auth_header
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:  # noqa: S310
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
+            with self._opener.open(req, timeout=self._timeout) as resp:  # noqa: S310
+                body = resp.read()
+        except urllib.error.HTTPError as exc:  # a subclass of OSError: keep it first
             raise JenkinsError(_http_message(exc.code)) from None
-        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        except (OSError, http.client.HTTPException) as exc:
+            # OSError covers URLError and TimeoutError. HTTPException covers a
+            # response that dies *after* the headers (IncompleteRead,
+            # RemoteDisconnected) — routine through a proxy, and not something
+            # urlopen wraps, so without it a mid-body reset would escape this
+            # method's contract and reach the caller as a raw traceback.
             # Never the URL: it is long, and the reason is the useful half.
             raise JenkinsError(f"unreachable: {exc}") from None
+
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # A 200 that is not JSON is almost always an SSO login page, which
+            # never returns a 4xx — so without this the one diagnosis that
+            # actually helps would be reported as a network outage.
+            raise JenkinsError(
+                "answered with something that is not JSON — the URL may be reaching a "
+                f"login page rather than Jenkins itself; if so, {_AUTH_HINT}"
+            ) from None
 
 
 def _http_message(code: int) -> str:
@@ -243,6 +283,42 @@ def _status(job: JenkinsJob, state: str, build: dict, **extra) -> JobStatus:
     )
 
 
+# --- fetching every job ----------------------------------------------------
+
+_MAX_PARALLEL = 8
+
+
+def fetch_all(
+    client: JenkinsClient, jobs: Iterable[JenkinsJob]
+) -> dict[str, JobStatus | Exception]:
+    """Every job's status, fetched concurrently, keyed by job name.
+
+    Values are a ``JobStatus`` or the exception that job failed with — the
+    caller decides what a failure should look like (a dimmed chip here, a failed
+    check in ``radar check``), so nothing is swallowed on the way.
+
+    Concurrent because a pass costs one timeout per unreachable job when it is
+    serial: at the minimum 15s poll interval two dead jobs already overrun it,
+    and APScheduler then drops the firings it cannot start while the board keeps
+    ageing. These are independent GETs, so a pass now costs roughly one timeout
+    however many jobs there are.
+    """
+    jobs = list(jobs)
+    if not jobs:
+        return {}
+
+    def one(job: JenkinsJob) -> JobStatus | Exception:
+        try:
+            return map_status(client.fetch(job), job)
+        except Exception as exc:  # noqa: BLE001 - handed to the caller intact
+            return exc
+
+    with ThreadPoolExecutor(
+        max_workers=min(_MAX_PARALLEL, len(jobs)), thread_name_prefix="jenkins"
+    ) as pool:
+        return dict(zip((job.name for job in jobs), pool.map(one, jobs), strict=True))
+
+
 # --- the cache the board reads --------------------------------------------
 
 
@@ -270,17 +346,21 @@ class JenkinsMonitor:
         with self._lock:
             previous = dict(self._statuses)
 
+        fetch_all_result = fetch_all(self._client, self._jobs)
         fetched: dict[str, JobStatus] = {}
         for job in self._jobs:
-            try:
-                fetched[job.name] = map_status(self._client.fetch(job), job)
-            except Exception as exc:  # noqa: BLE001 - one job's outage is its own
-                reason = str(exc) if isinstance(exc, JenkinsError) else repr(exc)
-                if not isinstance(exc, JenkinsError):
-                    log.exception("jenkins job %s failed", job.name)
-                else:
-                    log.warning("jenkins job %s: %s", job.name, reason)
-                fetched[job.name] = _stale(previous.get(job.name), job, reason)
+            outcome = fetch_all_result[job.name]
+            if isinstance(outcome, JobStatus):
+                fetched[job.name] = outcome
+                continue
+            # One job's outage is its own: it goes stale, the rest still update.
+            if isinstance(outcome, JenkinsError):
+                reason = str(outcome)
+                log.warning("jenkins job %s: %s", job.name, reason)
+            else:
+                reason = repr(outcome)
+                log.error("jenkins job %s failed", job.name, exc_info=outcome)
+            fetched[job.name] = _stale(previous.get(job.name), job, reason)
 
         # Swapped in one go, so a pass in flight is never half on screen.
         with self._lock:
@@ -343,7 +423,10 @@ def _detail(status: JobStatus, now: datetime) -> str:
     if status.state == RUNNING:
         running = "running"
         if status.started_at:
-            running += f" {_dur(int((now - status.started_at).total_seconds()))}"
+            # Clamped like _ago: Jenkins' clock being a little ahead of ours is
+            # routine, and "running -42s" reads as a bug in radar.
+            elapsed = max(0, int((now - status.started_at).total_seconds()))
+            running += f" {_dur(elapsed)}"
         parts.append(running)
         if status.estimated_s:
             parts.append(f"usually {_dur(status.estimated_s)}")
@@ -378,6 +461,11 @@ def job_view(status: JobStatus, now: datetime) -> dict:
         # a running build still reads as red.
         "ring": (status.previous or UNKNOWN) if status.state == RUNNING else status.state,
         "stale": status.stale,
+        # Marked whenever radar does not actually know: a stale chip, and an
+        # unknown one (a folder URL, say) that never had a state to go stale
+        # from. Without it a misconfigured job looks like one awaiting its
+        # first build.
+        "warn": status.stale or status.state == UNKNOWN,
         "detail": _detail(status, now),
     }
 
@@ -385,13 +473,23 @@ def job_view(status: JobStatus, now: datetime) -> dict:
 def strip_view(snapshot: Snapshot, now: datetime | None = None) -> dict:
     """The whole CI strip: chips, a one-line summary, and how fresh it all is."""
     now = now or datetime.now(UTC)
+    jobs = [job_view(s, now) for s in snapshot.jobs]
+
+    if snapshot.checked_at is None:
+        # No pass has finished yet (the board opened in the second before the
+        # first one lands). Every chip is unknown, but that is radar not having
+        # looked rather than Jenkins being down, and announcing an outage on
+        # every freshly started board would train people to ignore the one real
+        # outage it is there to report.
+        return {"jobs": jobs, "summary": "checking…", "all_green": False, "checked": "checking…"}
+
     # A job radar could not reach counts as unreachable whatever it last said —
     # otherwise a total outage would leave the summary claiming "all green".
     counts = Counter(UNKNOWN if s.stale else s.state for s in snapshot.jobs)
     trouble = [f"{counts[state]} {word}" for state, word in _SUMMARY_WORD if counts[state]]
     return {
-        "jobs": [job_view(s, now) for s in snapshot.jobs],
+        "jobs": jobs,
         "summary": " · ".join(trouble) if trouble else "all green",
         "all_green": not trouble,
-        "checked": _ago(snapshot.checked_at, now) if snapshot.checked_at else "checking…",
+        "checked": _ago(snapshot.checked_at, now),
     }

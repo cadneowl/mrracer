@@ -70,16 +70,23 @@ body {
 .dot-success  { background: var(--green); }
 .dot-unstable { background: var(--amber); }
 .dot-failed   { background: var(--red);   }
-.dot-aborted  { background: var(--grey);  }
-/* Hollow: never built, or radar could not find out — visibly neither a pass
-   nor a failure. */
-.dot-never, .dot-unknown { background: transparent; border: 1px dashed var(--grey); }
-/* Reuses .spinner; the ring's top edge carries the previous result's colour. */
-.ci-spin { width: 11px; height: 11px; border-width: 2px; }
-.ring-success  { border-top-color: var(--green); }
-.ring-unstable { border-top-color: var(--amber); }
-.ring-failed   { border-top-color: var(--red);   }
-.ring-aborted, .ring-never, .ring-unknown { border-top-color: var(--grey); }
+.dot-aborted, .dot-never { background: var(--grey); }
+/* Hollow, and always carrying a "!": radar could not find out. Kept distinct
+   from the solid grey above, which is Jenkins telling us a build was aborted or
+   never ran — a misconfigured URL must not read as a healthy job awaiting its
+   first build. */
+.dot-unknown { background: transparent; border: 1px dashed var(--grey); }
+/* Reuses .spinner; the ring's top edge carries the previous result's colour.
+   Two-class selectors on purpose: .spinner is defined later in this file, so a
+   single-class rule here would lose the specificity tie and every running dot
+   would render 16px and green-ringed. (.refresh-btn .spinner does the same.) */
+.spinner.ci-spin { width: 11px; height: 11px; border-width: 2px; }
+.spinner.ring-success  { border-top-color: var(--green); }
+.spinner.ring-unstable { border-top-color: var(--amber); }
+.spinner.ring-failed   { border-top-color: var(--red);   }
+.spinner.ring-aborted,
+.spinner.ring-never,
+.spinner.ring-unknown  { border-top-color: var(--grey); }
 .ci-checked { color: var(--muted); margin-left: auto; }
 
 main { padding: 18px 22px; }
