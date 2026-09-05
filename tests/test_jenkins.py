@@ -7,6 +7,7 @@ or a monkeypatched urlopen for the two tests that are *about* the HTTP layer.
 from __future__ import annotations
 
 import base64
+import ssl
 import threading
 import time
 import urllib.error
@@ -365,6 +366,24 @@ def test_a_redirect_off_the_host_does_not_carry_the_token(monkeypatch):
     assert same_host.headers["Authorization"] == "Basic zzz"  # http->https still works
 
 
+def test_certificates_are_verified_unless_the_config_turns_it_off():
+    """Asserted on the SSL context the opener will actually use, rather than on
+    the flag having been passed: the whole value of the default is that it is
+    the connection that verifies, not that a boolean said so."""
+
+    def https_context(client: JenkinsClient) -> ssl.SSLContext:
+        handler = next(
+            h for h in client._opener.handlers if isinstance(h, urllib.request.HTTPSHandler)
+        )
+        return handler._context
+
+    default = https_context(JenkinsClient())
+    assert (default.verify_mode, default.check_hostname) == (ssl.CERT_REQUIRED, True)
+
+    unverified = https_context(JenkinsClient(verify_ssl=False))
+    assert (unverified.verify_mode, unverified.check_hostname) == (ssl.CERT_NONE, False)
+
+
 def test_a_login_page_is_reported_as_auth_rather_than_as_an_outage(monkeypatch):
     """An SSO proxy answers 200 with HTML, never a 4xx, so the status-code path
     never fires — and "unreachable: Expecting value: line 1 column 1" sends the
@@ -374,6 +393,24 @@ def test_a_login_page_is_reported_as_auth_rather_than_as_an_outage(monkeypatch):
     with pytest.raises(JenkinsError) as exc:
         JenkinsClient().fetch(JOB)
     assert "not JSON" in str(exc.value) and "JENKINS_USER" in str(exc.value)
+
+
+def test_a_certificate_failure_names_its_own_fix(monkeypatch):
+    """The host answered — calling it "unreachable" sends the reader hunting for
+    a firewall, which is exactly the round trip this message exists to save."""
+    verify_failed = ssl.SSLCertVerificationError(
+        "certificate verify failed: self-signed certificate in certificate chain"
+    )
+    _answer_with(monkeypatch, urllib.error.URLError(verify_failed))
+
+    with pytest.raises(JenkinsError) as exc:
+        JenkinsClient().fetch(JOB)
+
+    message = str(exc.value)
+    assert "certificate not trusted" in message
+    assert "SSL_CERT_FILE" in message and "verify_ssl" in message
+    assert "unreachable" not in message
+    message.encode("cp1252")  # it reaches `radar check`, which prints to one
 
 
 def test_a_connection_dying_mid_body_is_still_a_jenkins_error(monkeypatch):

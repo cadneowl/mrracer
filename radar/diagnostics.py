@@ -200,7 +200,23 @@ def _check_jenkins(config: Config) -> list[Check]:
     # Shorter than the background loop's budget, and fetched together: this is a
     # one-shot report an operator is watching, and `run_checks` prints nothing
     # until every check has returned.
-    client = JenkinsClient(credentials=credentials, timeout=_JENKINS_CHECK_TIMEOUT_S)
+    if not config.jenkins.verify_ssl:
+        out.append(
+            Check(
+                "jenkins.tls",
+                "warn",
+                "certificate verification is OFF (jenkins.verify_ssl: false) — any host "
+                "can present any certificate for these jobs, including one carrying "
+                "JENKINS_TOKEN. Pointing SSL_CERT_FILE at your CA keeps it on and fixes "
+                "GitLab and Jira too (see the tls.ca_bundle line above)",
+            )
+        )
+
+    client = JenkinsClient(
+        credentials=credentials,
+        timeout=_JENKINS_CHECK_TIMEOUT_S,
+        verify_ssl=config.jenkins.verify_ssl,
+    )
     results = fetch_all(client, config.jenkins.jobs)
     for job in config.jenkins.jobs:
         name = f"jenkins.job[{job.name}]"

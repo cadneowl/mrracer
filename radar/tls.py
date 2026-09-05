@@ -2,11 +2,11 @@
 
 Behind a TLS-inspecting proxy (Zscaler, Netskope, a corporate MITM appliance)
 every HTTPS call must trust the proxy's root certificate instead of the public
-roots. There is no one environment variable for that, and radar talks to its two
+roots. There is no one environment variable for that, and radar talks to its
 backends through two HTTP stacks that read *disjoint* sets:
 
-    GitLab   python-gitlab -> requests   reads REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE
-    Jira     urllib.request -> ssl       reads SSL_CERT_FILE, SSL_CERT_DIR
+    GitLab           python-gitlab -> requests   reads REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE
+    Jira, Jenkins    urllib.request -> ssl       reads SSL_CERT_FILE, SSL_CERT_DIR
 
 Neither stack looks at the other's variables. A proxy installer sets whichever
 one it favours, so exactly one half of radar works and the other half fails with
@@ -134,9 +134,12 @@ def ca_trust_state(env: MutableMapping[str, str] | None = None) -> tuple[str, st
         return next((_unquote(env[n].strip()) for n in names if (env.get(n) or "").strip()), "")
 
     gitlab = value("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
-    jira = value("SSL_CERT_FILE", "SSL_CERT_DIR")
+    # Jira and Jenkins share the urllib stack, so they share a verdict. Both are
+    # named in it: an operator whose Jenkins is failing on a certificate should
+    # not have to know which library it happens to use to recognise their line.
+    urllib_stack = value("SSL_CERT_FILE", "SSL_CERT_DIR")
 
-    if not gitlab and not jira:
+    if not gitlab and not urllib_stack:
         return "skip", "no CA bundle set; using the system trust store"
 
     # The two stacks disagree about what a missing bundle means, so the report
@@ -147,14 +150,14 @@ def ca_trust_state(env: MutableMapping[str, str] | None = None) -> tuple[str, st
             f"{gitlab} does not exist — requests refuses to run without the bundle it "
             "was pointed at, so every GitLab call fails"
         )
-    if jira and not Path(jira).exists():
+    if urllib_stack and not Path(urllib_stack).exists():
         return "warn", (
-            f"{jira} does not exist — it is ignored, so Jira falls back to the system "
-            "trust store and will fail if that store lacks your proxy's CA"
+            f"{urllib_stack} does not exist — it is ignored, so Jira and Jenkins fall back "
+            "to the system trust store and will fail if that store lacks your proxy's CA"
         )
-    if not gitlab or not jira:
-        blind = "GitLab (requests)" if not gitlab else "Jira (urllib)"
+    if not gitlab or not urllib_stack:
+        blind = "GitLab (requests)" if not gitlab else "Jira and Jenkins (urllib)"
         return "warn", f"{blind} has no CA bundle set while the other does"
-    if gitlab != jira:
-        return "warn", f"GitLab trusts {gitlab}, Jira trusts {jira}"
-    return "ok", f"{gitlab} (GitLab + Jira)"
+    if gitlab != urllib_stack:
+        return "warn", f"GitLab trusts {gitlab}, Jira and Jenkins trust {urllib_stack}"
+    return "ok", f"{gitlab} (GitLab + Jira + Jenkins)"

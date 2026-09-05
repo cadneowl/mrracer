@@ -169,6 +169,13 @@ class JenkinsConfig:
 
     jobs: tuple[JenkinsJob, ...] = ()
     poll_interval_seconds: int = 60
+    # An escape hatch for an internal Jenkins whose certificate chain radar
+    # cannot be made to trust. It switches verification off for every Jenkins
+    # call, so any host can present any certificate for these jobs — including
+    # to a run carrying JENKINS_TOKEN. Trusting the CA instead (SSL_CERT_FILE,
+    # see tls.py) keeps verification on and fixes every backend at once, so
+    # `radar check` reports this as a warning for as long as it is set.
+    verify_ssl: bool = True
 
 
 @dataclass(frozen=True)
@@ -717,6 +724,13 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
     if interval < _JENKINS_MIN_INTERVAL_S:
         raise ConfigError(f"jenkins.poll_interval_seconds: must be >= {_JENKINS_MIN_INTERVAL_S}")
 
+    verify_ssl = raw.get("verify_ssl", True)
+    if not isinstance(verify_ssl, bool):
+        # Strictly a bool: YAML reads `verify_ssl: "false"` as a true string,
+        # and silently verifying when the file says not to is the wrong way for
+        # this particular setting to be wrong.
+        raise ConfigError("jenkins.verify_ssl: expected true or false")
+
     jobs_raw = raw.get("jobs") or []
     if not isinstance(jobs_raw, list):
         raise ConfigError("jenkins.jobs: expected a list of job entries")
@@ -740,7 +754,9 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
             )
         seen.add(name)
         jobs.append(JenkinsJob(name=name, url=url))
-    return JenkinsConfig(jobs=tuple(jobs), poll_interval_seconds=interval)
+    return JenkinsConfig(
+        jobs=tuple(jobs), poll_interval_seconds=interval, verify_ssl=verify_ssl
+    )
 
 
 def _parse_teams(raw: object) -> tuple[Team, ...]:

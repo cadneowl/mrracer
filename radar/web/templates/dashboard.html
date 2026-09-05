@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>radar — review SLA board</title>
   <script src="/static/htmx.min.js"></script>
-  <link rel="stylesheet" href="/static/radar.css" />
+  {# ?v= is the file's own digest: an upgraded stylesheet is a new URL, so a
+     browser cannot answer it from the copy it cached before the upgrade. #}
+  <link rel="stylesheet" href="/static/radar.css?v={{ css_version }}" />
 </head>
 <body>
   <header class="topbar">

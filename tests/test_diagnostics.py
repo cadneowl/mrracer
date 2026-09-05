@@ -116,6 +116,22 @@ def test_jenkins_check_reports_a_job_it_cannot_read(tmp_path, monkeypatch):
     assert "403" in checks["jenkins.job[ci]"].detail
 
 
+def test_turning_off_certificate_verification_is_reported_every_run(tmp_path, monkeypatch):
+    """Set once in a config file, it is invisible forever after — so `radar
+    check` says it out loud for as long as it is on, and names the alternative."""
+    import radar.jenkins as jenkins_mod
+
+    monkeypatch.setattr(jenkins_mod.JenkinsClient, "fetch", lambda self, job: {"lastBuild": None})
+    checks = {c.name: c for c in _check_jenkins(_config(tmp_path, extra=_ONE_JOB))}
+    assert "jenkins.tls" not in checks  # nothing to say while it is verifying
+
+    off = _config(tmp_path, extra=_ONE_JOB + "  verify_ssl: false\n")
+    checks = {c.name: c for c in _check_jenkins(off)}
+
+    assert checks["jenkins.tls"].status == "warn"
+    assert "SSL_CERT_FILE" in checks["jenkins.tls"].detail  # says what to do instead
+
+
 def test_a_red_build_is_not_a_failed_check(tmp_path, monkeypatch):
     """A broken build is the news the strip exists to carry, not a sign radar is
     misconfigured — `radar check` must not start failing because CI is red."""

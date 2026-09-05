@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
+from radar import jenkins
 from radar.db import Database
 from radar.gitlab_client import FixtureSource
 from radar.jenkins import JenkinsClient, JenkinsMonitor
@@ -148,6 +153,69 @@ def test_without_jenkins_jobs_there_is_no_strip(config, tmp_path):
 
     assert 'id="ci-strip"' not in client.get("/").text
     assert client.get("/partials/ci").status_code == 404
+
+
+def _css() -> str:
+    return (Path(__file__).resolve().parent.parent / "radar/web/static/radar.css").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_every_state_the_strip_can_render_has_a_rule():
+    """The strip builds its classes at runtime — `dot-{{ job.state }}` — so a
+    state added to jenkins.py with no rule beside it renders as an invisible
+    zero-size span, and no assertion on the HTML would notice: the markup is
+    exactly right, it is the styling that is missing."""
+    css = _css()
+    states = [
+        jenkins.SUCCESS,
+        jenkins.UNSTABLE,
+        jenkins.FAILED,
+        jenkins.ABORTED,
+        jenkins.NEVER,
+        jenkins.UNKNOWN,
+    ]
+
+    assert [s for s in states if f".dot-{s}" not in css] == []
+    # RUNNING draws a spinner rather than a dot, ringed in the previous state.
+    assert [s for s in [*states, jenkins.UNKNOWN] if f".ring-{s}" not in css] == []
+
+
+def test_the_templates_use_no_class_the_stylesheet_never_heard_of():
+    """Catches the rename half-done in one file — the markup keeps saying
+    `ci-job` while the rule became something else, or the reverse."""
+    css_rules = set(re.findall(r"\.([a-zA-Z][\w-]*)", _css()))
+    # Hooks that deliberately carry no styling of their own: JS toggles them, or
+    # a parent selector reaches them, or they exist only to be found in a test.
+    styleless = {"chip-name", "ci-name", "col-mr", "col-obl", "mr-title", "stat-open"}
+
+    templates_dir = Path(__file__).resolve().parent.parent / "radar/web/templates"
+    unknown: dict[str, str] = {}
+    for template in sorted(templates_dir.glob("*.html")):
+        for attr in re.findall(r'class="([^"]*)"', template.read_text(encoding="utf-8")):
+            # Drop Jinja tags and interpolations; what is left is literal.
+            for token in re.sub(r"\{%.*?%\}|\{\{.*?\}\}", " ", attr, flags=re.S).split():
+                if re.fullmatch(r"[a-z][a-z0-9-]*[a-z0-9]", token) and token not in css_rules:
+                    unknown.setdefault(token, template.name)
+
+    assert {k: v for k, v in unknown.items() if k not in styleless} == {}
+
+
+def test_the_stylesheet_url_changes_when_the_stylesheet_does(config, tmp_path):
+    """Static files go out with an ETag and no Cache-Control, so the browser is
+    left to guess how long they stay fresh — and for a file months old it
+    guesses days, serving new markup against the rules from before the upgrade.
+    The digest in the URL is what stops that, so it has to actually be there."""
+    db_path = tmp_path / "assets.db"
+    Database(db_path).close()
+    client = TestClient(create_app(config, str(db_path)))
+
+    href = re.search(r'href="(/static/radar\.css[^"]*)"', client.get("/").text).group(1)
+    assert re.fullmatch(r"/static/radar\.css\?v=[0-9a-f]{12}", href)
+    assert client.get(href).status_code == 200  # the query does not break serving
+
+    digest = hashlib.sha256(_css().encode("utf-8")).hexdigest()[:12]
+    assert href.endswith(digest)  # this file's content, not a build number
 
 
 def test_refresh_is_absent_without_a_poller(config, tmp_path):
