@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
+import yaml
 
-from radar.config import ConfigError, gitlab_credentials, load_config
+from radar.config import ConfigError, _parse_jenkins, gitlab_credentials, load_config
 
 VALID = """
 gitlab:
@@ -259,6 +261,22 @@ def test_jenkins_jobs_take_a_url_or_a_path(tmp_path):
         # while the chip's label keeps it readable.
         "https://jenkins.example.com/job/hub/job/e2e/job/nightly%20build",
     ]
+
+
+def test_the_readme_example_for_adding_jobs_is_loadable_and_current():
+    """People copy the README's block, not only config.example.yaml, so it is
+    held to the same parser. It is also where the defaulted `name:` is promised
+    — exactly the kind of claim that quietly stops being true."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    block = re.search(r"#### Adding jobs.*?```yaml\n(.*?)```", readme, re.S)
+    assert block, "the README no longer shows how to add Jenkins jobs"
+
+    cfg = _parse_jenkins(yaml.safe_load(block.group(1))["jenkins"])
+
+    # Three entries, in the order listed, the last one's name defaulted as the
+    # comment beside it claims.
+    assert [j.name for j in cfg.jobs] == ["backend-ci", "nightly-e2e", "api"]
+    assert cfg.jobs[-1].url == "https://jenkins.example.com/job/platform/job/api"
 
 
 def test_no_jenkins_block_means_no_strip(tmp_path):

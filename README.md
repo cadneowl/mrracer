@@ -132,6 +132,38 @@ the URL in your config plus the build number, never from the URL Jenkins reports
 about itself — that one comes from its *Jenkins URL* setting and is routinely an
 internal host your browser cannot reach.
 
+#### Adding jobs
+
+Name as many as you like: one entry, one dot, left to right in the order you
+list them.
+
+```yaml
+jenkins:
+  base_url: https://jenkins.example.com   # only needed by `path:` entries
+  poll_interval_seconds: 60               # default 60, minimum 15
+  jobs:
+    # Either paste the job page straight out of your browser…
+    - name: backend-ci
+      url: https://jenkins.example.com/job/hub/job/backend/job/main/
+    # …or give the job path under base_url (folders nested with /).
+    - name: nightly-e2e
+      path: hub/e2e/nightly
+    # `name` is optional — this chip is labelled "api", the last path segment.
+    - path: platform/api
+```
+
+Point each entry at a **job**, not at a folder or the top of a multibranch
+project: those have no builds of their own, and `radar check` says so if you do.
+
+Watch out for the one collision this shape allows — the `main` branch job of two
+different multibranch projects, where both entries default to the name `main`.
+radar refuses to load rather than draw two chips with the same label, so give at
+least one of them an explicit `name:`.
+
+There's no limit on how many you list. They are fetched concurrently (eight at a
+time), so a pass costs about as long as the slowest job rather than the sum of
+them all, and one job hanging cannot delay the rest of the strip.
+
 A job radar cannot reach keeps its last known state, dimmed and flagged: a blip
 should not repaint the board grey, and the strip's one-line summary counts it as
 *unreachable* rather than as a pass, so a real outage never reads as "all green".
