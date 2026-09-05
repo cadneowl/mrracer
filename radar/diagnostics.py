@@ -13,7 +13,13 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Config, ConfigError, gitlab_credentials, jira_credentials
+from .config import (
+    Config,
+    ConfigError,
+    gitlab_credentials,
+    jenkins_credentials,
+    jira_credentials,
+)
 from .db import Database
 from .dotenv import candidates, load_dotenv
 from .skillcontext import resolve_inputs, resolve_source
@@ -26,6 +32,12 @@ class Check:
     name: str
     status: str  # ok / warn / fail / skip
     detail: str
+
+
+# Per-job ceiling for the Jenkins check. Deliberately below the 10s the
+# background monitor allows itself: nothing is printed until every check has
+# returned, so this one is bounded by what a person will sit and watch.
+_JENKINS_CHECK_TIMEOUT_S = 5
 
 
 def _first_token(command: str) -> str | None:
@@ -155,6 +167,56 @@ def _check_jira(config: Config) -> Check:
         return Check("jira.auth", "ok", f"authenticated as {who}")
     except Exception as exc:  # noqa: BLE001
         return Check("jira.auth", "fail", str(exc).splitlines()[0])
+
+
+def _check_jenkins(config: Config) -> list[Check]:
+    """Whether each watched job is reachable, and what it last did.
+
+    Here for the same reason as the GitLab checks: a job URL that points at a
+    folder, or a Jenkins that refuses anonymous reads, is a deployment problem,
+    and finding it here beats finding it as an inexplicably grey strip. A *red*
+    build is not a failure of this check — it is the news the strip exists to
+    carry, so it reports ok with the result named.
+    """
+    if not config.jenkins.jobs:
+        return [Check("jenkins", "skip", "no jobs configured")]
+
+    from .jenkins import NEVER, UNKNOWN, JenkinsClient, JobStatus, fetch_all
+
+    credentials = jenkins_credentials()
+    if credentials:
+        out = [Check("jenkins.env", "ok", f"authenticated as {credentials[0]}")]
+    else:
+        # jenkins_credentials() folds a half-set pair into "anonymous", which is
+        # the right call for the client and the wrong thing to say here: one of
+        # the two set alone is a mistake that looks exactly like setting neither.
+        half = [n for n in ("JENKINS_USER", "JENKINS_TOKEN") if os.environ.get(n, "").strip()]
+        if half:
+            missing = "JENKINS_TOKEN" if half[0] == "JENKINS_USER" else "JENKINS_USER"
+            out = [Check("jenkins.env", "warn", f"{missing} is not set — connecting anonymously")]
+        else:
+            out = [Check("jenkins.env", "skip", "no credentials set — connecting anonymously")]
+
+    # Shorter than the background loop's budget, and fetched together: this is a
+    # one-shot report an operator is watching, and `run_checks` prints nothing
+    # until every check has returned.
+    client = JenkinsClient(credentials=credentials, timeout=_JENKINS_CHECK_TIMEOUT_S)
+    results = fetch_all(client, config.jenkins.jobs)
+    for job in config.jenkins.jobs:
+        name = f"jenkins.job[{job.name}]"
+        status = results[job.name]
+        if not isinstance(status, JobStatus):
+            out.append(Check(name, "fail", f"{job.url}: {status}"))
+            continue
+        if status.state == UNKNOWN:
+            out.append(Check(name, "fail", f"{job.url}: {status.message}"))
+        elif status.state == NEVER:
+            out.append(Check(name, "warn", f"{job.url}: no builds yet"))
+        else:
+            out.append(
+                Check(name, "ok", f"last build #{status.build_number} {status.state} · {job.url}")
+            )
+    return out
 
 
 def _check_commands(config: Config) -> list[Check]:
@@ -317,6 +379,7 @@ def run_checks(config: Config, config_path: str | Path | None = None) -> list[Ch
     ]
     checks.extend(_check_gitlab(config))
     checks.append(_check_jira(config))
+    checks.extend(_check_jenkins(config))
     checks.extend(_check_commands(config))
     checks.extend(_check_skill_context(config))
     note = _check_note_parsing(config)

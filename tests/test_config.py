@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
+import yaml
 
-from radar.config import ConfigError, gitlab_credentials, load_config
+from radar.config import ConfigError, _parse_jenkins, gitlab_credentials, load_config
 
 VALID = """
 gitlab:
@@ -233,6 +235,79 @@ def test_bad_workday(tmp_path):
 def test_reviewer_timezone_lookup(tmp_path):
     cfg = load_config(_write(tmp_path, VALID))
     assert str(cfg.calendar.tz_for("anyone")) == "America/New_York"
+
+
+JENKINS = """
+jenkins:
+  base_url: https://jenkins.example.com/
+  poll_interval_seconds: 30
+  jobs:
+    - name: backend-ci
+      url: https://jenkins.example.com/job/hub/job/backend/job/main/
+    - path: hub/e2e/nightly build
+"""
+
+
+def test_jenkins_jobs_take_a_url_or_a_path(tmp_path):
+    """`url:` is what a browser gives you; `path:` is the shorthand. Both end as
+    the same absolute URL, trailing slash trimmed, ready to be linked."""
+    cfg = load_config(_write(tmp_path, VALID + JENKINS))
+
+    assert cfg.jenkins.poll_interval_seconds == 30
+    assert [j.name for j in cfg.jenkins.jobs] == ["backend-ci", "nightly build"]
+    assert [j.url for j in cfg.jenkins.jobs] == [
+        "https://jenkins.example.com/job/hub/job/backend/job/main",
+        # Folder nesting rebuilt, and a space in a job name escaped for the URL
+        # while the chip's label keeps it readable.
+        "https://jenkins.example.com/job/hub/job/e2e/job/nightly%20build",
+    ]
+
+
+def test_the_readme_example_for_adding_jobs_is_loadable_and_current():
+    """People copy the README's block, not only config.example.yaml, so it is
+    held to the same parser. It is also where the defaulted `name:` is promised
+    — exactly the kind of claim that quietly stops being true."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    block = re.search(r"#### Adding jobs.*?```yaml\n(.*?)```", readme, re.S)
+    assert block, "the README no longer shows how to add Jenkins jobs"
+
+    cfg = _parse_jenkins(yaml.safe_load(block.group(1))["jenkins"])
+
+    # Three entries, in the order listed, the last one's name defaulted as the
+    # comment beside it claims.
+    assert [j.name for j in cfg.jobs] == ["backend-ci", "nightly-e2e", "api"]
+    assert cfg.jobs[-1].url == "https://jenkins.example.com/job/platform/job/api"
+
+
+def test_no_jenkins_block_means_no_strip(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID))
+    assert cfg.jenkins.jobs == ()
+    assert cfg.jenkins.poll_interval_seconds == 60
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        ("jenkins:\n  jobs:\n    - {name: x}\n", "missing 'url'"),
+        ("jenkins:\n  jobs:\n    - {path: a/b}\n", "jenkins.base_url"),
+        ("jenkins:\n  jobs:\n    - {url: 'ftp://x/job/a'}\n", "http(s)"),
+        ("jenkins:\n  poll_interval_seconds: 5\n  jobs: []\n", ">= 15"),
+        (
+            "jenkins:\n  jobs:\n    - {url: 'https://j/job/a'}\n    - {url: 'https://j/job/a'}\n",
+            # and says how to fix it: two multibranch projects' `main` branches
+            # would otherwise collide with neither entry looking wrong.
+            "give one of them an explicit 'name:'",
+        ),
+        (
+            "jenkins:\n  base_url: https://j\n  jobs:\n    - {url: 'https://j/job/a', path: a}\n",
+            "not both",
+        ),
+    ],
+)
+def test_jenkins_config_mistakes_say_what_to_fix(tmp_path, block, expected):
+    with pytest.raises(ConfigError) as exc:
+        load_config(_write(tmp_path, VALID + block))
+    assert expected in str(exc.value)
 
 
 def test_credentials_missing(monkeypatch):

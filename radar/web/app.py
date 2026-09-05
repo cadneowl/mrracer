@@ -26,6 +26,7 @@ from ..commands import SNAPSHOT_KEYS, CommandJob, CommandRunner
 from ..config import Config
 from ..context import stdin_provider_for
 from ..db import Database
+from ..jenkins import JenkinsMonitor, strip_view
 from ..jira import extract_keys
 from ..service import build_dashboard, build_threads
 
@@ -61,6 +62,12 @@ def _sse(event: str, data: dict) -> str:
 
 _STREAM_TICK = 0.4      # seconds between progress polls on the SSE stream
 _CLOCK_EVERY = 12       # ticks between countdown re-anchors (~5s)
+
+# How often the browser re-reads the CI strip. This is a read of an in-process
+# cache, not a Jenkins call — Jenkins itself is polled on the scheduler's own
+# `jenkins.poll_interval_seconds` — so it is cheap enough to keep well under
+# that interval and leave the screen close to the cache.
+_CI_TICK_S = 15
 
 
 def _remaining_s(job: CommandJob | None, status: str | None = None) -> int | None:
@@ -102,6 +109,7 @@ def create_app(
     config: Config,
     db_path: str,
     poll_now: Callable[[], object] | None = None,
+    jenkins: JenkinsMonitor | None = None,
 ) -> FastAPI:
     """Build the dashboard app.
 
@@ -109,6 +117,11 @@ def create_app(
     what it found; ``radar serve`` passes the background poller's own pass.
     Without it (no GitLab credentials, or a test) the board is read-only over
     existing data and the refresh button is not offered.
+
+    ``jenkins`` is the CI strip's ``JenkinsMonitor``, kept fresh by the
+    background scheduler. The web layer only ever reads its snapshot: Jenkins is
+    never fetched while a request is waiting. None means no jobs are configured,
+    and no strip is rendered at all.
     """
     app = FastAPI(title="radar", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=str(_BASE / "static")), name="static")
@@ -131,6 +144,12 @@ def create_app(
         data["enabled_skills"] = [_skill_view(s) for s in config.skills if s.enabled]
         data["storing_skills"] = storing_skills
         return data
+
+    def _ci_view() -> dict | None:
+        """The CI strip from cache — no I/O, so the strip's own tick is free."""
+        if jenkins is None:
+            return None
+        return strip_view(jenkins.snapshot()) | {"tick_s": _CI_TICK_S}
 
     def _panel(request: Request, job, generated_at: str | None = None) -> HTMLResponse:
         skill = skills_by_name.get(job.kind)
@@ -184,7 +203,9 @@ def create_app(
         cookie = request.cookies.get(COOKIE_NAME) or None
         token = (view or None) if view is not None else cookie
 
-        resp = templates.TemplateResponse(request, "dashboard.html", context(token))
+        resp = templates.TemplateResponse(
+            request, "dashboard.html", context(token) | {"ci": _ci_view()}
+        )
         if view is not None:
             if token:
                 resp.set_cookie(COOKIE_NAME, token, max_age=COOKIE_MAX_AGE, samesite="lax")
@@ -197,6 +218,19 @@ def create_app(
         # Auto-refresh preserves the remembered filter via the cookie.
         token = request.cookies.get(COOKIE_NAME) or None
         return templates.TemplateResponse(request, "_board.html", context(token))
+
+    @app.get("/partials/ci", response_class=HTMLResponse)
+    def ci(request: Request):
+        """The CI strip's own refresh, on its own cadence.
+
+        Separate from the board partial on purpose: builds start and finish far
+        faster than the board's 60s tick, and the strip must not be swept away
+        with the board when someone changes the view filter.
+        """
+        view = _ci_view()
+        if view is None:
+            raise HTTPException(status_code=404, detail="no Jenkins jobs are configured")
+        return templates.TemplateResponse(request, "_ci.html", {"ci": view})
 
     @app.post("/refresh", response_class=HTMLResponse)
     def refresh(request: Request):

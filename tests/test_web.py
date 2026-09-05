@@ -6,8 +6,10 @@ from fastapi.testclient import TestClient
 
 from radar.db import Database
 from radar.gitlab_client import FixtureSource
+from radar.jenkins import JenkinsClient, JenkinsMonitor
 from radar.poller import poll_once
 from radar.web.app import create_app
+from tests.test_jenkins import _build, _payload
 from tests.test_poller import PID, PROJECT, _discussions, _mr
 
 
@@ -81,6 +83,71 @@ def test_refresh_polls_then_returns_the_new_board(config, tmp_path):
     assert len(polls) == 2
     assert "Add widget" in resp.text
     assert "dan" in resp.text
+
+
+def _jenkins(config, calls=None):
+    """A monitor over the fixture's two jobs, already refreshed once: backend-ci
+    red, nightly-e2e green."""
+    answers = {
+        "hub": _payload(_build(128, "FAILURE"), _build(128, "FAILURE")),
+        "e2e": _payload(_build(9, "SUCCESS"), _build(9, "SUCCESS")),
+    }
+
+    def getter(url: str) -> dict:
+        if calls is not None:
+            calls.append(url)
+        return next(payload for key, payload in answers.items() if f"/job/{key}" in url)
+
+    monitor = JenkinsMonitor(config.jenkins.jobs, JenkinsClient(getter=getter))
+    monitor.refresh()
+    return monitor
+
+
+def test_the_ci_strip_shows_a_dot_per_job_that_opens_the_build(jenkins_config, tmp_path):
+    db_path = tmp_path / "ci.db"
+    Database(db_path).close()
+    client = TestClient(
+        create_app(jenkins_config, str(db_path), jenkins=_jenkins(jenkins_config))
+    )
+
+    page = client.get("/").text
+    assert 'id="ci-strip"' in page
+    assert "backend-ci" in page and "nightly-e2e" in page
+    assert "dot-failed" in page and "dot-success" in page
+    # The link is the build, built from the configured job URL — click it and
+    # you land on the run that broke, not on a job page to hunt through.
+    assert "https://jenkins.example.com/job/hub/job/backend/job/main/128/" in page
+    assert "1 failed" in page  # the summary says so without reading the dots
+
+    partial = client.get("/partials/ci")
+    assert partial.status_code == 200
+    assert "nightly-e2e" in partial.text
+
+
+def test_the_strip_is_served_from_cache_never_a_live_fetch(jenkins_config, tmp_path):
+    """The guarantee the whole design rests on: a Jenkins call on the request
+    path would make every board render as slow as the slowest Jenkins."""
+    db_path = tmp_path / "ci-cache.db"
+    Database(db_path).close()
+    calls: list[str] = []
+    monitor = _jenkins(jenkins_config, calls)
+    assert len(calls) == 2  # the one background pass, one call per job
+
+    client = TestClient(create_app(jenkins_config, str(db_path), jenkins=monitor))
+    client.get("/")
+    client.get("/partials/ci")
+    client.get("/partials/board")
+
+    assert len(calls) == 2  # no request asked Jenkins anything
+
+
+def test_without_jenkins_jobs_there_is_no_strip(config, tmp_path):
+    db_path = tmp_path / "no-ci.db"
+    Database(db_path).close()
+    client = TestClient(create_app(config, str(db_path)))
+
+    assert 'id="ci-strip"' not in client.get("/").text
+    assert client.get("/partials/ci").status_code == 404
 
 
 def test_refresh_is_absent_without_a_poller(config, tmp_path):

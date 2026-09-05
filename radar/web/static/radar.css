@@ -48,6 +48,47 @@ body {
 .refresh-btn.htmx-request .refresh-busy { display: inline-flex; align-items: center; gap: 6px; }
 .refresh-btn .spinner { width: 11px; height: 11px; border-width: 2px; }
 
+/* CI strip — one dot per watched Jenkins job, between the topbar and the board.
+   It takes the topbar's panel/line treatment so it reads as part of the page
+   chrome rather than as the first row of the board. */
+.ci { padding: 8px 22px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.ci-inner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+.ci-label { color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+.ci-summary { color: var(--amber); font-weight: 600; }
+.ci-summary.is-ok { color: var(--green); }
+.ci-job {
+  display: inline-flex; align-items: center; gap: 7px; padding: 3px 11px;
+  border: 1px solid var(--line); border-radius: 20px; background: var(--panel);
+  color: var(--text); text-decoration: none;
+}
+.ci-job:hover { border-color: var(--green); }
+/* The last fetch failed: what's shown is the last thing radar knew, so it is
+   dimmed and flagged rather than presented as current. */
+.ci-job.is-stale { opacity: .55; }
+.ci-warn { color: var(--amber); font-weight: 700; }
+.ci-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.dot-success  { background: var(--green); }
+.dot-unstable { background: var(--amber); }
+.dot-failed   { background: var(--red);   }
+.dot-aborted, .dot-never { background: var(--grey); }
+/* Hollow, and always carrying a "!": radar could not find out. Kept distinct
+   from the solid grey above, which is Jenkins telling us a build was aborted or
+   never ran — a misconfigured URL must not read as a healthy job awaiting its
+   first build. */
+.dot-unknown { background: transparent; border: 1px dashed var(--grey); }
+/* Reuses .spinner; the ring's top edge carries the previous result's colour.
+   Two-class selectors on purpose: .spinner is defined later in this file, so a
+   single-class rule here would lose the specificity tie and every running dot
+   would render 16px and green-ringed. (.refresh-btn .spinner does the same.) */
+.spinner.ci-spin { width: 11px; height: 11px; border-width: 2px; }
+.spinner.ring-success  { border-top-color: var(--green); }
+.spinner.ring-unstable { border-top-color: var(--amber); }
+.spinner.ring-failed   { border-top-color: var(--red);   }
+.spinner.ring-aborted,
+.spinner.ring-never,
+.spinner.ring-unknown  { border-top-color: var(--grey); }
+.ci-checked { color: var(--muted); margin-left: auto; }
+
 main { padding: 18px 22px; }
 
 .people { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
