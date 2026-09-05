@@ -9,6 +9,7 @@ from radar.db import Database
 from radar.diagnostics import (
     _check_commands,
     _check_database,
+    _check_jenkins,
     _check_note_parsing,
     _first_token,
     run_checks,
@@ -91,6 +92,44 @@ def test_note_parsing_warns_on_backfill(tmp_path):
     c = _check_note_parsing(config)
     assert c.status == "warn"
     assert "backfill" in c.detail
+
+
+_ONE_JOB = "jenkins:\n  jobs:\n    - {name: ci, url: 'https://jenkins.example.com/job/ci'}\n"
+
+
+def test_jenkins_check_is_skipped_when_nothing_is_watched(tmp_path):
+    assert _check_jenkins(_config(tmp_path))[0].status == "skip"
+
+
+def test_jenkins_check_reports_a_job_it_cannot_read(tmp_path, monkeypatch):
+    """The point of checking here: a wrong URL or a Jenkins that refuses
+    anonymous reads should be named now, not discovered as a grey strip later."""
+    import radar.jenkins as jenkins_mod
+
+    def refuse(self, job):
+        raise jenkins_mod.JenkinsError("HTTP 403: not permitted")
+
+    monkeypatch.setattr(jenkins_mod.JenkinsClient, "fetch", refuse)
+    checks = {c.name: c for c in _check_jenkins(_config(tmp_path, extra=_ONE_JOB))}
+
+    assert checks["jenkins.job[ci]"].status == "fail"
+    assert "403" in checks["jenkins.job[ci]"].detail
+
+
+def test_a_red_build_is_not_a_failed_check(tmp_path, monkeypatch):
+    """A broken build is the news the strip exists to carry, not a sign radar is
+    misconfigured — `radar check` must not start failing because CI is red."""
+    import radar.jenkins as jenkins_mod
+
+    payload = {
+        "lastBuild": {"number": 128, "building": False, "result": "FAILURE", "timestamp": 1},
+        "lastCompletedBuild": {"number": 128, "result": "FAILURE", "timestamp": 1},
+    }
+    monkeypatch.setattr(jenkins_mod.JenkinsClient, "fetch", lambda self, job: payload)
+    checks = {c.name: c for c in _check_jenkins(_config(tmp_path, extra=_ONE_JOB))}
+
+    assert checks["jenkins.job[ci]"].status == "ok"
+    assert "#128 failed" in checks["jenkins.job[ci]"].detail
 
 
 def test_run_checks_flags_missing_gitlab(tmp_path, monkeypatch):

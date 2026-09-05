@@ -70,6 +70,25 @@ def assign_config(tmp_path):
     return load_config(path)
 
 
+_JENKINS_JOBS = """
+jenkins:
+  poll_interval_seconds: 30
+  jobs:
+    - name: backend-ci
+      url: https://jenkins.example.com/job/hub/job/backend/job/main
+    - name: nightly-e2e
+      url: https://jenkins.example.com/job/e2e
+"""
+
+
+@pytest.fixture
+def jenkins_config(tmp_path):
+    """The base config plus two watched Jenkins jobs — what turns the CI strip on."""
+    path = tmp_path / "config-jenkins.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS, encoding="utf-8")
+    return load_config(path)
+
+
 def ny(y, m, d, hh, mm=0) -> datetime:
     return datetime(y, m, d, hh, mm, tzinfo=NY)
 

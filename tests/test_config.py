@@ -235,6 +235,61 @@ def test_reviewer_timezone_lookup(tmp_path):
     assert str(cfg.calendar.tz_for("anyone")) == "America/New_York"
 
 
+JENKINS = """
+jenkins:
+  base_url: https://jenkins.example.com/
+  poll_interval_seconds: 30
+  jobs:
+    - name: backend-ci
+      url: https://jenkins.example.com/job/hub/job/backend/job/main/
+    - path: hub/e2e/nightly build
+"""
+
+
+def test_jenkins_jobs_take_a_url_or_a_path(tmp_path):
+    """`url:` is what a browser gives you; `path:` is the shorthand. Both end as
+    the same absolute URL, trailing slash trimmed, ready to be linked."""
+    cfg = load_config(_write(tmp_path, VALID + JENKINS))
+
+    assert cfg.jenkins.poll_interval_seconds == 30
+    assert [j.name for j in cfg.jenkins.jobs] == ["backend-ci", "nightly build"]
+    assert [j.url for j in cfg.jenkins.jobs] == [
+        "https://jenkins.example.com/job/hub/job/backend/job/main",
+        # Folder nesting rebuilt, and a space in a job name escaped for the URL
+        # while the chip's label keeps it readable.
+        "https://jenkins.example.com/job/hub/job/e2e/job/nightly%20build",
+    ]
+
+
+def test_no_jenkins_block_means_no_strip(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID))
+    assert cfg.jenkins.jobs == ()
+    assert cfg.jenkins.poll_interval_seconds == 60
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        ("jenkins:\n  jobs:\n    - {name: x}\n", "missing 'url'"),
+        ("jenkins:\n  jobs:\n    - {path: a/b}\n", "jenkins.base_url"),
+        ("jenkins:\n  jobs:\n    - {url: 'ftp://x/job/a'}\n", "http(s)"),
+        ("jenkins:\n  poll_interval_seconds: 5\n  jobs: []\n", ">= 15"),
+        (
+            "jenkins:\n  jobs:\n    - {url: 'https://j/job/a'}\n    - {url: 'https://j/job/a'}\n",
+            "duplicate job name",
+        ),
+        (
+            "jenkins:\n  base_url: https://j\n  jobs:\n    - {url: 'https://j/job/a', path: a}\n",
+            "not both",
+        ),
+    ],
+)
+def test_jenkins_config_mistakes_say_what_to_fix(tmp_path, block, expected):
+    with pytest.raises(ConfigError) as exc:
+        load_config(_write(tmp_path, VALID + block))
+    assert expected in str(exc.value)
+
+
 def test_credentials_missing(monkeypatch):
     monkeypatch.delenv("GITLAB_URL", raising=False)
     monkeypatch.delenv("GITLAB_TOKEN", raising=False)

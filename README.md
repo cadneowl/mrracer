@@ -113,6 +113,41 @@ auto-refresh and reloads with it, so a thread resolved mid-read updates in place
 > MRs that haven't changed since the last pass — which is exactly the quiet,
 > stalled MR whose threads you most want to read.
 
+### Build and test health (Jenkins)
+
+Above the board, a **CI strip** carries one dot per Jenkins job you name in
+config — the builds and suites the team actually watches:
+
+| Dot | Meaning |
+|-----|---------|
+| 🟢 **green** | the last build passed |
+| 🟠 **amber** | `UNSTABLE` — it built, tests failed |
+| 🔴 **red** | `FAILURE` |
+| ⚪ **grey** | aborted, or never built |
+| **spinner** | a build is running, ringed in the *last* result's colour — a build running over a red job still reads as red |
+| **dashed grey + `!`** | radar could not reach Jenkins |
+
+Click a dot and that job's latest build opens in Jenkins. The link is built from
+the URL in your config plus the build number, never from the URL Jenkins reports
+about itself — that one comes from its *Jenkins URL* setting and is routinely an
+internal host your browser cannot reach.
+
+A job radar cannot reach keeps its last known state, dimmed and flagged: a blip
+should not repaint the board grey, and the strip's one-line summary counts it as
+*unreachable* rather than as a pass, so a real outage never reads as "all green".
+
+Jenkins is polled in the background (`jenkins.poll_interval_seconds`, default 60,
+minimum 15) into an in-process cache, and every page render reads that cache — a
+slow or hung Jenkins can never slow the board down. The strip refreshes itself
+every 15s, independently of the board's 60s tick and of whichever view filter is
+on, because builds start and finish faster than a minute.
+
+radar only ever **reads** Jenkins: no triggering, re-running, or cancelling.
+Anonymous by default; set `JENKINS_USER` / `JENKINS_TOKEN` if your Jenkins needs
+a login. `radar check` reports every job — reachable, what it last did, and
+whether the URL points at a folder or multibranch project rather than a branch
+job (the commonest way to get this wrong).
+
 ### Coach view (manager-only)
 
 Per the "no surveillance" principle, individual breach detail lives *only* on a
@@ -692,10 +727,12 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `skills[].env` / `skills[].env_unset` | Extra environment for that skill's subprocess, and names it must not inherit. Values export as written; a valueless key is refused (use `env_unset`). radar's own credentials are stripped and refused in both, in any case spelling. radar exports `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` to every skill unless you exported one yourself — the second removes the CLI's own 10-minute background-agent cutoff, leaving `timeout_seconds` as the only clock. See [Headless agents and background work](#headless-agents-and-background-work). |
 | `jira` | `base_url` (builds the `PROJ-123` browse links on the board) and `project_keys` (optional filter so `UTF-8`-shaped tokens aren't matched). Not a credential — fetching a ticket uses `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` from the environment. |
 | `teams` | Named GitLab-username groups; each becomes an *authored* / *to review* filter pill on the board. |
+| `jenkins` | The jobs behind the [CI strip](#build-and-test-health-jenkins). `base_url` (optional, only for `path:` jobs), `poll_interval_seconds` (default 60, minimum 15), and `jobs`: each takes `url` (the job page as your browser shows it) **or** `path` (its job path under `base_url`), plus an optional `name` for the chip (defaults to the job's own last path segment). Omit the block and there is no strip. Not a credential — a Jenkins that refuses anonymous reads takes `JENKINS_USER`/`JENKINS_TOKEN` from the environment. |
 | `gamification` | Consumed in Phase 3; carried verbatim for now. |
 
-Secrets are **never** in this file — only `GITLAB_URL` / `GITLAB_TOKEN` in the
-environment.
+Secrets are **never** in this file — only `GITLAB_URL` / `GITLAB_TOKEN` (plus
+`JIRA_*` for QA context, and `JENKINS_USER` / `JENKINS_TOKEN` for a Jenkins that
+needs a login) in the environment.
 
 ---
 
@@ -734,7 +771,10 @@ GitLab REST ─▶ gitlab_client ─▶ poller ─▶ [ events ]  (append-only, 
   derived: `resolved` is mutable state only GitLab knows).
 - `db.py` — hand-written SQLite repository (no ORM).
 - `derive.py` — replay events → obligation states.
-- `poller.py` / `scheduler.py` — ingestion and the in-process loop.
+- `poller.py` / `scheduler.py` — ingestion and the in-process loops.
+- `jenkins.py` — the CI strip: a small Jenkins client, the state table behind
+  the dots, and the background-refreshed cache every request renders from (no
+  request path ever calls Jenkins).
 - `service.py` / `web/` — read-side dashboard and recompute.
 
 > **Design note (extension):** clock fairness needs to know when the author
@@ -754,4 +794,6 @@ GitLab REST ─▶ gitlab_client ─▶ poller ─▶ [ events ]  (append-only, 
 ## Non-goals
 
 No reviewer auto-assignment, no GitLab webhooks (polling only), no auth layer
-(deploy on a trusted network), no AI/LLM features.
+(deploy on a trusted network), no AI/LLM features. radar reads Jenkins but never
+writes to it — no triggering, re-running, or cancelling builds — and the CI strip
+is team-level: per-MR pipeline status on each board row is a separate feature.

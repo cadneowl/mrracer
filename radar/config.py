@@ -11,6 +11,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -34,7 +35,15 @@ class ConfigError(Exception):
 # refused in a skill's own ``env:`` block, so neither path can hand a skill
 # radar's GitLab PAT or Jira login.
 SECRET_ENV_NAMES = frozenset(
-    {"GITLAB_TOKEN", "GITLAB_URL", "JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"}
+    {
+        "GITLAB_TOKEN",
+        "GITLAB_URL",
+        "JIRA_BASE_URL",
+        "JIRA_EMAIL",
+        "JIRA_API_TOKEN",
+        "JENKINS_USER",
+        "JENKINS_TOKEN",
+    }
 )
 
 
@@ -147,6 +156,22 @@ class JiraConfig:
 
 
 @dataclass(frozen=True)
+class JenkinsJob:
+    """One watched Jenkins job — a build or test suite shown on the CI strip."""
+
+    name: str  # the chip's label, and the key the strip is keyed by
+    url: str  # absolute job page URL, no trailing slash (what a browser opens)
+
+
+@dataclass(frozen=True)
+class JenkinsConfig:
+    """Which Jenkins jobs the board watches, and how often to ask Jenkins."""
+
+    jobs: tuple[JenkinsJob, ...] = ()
+    poll_interval_seconds: int = 60
+
+
+@dataclass(frozen=True)
 class Team:
     """A named group of GitLab usernames, used for board filters."""
 
@@ -169,6 +194,9 @@ class Config:
     jira: JiraConfig
     teams: tuple[Team, ...]
     gamification: dict  # consumed in Phase 3; carried verbatim for now
+    # Defaulted: a config with no `jenkins:` block simply has no CI strip, and
+    # every existing config predates the key.
+    jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
 
     def team_by_name(self, name: str) -> Team | None:
         for team in self.teams:
@@ -615,6 +643,100 @@ def _parse_jira(raw: object) -> JiraConfig:
     return JiraConfig(base_url=base_url or None, project_keys=tuple(str(k) for k in keys_raw))
 
 
+# Below this, a Jenkins fetch costs more than the answer is worth: one small
+# JSON per job is cheap but not free, and nothing on a build board changes
+# meaningfully inside a quarter of a minute.
+_JENKINS_MIN_INTERVAL_S = 15
+
+
+def _http_url(value: object, ctx: str) -> str:
+    """An absolute http(s) URL, trailing slash trimmed, or a ConfigError saying why.
+
+    The scheme is checked here rather than at render time because these URLs end
+    up as links on the board.
+    """
+    url = str(value).strip().rstrip("/")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ConfigError(f"{ctx}: expected an absolute http(s) URL, got {str(value)!r}")
+    return url
+
+
+def _job_url(entry: dict, base_url: str | None, ctx: str) -> str:
+    """One job's page URL: ``url:`` verbatim, or ``path:`` joined onto base_url."""
+    url, path = entry.get("url"), entry.get("path")
+    if url and path:
+        raise ConfigError(f"{ctx}: give either 'url' or 'path', not both")
+    if url:
+        return _http_url(url, f"{ctx}.url")
+    if not path:
+        raise ConfigError(
+            f"{ctx}: missing 'url' (the job page as your browser shows it) or 'path' "
+            "(the job path under jenkins.base_url, e.g. hub/backend/main)"
+        )
+    if not base_url:
+        raise ConfigError(
+            f"{ctx}.path: there is no jenkins.base_url to resolve it against — set one, "
+            "or give this job its full 'url' instead"
+        )
+    segments = [seg for seg in str(path).split("/") if seg]
+    if not segments:
+        raise ConfigError(f"{ctx}.path: expected a job path, e.g. hub/backend/main")
+    # Jenkins nests folders as /job/<a>/job/<b>, and a job name may contain spaces.
+    return base_url + "".join(f"/job/{quote(seg)}" for seg in segments)
+
+
+def _job_name(entry: dict, url: str) -> str:
+    """The chip's label: what the config says, else the job's own last segment."""
+    raw = entry.get("name")
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()
+    segments = [seg for seg in urlparse(url).path.split("/") if seg]
+    return unquote(segments[-1]) if segments else url
+
+
+def _parse_jenkins(raw: object) -> JenkinsConfig:
+    """Parse the optional ``jenkins:`` block behind the board's CI strip.
+
+    Absent, or present with no jobs, means no strip at all — radar never asks
+    Jenkins for anything it was not pointed at.
+    """
+    if raw is None:
+        return JenkinsConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("jenkins: expected a mapping")
+
+    base_raw = raw.get("base_url")
+    base_url = _http_url(base_raw, "jenkins.base_url") if base_raw else None
+
+    interval = raw.get("poll_interval_seconds", 60)
+    try:
+        interval = int(interval)
+    except (TypeError, ValueError):
+        raise ConfigError("jenkins.poll_interval_seconds: expected an integer") from None
+    if interval < _JENKINS_MIN_INTERVAL_S:
+        raise ConfigError(f"jenkins.poll_interval_seconds: must be >= {_JENKINS_MIN_INTERVAL_S}")
+
+    jobs_raw = raw.get("jobs") or []
+    if not isinstance(jobs_raw, list):
+        raise ConfigError("jenkins.jobs: expected a list of job entries")
+    jobs: list[JenkinsJob] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(jobs_raw):
+        ctx = f"jenkins.jobs[{i}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{ctx}: expected a mapping with 'url' or 'path'")
+        url = _job_url(entry, base_url, ctx)
+        name = _job_name(entry, url)
+        if name in seen:
+            # Names key the strip's chips, and two chips with one name is a board
+            # nobody can read.
+            raise ConfigError(f"{ctx}: duplicate job name {name!r}")
+        seen.add(name)
+        jobs.append(JenkinsJob(name=name, url=url))
+    return JenkinsConfig(jobs=tuple(jobs), poll_interval_seconds=interval)
+
+
 def _parse_teams(raw: object) -> tuple[Team, ...]:
     if raw is None:
         return ()
@@ -693,6 +815,7 @@ def load_config(path: str | Path) -> Config:
     # A declared `file:` input is written relative to the config that names it.
     skills = _parse_skills(raw, path.resolve().parent)
     jira = _parse_jira(raw.get("jira"))
+    jenkins = _parse_jenkins(raw.get("jenkins"))
     teams = _parse_teams(raw.get("teams"))
     gamification = raw.get("gamification") or {}
     if not isinstance(gamification, dict):
@@ -708,6 +831,7 @@ def load_config(path: str | Path) -> Config:
         jira=jira,
         teams=teams,
         gamification=gamification,
+        jenkins=jenkins,
     )
 
 
@@ -728,6 +852,20 @@ def gitlab_credentials() -> tuple[str, str]:
             "(a personal access token with the read_api scope)."
         )
     return url, token
+
+
+def jenkins_credentials() -> tuple[str, str] | None:
+    """Jenkins API login from the environment, or None for an anonymous read.
+
+    Returns (user, api_token) only when both are set: anonymous read access is
+    how most internal Jenkins instances are configured, and radar only ever
+    reads. Unlike GitLab, the *URL* is not read from here — a job URL is an
+    identifier rather than a secret, it belongs next to the job it names in
+    config.yaml, and JENKINS_URL is a name Jenkins sets inside its own agents.
+    """
+    user = os.environ.get("JENKINS_USER", "").strip()
+    secret = os.environ.get("JENKINS_TOKEN", "").strip()
+    return (user, secret) if user and secret else None
 
 
 def jira_credentials() -> tuple[str, str, str]:

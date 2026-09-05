@@ -7,7 +7,8 @@
     python -m radar check         validate config + GitLab/Jira/DB connectivity
 
 Secrets come only from the environment: GITLAB_URL / GITLAB_TOKEN, and (for QA
-context fetch) JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN.
+context fetch) JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN. A Jenkins that does
+not allow anonymous reads takes JENKINS_USER / JENKINS_TOKEN as well.
 """
 
 from __future__ import annotations
@@ -40,6 +41,20 @@ def _make_source(config):
     return GitLabSource(url, token)
 
 
+def _make_jenkins_monitor(config):
+    """The CI strip's cache, or None when the config names no Jenkins jobs.
+
+    Credentials are optional here, unlike GitLab's: an anonymous read is how
+    most internal Jenkins instances are set up, and `radar check` is where a
+    job that turns out to need a login gets reported.
+    """
+    if not config.jenkins.jobs:
+        return None
+    from .jenkins import JenkinsClient, JenkinsMonitor
+
+    return JenkinsMonitor(config.jenkins.jobs, JenkinsClient.from_env())
+
+
 def cmd_poll_once(args) -> int:
     config = load_config(args.config)
     with Database(str(config.database_path)) as db:
@@ -68,6 +83,7 @@ def cmd_recompute(args) -> int:
 def cmd_serve(args) -> int:
     import uvicorn
 
+    from .scheduler import PollRunner, add_jenkins_job, add_poll_job, make_scheduler
     from .web.app import create_app
 
     config = load_config(args.config)
@@ -75,24 +91,38 @@ def cmd_serve(args) -> int:
     # Ensure schema exists before the first request.
     Database(db_path).close()
 
+    scheduler = make_scheduler()
+
     # The poller is built first: the board's "refresh now" button runs the same
     # pass on demand, so the app needs a handle on it. No credentials -> no
     # runner -> the app serves read-only and hides the button.
     runner = None
-    scheduler = None
     try:
         source = _make_source(config)
-        from .scheduler import PollRunner, make_scheduler
-
         runner = PollRunner(config, db_path, lambda: source)
-        scheduler = make_scheduler(runner, config.gitlab.poll_interval_minutes)
-        scheduler.start()
-        log.info("background poller started (every %d min)", config.gitlab.poll_interval_minutes)
+        add_poll_job(scheduler, runner, config.gitlab.poll_interval_minutes)
+        log.info("background poller enabled (every %d min)", config.gitlab.poll_interval_minutes)
     except ConfigError as exc:
         log.warning("background poller disabled: %s", exc.args[0].splitlines()[0])
         log.warning("serving read-only from existing data; set GITLAB_URL/GITLAB_TOKEN to poll")
 
-    app = create_app(config, db_path, poll_now=runner.run if runner else None)
+    # Deliberately not inside that try: the CI strip has nothing to do with
+    # GitLab credentials, and a board that cannot poll can still watch Jenkins.
+    monitor = _make_jenkins_monitor(config)
+    if monitor is not None:
+        add_jenkins_job(scheduler, monitor, config.jenkins.poll_interval_seconds)
+        log.info(
+            "watching %d Jenkins job(s) (every %ds)",
+            len(config.jenkins.jobs),
+            config.jenkins.poll_interval_seconds,
+        )
+
+    if scheduler.get_jobs():
+        scheduler.start()
+
+    app = create_app(
+        config, db_path, poll_now=runner.run if runner else None, jenkins=monitor
+    )
 
     try:
         # Single worker on purpose: the poller (APScheduler) and the in-memory
@@ -100,7 +130,10 @@ def cmd_serve(args) -> int:
         # would start N pollers and split job state across processes.
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     finally:
-        if scheduler is not None:
+        # `running` rather than a None check: with neither GitLab credentials nor
+        # Jenkins jobs there is nothing to schedule, and shutting down a
+        # scheduler that was never started raises.
+        if scheduler.running:
             scheduler.shutdown(wait=False)
     return 0
 

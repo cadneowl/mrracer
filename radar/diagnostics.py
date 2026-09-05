@@ -157,6 +157,50 @@ def _check_jira(config: Config) -> Check:
         return Check("jira.auth", "fail", str(exc).splitlines()[0])
 
 
+def _check_jenkins(config: Config) -> list[Check]:
+    """Whether each watched job is reachable, and what it last did.
+
+    Here for the same reason as the GitLab checks: a job URL that points at a
+    folder, or a Jenkins that refuses anonymous reads, is a deployment problem,
+    and finding it here beats finding it as an inexplicably grey strip. A *red*
+    build is not a failure of this check — it is the news the strip exists to
+    carry, so it reports ok with the result named.
+    """
+    if not config.jenkins.jobs:
+        return [Check("jenkins", "skip", "no jobs configured")]
+
+    from .jenkins import NEVER, UNKNOWN, JenkinsClient, map_status
+
+    user = os.environ.get("JENKINS_USER", "").strip()
+    secret = os.environ.get("JENKINS_TOKEN", "").strip()
+    if user and secret:
+        out = [Check("jenkins.env", "ok", f"authenticated as {user}")]
+    elif user or secret:
+        # Half a credential is the failure that looks like no credential at all.
+        missing = "JENKINS_TOKEN" if user else "JENKINS_USER"
+        out = [Check("jenkins.env", "warn", f"{missing} is not set — connecting anonymously")]
+    else:
+        out = [Check("jenkins.env", "skip", "no credentials set — connecting anonymously")]
+
+    client = JenkinsClient(credentials=(user, secret) if user and secret else None)
+    for job in config.jenkins.jobs:
+        name = f"jenkins.job[{job.name}]"
+        try:
+            status = map_status(client.fetch(job), job)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the run
+            out.append(Check(name, "fail", f"{job.url}: {exc}"))
+            continue
+        if status.state == UNKNOWN:
+            out.append(Check(name, "fail", f"{job.url}: {status.message}"))
+        elif status.state == NEVER:
+            out.append(Check(name, "warn", f"{job.url}: no builds yet"))
+        else:
+            out.append(
+                Check(name, "ok", f"last build #{status.build_number} {status.state} · {job.url}")
+            )
+    return out
+
+
 def _check_commands(config: Config) -> list[Check]:
     out = []
     for skill in config.skills:
@@ -317,6 +361,7 @@ def run_checks(config: Config, config_path: str | Path | None = None) -> list[Ch
     ]
     checks.extend(_check_gitlab(config))
     checks.append(_check_jira(config))
+    checks.extend(_check_jenkins(config))
     checks.extend(_check_commands(config))
     checks.extend(_check_skill_context(config))
     note = _check_note_parsing(config)

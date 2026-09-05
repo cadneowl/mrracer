@@ -10,6 +10,10 @@
 #   JIRA_EMAIL      your Atlassian account email
 #   JIRA_API_TOKEN  an API token (id.atlassian.com -> Security -> API tokens)
 #
+# Only if your Jenkins refuses anonymous reads (see `jenkins:` below):
+#   JENKINS_USER    the account to read as
+#   JENKINS_TOKEN   its API token
+#
 # Behind a TLS-inspecting proxy (Zscaler & co.), point ONE of these at your
 # organisation's root cert and radar copies it to the rest at startup — GitLab
 # goes through requests and Jira through urllib, and they read different ones:
@@ -94,6 +98,34 @@ teams:
 jira:
   base_url: https://yourco.atlassian.net
   project_keys: [PROJ, BUG]
+
+# Jenkins jobs to watch. Each one becomes a dot in the CI strip above the board
+# — green passed, amber unstable (built, tests failed), red failed, grey aborted
+# or never built, a spinner while a build runs (ringed in the last result's
+# colour), and a dashed grey dot with a "!" when radar could not reach Jenkins.
+# Clicking a dot opens that job's latest build. Read-only: radar never triggers,
+# re-runs, or cancels anything.
+#
+# Name a job either way:
+#   url:   the job page exactly as your browser shows it (simplest — paste it)
+#   path:  its job path under base_url, e.g. hub/backend/main
+# `name` is the chip's label and defaults to the job's own last path segment.
+# Point at a *job*, not at a folder or the top of a multibranch project: those
+# have no builds of their own, and `radar check` says so if you do.
+#
+# Polling is measured in seconds, unlike GitLab's: a pass is one small JSON per
+# job, and a build that has just gone green should not sit spinning for minutes.
+# Minimum 15. If your Jenkins refuses anonymous reads, set JENKINS_USER and
+# JENKINS_TOKEN in the environment (an API token: Jenkins -> your user ->
+# Configure -> API token). Remove this block entirely and there is no strip.
+jenkins:
+  base_url: https://jenkins.example.com
+  poll_interval_seconds: 60
+  jobs:
+    - name: backend-ci
+      url: https://jenkins.example.com/job/hub/job/backend/job/main/
+    - name: nightly-e2e
+      path: hub/e2e/nightly
 
 # ---------------------------------------------------------------------------
 # Skills — every dashboard button, in one list.

@@ -48,6 +48,40 @@ body {
 .refresh-btn.htmx-request .refresh-busy { display: inline-flex; align-items: center; gap: 6px; }
 .refresh-btn .spinner { width: 11px; height: 11px; border-width: 2px; }
 
+/* CI strip — one dot per watched Jenkins job, between the topbar and the board.
+   It takes the topbar's panel/line treatment so it reads as part of the page
+   chrome rather than as the first row of the board. */
+.ci { padding: 8px 22px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.ci-inner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+.ci-label { color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+.ci-summary { color: var(--amber); font-weight: 600; }
+.ci-summary.is-ok { color: var(--green); }
+.ci-job {
+  display: inline-flex; align-items: center; gap: 7px; padding: 3px 11px;
+  border: 1px solid var(--line); border-radius: 20px; background: var(--panel);
+  color: var(--text); text-decoration: none;
+}
+.ci-job:hover { border-color: var(--green); }
+/* The last fetch failed: what's shown is the last thing radar knew, so it is
+   dimmed and flagged rather than presented as current. */
+.ci-job.is-stale { opacity: .55; }
+.ci-warn { color: var(--amber); font-weight: 700; }
+.ci-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.dot-success  { background: var(--green); }
+.dot-unstable { background: var(--amber); }
+.dot-failed   { background: var(--red);   }
+.dot-aborted  { background: var(--grey);  }
+/* Hollow: never built, or radar could not find out — visibly neither a pass
+   nor a failure. */
+.dot-never, .dot-unknown { background: transparent; border: 1px dashed var(--grey); }
+/* Reuses .spinner; the ring's top edge carries the previous result's colour. */
+.ci-spin { width: 11px; height: 11px; border-width: 2px; }
+.ring-success  { border-top-color: var(--green); }
+.ring-unstable { border-top-color: var(--amber); }
+.ring-failed   { border-top-color: var(--red);   }
+.ring-aborted, .ring-never, .ring-unknown { border-top-color: var(--grey); }
+.ci-checked { color: var(--muted); margin-left: auto; }
+
 main { padding: 18px 22px; }
 
 .people { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }

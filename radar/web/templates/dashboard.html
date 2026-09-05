@@ -31,6 +31,19 @@
     </div>
   </header>
 
+  {% if ci %}
+  {# Outside #board on purpose: the board's 60s swap (and every view-filter
+     change) replaces that element wholesale, and the build status is not a
+     property of whichever filter happens to be on. Builds also start and finish
+     faster than a minute, so the strip runs its own, shorter tick. #}
+  <section id="ci-strip" class="ci"
+           hx-get="/partials/ci"
+           hx-trigger="every {{ ci.tick_s }}s"
+           hx-swap="innerHTML">
+    {% include "_ci.html" %}
+  </section>
+  {% endif %}
+
   <main id="board"
         hx-get="/partials/board"
         hx-trigger="every 60s"

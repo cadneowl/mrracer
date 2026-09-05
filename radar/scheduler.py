@@ -1,8 +1,12 @@
-"""In-process polling loop via APScheduler.
+"""In-process polling loops via APScheduler.
 
-Used by ``radar serve`` to poll GitLab on the configured interval while the
-web server runs in the same process. Each run opens its own DB connection and
-data source so nothing long-lived is shared across threads.
+Used by ``radar serve`` to poll GitLab, and to refresh the CI strip's Jenkins
+cache, on their own intervals while the web server runs in the same process.
+Each GitLab pass opens its own DB connection and data source so nothing
+long-lived is shared across threads.
+
+The two are independent jobs on one scheduler: Jenkins is watched with or
+without GitLab credentials, and a config with neither starts no scheduler at all.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from .config import Config
 from .db import Database
 from .gitlab_client import MRSource
+from .jenkins import JenkinsMonitor
 from .poller import PollResult, poll_once
 
 log = logging.getLogger("radar.scheduler")
@@ -62,8 +67,12 @@ class PollRunner:
         return result
 
 
-def make_scheduler(runner: PollRunner, minutes: int) -> BackgroundScheduler:
-    scheduler = BackgroundScheduler(timezone="UTC")
+def make_scheduler() -> BackgroundScheduler:
+    """An empty scheduler. The caller adds the jobs this deployment actually has."""
+    return BackgroundScheduler(timezone="UTC")
+
+
+def add_poll_job(scheduler: BackgroundScheduler, runner: PollRunner, minutes: int) -> None:
     scheduler.add_job(
         runner.run,
         trigger="interval",
@@ -73,4 +82,24 @@ def make_scheduler(runner: PollRunner, minutes: int) -> BackgroundScheduler:
         max_instances=1,
         coalesce=True,
     )
-    return scheduler
+
+
+def add_jenkins_job(
+    scheduler: BackgroundScheduler, monitor: JenkinsMonitor, seconds: int
+) -> None:
+    """Keep the CI strip's cache fresh.
+
+    Measured in seconds rather than minutes: a pass is one small JSON per job,
+    and a build that has just gone green should not sit spinning for minutes.
+    ``max_instances``/``coalesce`` matter more here than for GitLab — a Jenkins
+    slow enough to overrun the interval would otherwise stack up passes.
+    """
+    scheduler.add_job(
+        monitor.refresh,
+        trigger="interval",
+        seconds=seconds,
+        id="jenkins",
+        next_run_time=datetime.now(UTC),  # the board should not open empty
+        max_instances=1,
+        coalesce=True,
+    )

@@ -1,0 +1,24 @@
+{# CI strip: one dot per watched Jenkins job, rendered from the monitor's cache
+   (never a live fetch). Swapped in whole by the strip's own htmx tick. #}
+<div class="ci-inner">
+  <span class="ci-label">CI</span>
+  <span class="ci-summary {% if ci.all_green %}is-ok{% endif %}">{{ ci.summary }}</span>
+
+  {% for job in ci.jobs %}
+  <a class="ci-job {% if job.stale %}is-stale{% endif %}"
+     href="{{ job.link }}" target="_blank" rel="noopener"
+     title="{{ job.name }} — {{ job.detail }} · opens in Jenkins">
+    {% if job.state == "running" %}
+    {# The ring carries the last result's colour: a build running over a red job
+       should not read as if the breakage were over. #}
+    <span class="spinner ci-spin ring-{{ job.ring }}"></span>
+    {% else %}
+    <span class="ci-dot dot-{{ job.state }}"></span>
+    {% endif %}
+    <span class="ci-name">{{ job.name }}</span>
+    {% if job.stale %}<span class="ci-warn">!</span>{% endif %}
+  </a>
+  {% endfor %}
+
+  <span class="ci-checked">checked {{ ci.checked }}</span>
+</div>
