@@ -285,6 +285,16 @@ def test_no_jenkins_block_means_no_strip(tmp_path):
     assert cfg.jenkins.poll_interval_seconds == 60
 
 
+def test_certificate_verification_is_on_unless_asked_otherwise(tmp_path):
+    """It has to be opt-in and explicit: an internal Jenkins whose chain cannot
+    be trusted any other way is a real situation, and a silent default would
+    make every other deployment quietly weaker to serve it."""
+    assert load_config(_write(tmp_path, VALID + JENKINS)).jenkins.verify_ssl is True
+
+    off = load_config(_write(tmp_path, VALID + JENKINS + "  verify_ssl: false\n"))
+    assert off.jenkins.verify_ssl is False
+
+
 @pytest.mark.parametrize(
     ("block", "expected"),
     [
@@ -302,6 +312,9 @@ def test_no_jenkins_block_means_no_strip(tmp_path):
             "jenkins:\n  base_url: https://j\n  jobs:\n    - {url: 'https://j/job/a', path: a}\n",
             "not both",
         ),
+        # YAML reads this as the string "false", which is true. Verifying anyway
+        # is the wrong way for *this* setting to be wrong, so it is refused.
+        ("jenkins:\n  verify_ssl: 'false'\n  jobs: []\n", "expected true or false"),
     ],
 )
 def test_jenkins_config_mistakes_say_what_to_fix(tmp_path, block, expected):

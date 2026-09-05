@@ -31,6 +31,7 @@ import base64
 import http.client
 import json
 import logging
+import ssl
 import threading
 import urllib.error
 import urllib.request
@@ -160,6 +161,7 @@ class JenkinsClient:
         credentials: tuple[str, str] | None = None,
         getter: Callable[[str], dict] | None = None,
         timeout: int | None = None,
+        verify_ssl: bool = True,
     ):
         self._auth_header = None
         if credentials:
@@ -168,13 +170,23 @@ class JenkinsClient:
             self._auth_header = f"Basic {encoded}"
         self._getter = getter or self._http_get
         self._timeout = timeout or self.HTTP_TIMEOUT_S
-        self._opener = urllib.request.build_opener(_DropAuthOffHost())
+
+        handlers: list[urllib.request.BaseHandler] = [_DropAuthOffHost()]
+        if not verify_ssl:
+            # For an internal Jenkins whose chain cannot be trusted any other
+            # way (see JenkinsConfig.verify_ssl). check_hostname must go first:
+            # setting CERT_NONE while it is on raises.
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            handlers.append(urllib.request.HTTPSHandler(context=context))
+        self._opener = urllib.request.build_opener(*handlers)
 
     @classmethod
-    def from_env(cls) -> JenkinsClient:
+    def from_env(cls, verify_ssl: bool = True) -> JenkinsClient:
         from .config import jenkins_credentials
 
-        return cls(credentials=jenkins_credentials())
+        return cls(credentials=jenkins_credentials(), verify_ssl=verify_ssl)
 
     def fetch(self, job: JenkinsJob) -> dict:
         return self._getter(f"{job.url}/api/json?tree={_TREE}")
@@ -190,6 +202,9 @@ class JenkinsClient:
         except urllib.error.HTTPError as exc:  # a subclass of OSError: keep it first
             raise JenkinsError(_http_message(exc.code)) from None
         except (OSError, http.client.HTTPException) as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(exc, ssl.SSLError) or isinstance(reason, ssl.SSLError):
+                raise JenkinsError(_tls_message(reason or exc)) from None
             # OSError covers URLError and TimeoutError. HTTPException covers a
             # response that dies *after* the headers (IncompleteRead,
             # RemoteDisconnected) — routine through a proxy, and not something
@@ -208,6 +223,20 @@ class JenkinsClient:
                 "answered with something that is not JSON — the URL may be reaching a "
                 f"login page rather than Jenkins itself; if so, {_AUTH_HINT}"
             ) from None
+
+
+def _tls_message(exc: BaseException) -> str:
+    """A certificate failure as the two things that actually fix it.
+
+    Reported apart from the other network errors because it is not one: the host
+    answered, and "unreachable" sends the reader looking for a firewall. Plain
+    ASCII, like every message that can reach a cp1252 console.
+    """
+    return (
+        f"certificate not trusted: {exc} - point SSL_CERT_FILE at the CA that signed it "
+        "(radar copies it to the other TLS variables at startup, and 'radar check' shows "
+        "what each stack trusts), or set jenkins.verify_ssl: false to stop verifying"
+    )
 
 
 def _http_message(code: int) -> str:

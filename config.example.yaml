@@ -118,9 +118,19 @@ jira:
 # Minimum 15. If your Jenkins refuses anonymous reads, set JENKINS_USER and
 # JENKINS_TOKEN in the environment (an API token: Jenkins -> your user ->
 # Configure -> API token). Remove this block entirely and there is no strip.
+#
+# Certificates are verified, like every other call radar makes. Behind a
+# TLS-inspecting proxy, or against an internal CA, point SSL_CERT_FILE at the
+# root (see the header of this file) — radar copies it to the other TLS
+# variables, so GitLab, Jira and Jenkins are all fixed at once and verification
+# stays on. `verify_ssl: false` is the last resort for a chain that cannot be
+# trusted any other way: it turns verification off for *every* Jenkins call, so
+# any host can present any certificate for these jobs — including to a request
+# carrying JENKINS_TOKEN. `radar check` warns for as long as it is set.
 jenkins:
   base_url: https://jenkins.example.com
   poll_interval_seconds: 60
+  # verify_ssl: false
   jobs:
     - name: backend-ci
       url: https://jenkins.example.com/job/hub/job/backend/job/main/

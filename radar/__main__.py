@@ -52,7 +52,16 @@ def _make_jenkins_monitor(config):
         return None
     from .jenkins import JenkinsClient, JenkinsMonitor
 
-    return JenkinsMonitor(config.jenkins.jobs, JenkinsClient.from_env())
+    if not config.jenkins.verify_ssl:
+        # Said out loud on every start, not just in `radar check`: a setting that
+        # weakens a connection should not be discoverable only by reading the
+        # config file someone else wrote months ago.
+        log.warning(
+            "jenkins.verify_ssl is false — Jenkins certificates are NOT verified; "
+            "any host can present any certificate for these jobs"
+        )
+    client = JenkinsClient.from_env(verify_ssl=config.jenkins.verify_ssl)
+    return JenkinsMonitor(config.jenkins.jobs, client)
 
 
 def cmd_poll_once(args) -> int:

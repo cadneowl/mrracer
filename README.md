@@ -164,6 +164,29 @@ There's no limit on how many you list. They are fetched concurrently (eight at a
 time), so a pass costs about as long as the slowest job rather than the sum of
 them all, and one job hanging cannot delay the rest of the strip.
 
+#### A Jenkins with a private certificate
+
+`CERTIFICATE_VERIFY_FAILED … self-signed certificate in certificate chain` means
+the chain is signed by a root your machine does not trust — a TLS-inspecting
+proxy, or an internal CA. The fix is to trust that root: point `SSL_CERT_FILE`
+at it and radar copies it to the other TLS variables at startup, so GitLab, Jira
+and Jenkins are all fixed by the one setting and every connection stays
+verified. See [Behind a TLS-inspecting proxy](#2-behind-a-tls-inspecting-proxy-zscaler--co)
+and the `tls.ca_bundle` line in `radar check`, which prints what each stack will
+actually trust.
+
+As a last resort, for a chain that cannot be trusted any other way:
+
+```yaml
+jenkins:
+  verify_ssl: false
+```
+
+That turns verification off for **every** Jenkins call, so any host can present
+any certificate for these jobs — including to a request carrying
+`JENKINS_TOKEN`. It is off by default, `radar serve` warns at startup while it
+is set, and `radar check` reports it as a warning for as long as it stays set.
+
 A job radar cannot reach keeps its last known state, dimmed and flagged: a blip
 should not repaint the board grey, and the strip's one-line summary counts it as
 *unreachable* rather than as a pass, so a real outage never reads as "all green".
@@ -671,13 +694,13 @@ file and which the shell overrode (names only, never values).
 ### 2. Behind a TLS-inspecting proxy (Zscaler & co.)
 
 Skip this unless HTTPS is intercepted on your network. If it is, every call must
-trust your organisation's root certificate — and radar reaches its two backends
+trust your organisation's root certificate — and radar reaches its backends
 through two HTTP stacks that read **different** environment variables:
 
 | Backend | Stack | Reads |
 |---|---|---|
 | GitLab | `python-gitlab` → `requests` | `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` |
-| Jira | `urllib` → `ssl` | `SSL_CERT_FILE`, `SSL_CERT_DIR` |
+| Jira, Jenkins | `urllib` → `ssl` | `SSL_CERT_FILE`, `SSL_CERT_DIR` |
 
 Neither looks at the other's. A proxy installer typically exports only
 `REQUESTS_CA_BUNDLE`, which is why the board can poll GitLab perfectly while the
@@ -760,6 +783,7 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `jira` | `base_url` (builds the `PROJ-123` browse links on the board) and `project_keys` (optional filter so `UTF-8`-shaped tokens aren't matched). Not a credential — fetching a ticket uses `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` from the environment. |
 | `teams` | Named GitLab-username groups; each becomes an *authored* / *to review* filter pill on the board. |
 | `jenkins` | The jobs behind the [CI strip](#build-and-test-health-jenkins). `base_url` (optional, only for `path:` jobs), `poll_interval_seconds` (default 60, minimum 15), and `jobs`: each takes `url` (the job page as your browser shows it) **or** `path` (its job path under `base_url`), plus an optional `name` for the chip (defaults to the job's own last path segment). Omit the block and there is no strip. Not a credential — a Jenkins that refuses anonymous reads takes `JENKINS_USER`/`JENKINS_TOKEN` from the environment. |
+| `jenkins.verify_ssl` | Defaults to `true`. `false` stops verifying Jenkins certificates entirely, for a private chain that cannot be trusted any other way — see [A Jenkins with a private certificate](#a-jenkins-with-a-private-certificate). Trusting the CA via `SSL_CERT_FILE` is the fix that keeps verification on and covers GitLab and Jira too; `radar check` warns while this is set. |
 | `gamification` | Consumed in Phase 3; carried verbatim for now. |
 
 Secrets are **never** in this file — only `GITLAB_URL` / `GITLAB_TOKEN` (plus
