@@ -8,6 +8,7 @@ holds no long-lived DB handle.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from collections.abc import Callable
@@ -32,6 +33,21 @@ from ..service import build_dashboard, build_threads
 
 _BASE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(_BASE / "templates"))
+
+
+def _asset_version(path: Path) -> str:
+    """A short digest of a static file, for cache-busting its URL.
+
+    StaticFiles answers with an ETag and a Last-Modified and no Cache-Control,
+    which leaves the browser to guess how long the file stays fresh — and the
+    usual guess is a fraction of the file's age, so a stylesheet that has been
+    on disk for months is reused for days without so much as a revalidation.
+    The page then renders new markup against old rules: every class added in the
+    upgrade has no styling at all, which looks like broken CSS rather than like
+    a cache. Putting the digest in the URL makes an upgraded file a different
+    URL, so it cannot be answered from a cache filled by the old one.
+    """
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
 
 COOKIE_NAME = "radar_view"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365  # 1 year
@@ -125,6 +141,9 @@ def create_app(
     """
     app = FastAPI(title="radar", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=str(_BASE / "static")), name="static")
+    # Read once at startup: the file cannot change under a running server
+    # without a restart bringing the new code that goes with it.
+    templates.env.globals["css_version"] = _asset_version(_BASE / "static" / "radar.css")
     skills_by_name = {s.name: s for s in config.skills}
     runners = {s.name: CommandRunner(s, s.name) for s in config.skills}
     enabled = {s.name: s.enabled for s in config.skills}
