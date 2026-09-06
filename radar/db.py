@@ -69,6 +69,19 @@ CREATE TABLE IF NOT EXISTS test_plans (
     PRIMARY KEY (project_id, mr_iid, kind)
 );
 
+-- Stored build-failure analyses, keyed by the build they explain. A new build
+-- number is a new row rather than an overwrite: the analysis of #128 is about
+-- #128's commits and #128's log, and showing it against #129 would be a
+-- confident answer to a question nobody asked.
+CREATE TABLE IF NOT EXISTS build_analyses (
+    job_name     TEXT NOT NULL,
+    build_number INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    PRIMARY KEY (job_name, build_number, kind)
+);
+
 -- Discussion threads, as GitLab currently has them. A cache like mr_snapshots,
 -- not truth: `resolved` is mutable state radar cannot derive, so each poll
 -- replaces an MR's rows outright rather than appending.
@@ -409,6 +422,42 @@ class Database:
             (project_id, mr_iid, kind, jira_keys, content, _now_utc_iso()),
         )
         self.conn.commit()
+
+    # --- build analyses ----------------------------------------------------
+
+    def save_build_analysis(
+        self, job_name: str, build_number: int, kind: str, content: str
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO build_analyses (job_name, build_number, kind, content, generated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(job_name, build_number, kind) DO UPDATE SET
+                content=excluded.content, generated_at=excluded.generated_at
+            """,
+            (job_name, build_number, kind, content, _now_utc_iso()),
+        )
+        self.conn.commit()
+
+    def get_build_analysis(self, job_name: str, build_number: int, kind: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM build_analyses WHERE job_name=? AND build_number=? AND kind=?",
+            (job_name, build_number, kind),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def analysed_builds(self) -> set[tuple[str, int, str]]:
+        """Every (job, build, skill) that has a stored analysis.
+
+        One read for the whole strip: it is asked on every render, and the table
+        holds one short row per build anyone has ever analysed.
+        """
+        return {
+            (r["job_name"], r["build_number"], r["kind"])
+            for r in self.conn.execute(
+                "SELECT job_name, build_number, kind FROM build_analyses"
+            )
+        }
 
     def get_test_plan(self, project_id: int, mr_iid: int, kind: str = "qa") -> dict | None:
         row = self.conn.execute(

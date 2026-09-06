@@ -43,6 +43,73 @@ def build_review_input(source, project_id: int, mr_iid: int) -> str:
     return "\n\n".join(parts)
 
 
+def build_jenkins_input(client, job, status, log_lines: int, number: int) -> str:
+    """Fetch what Jenkins knows about a broken build and format it for the skill.
+
+    Two pieces of evidence, in the order a person would want them: what changed
+    since the build last passed, and the end of the log where it failed. Both
+    come from Jenkins alone, so an analysis needs no GitLab or git access.
+
+    ``number`` is passed in rather than read off ``status``: when a build is
+    running over a broken one, the chip's own number is the *running* build and
+    the one being explained is the last that finished. Reading it here would
+    describe one build while every other part of the job named the other.
+    """
+    from .jenkins import RUNNING, commit_range, fetch_builds, fetch_log_tail
+
+    # For a job building over a failure, the state to report is what the build
+    # being analysed did, not what the job is doing now.
+    result = (status.previous or "unknown") if status.state == RUNNING else status.state
+    parts = [
+        f"# Jenkins build failure: {job.name} #{number}\n\n"
+        f"Result: {result.upper()}\n"
+        f"Build: {job.url}/{number}/"
+    ]
+
+    last_good, commits = commit_range(fetch_builds(client, job), number)
+    if commits:
+        since = f"the last successful build (#{last_good})" if last_good else "the builds on record"
+        listed = []
+        for commit in commits:
+            head = f"- `{commit.short_sha}` {commit.author} {commit.when}".rstrip()
+            body = f"\n  {commit.message}" if commit.message else ""
+            files = f"\n  files: {', '.join(commit.files)}" if commit.files else ""
+            listed.append(head + body + files)
+        note = (
+            ""
+            if last_good
+            else "\n\nNo successful build is within the window radar looked at, so these are "
+            "the changes it can see rather than the full range since it last passed."
+        )
+        parts.append(f"## Commits since {since}\n\n" + "\n".join(listed) + note)
+    else:
+        # Said out loud: an empty list is evidence too — it points at the
+        # environment rather than at the change, and a skill told nothing would
+        # have to guess which of the two it is.
+        parts.append(
+            "## Commits\n\nJenkins recorded no source changes for this build"
+            + (f" since the last successful one (#{last_good})." if last_good else ".")
+            + " The failure may be environmental (an agent, a dependency, a flaky test)"
+            " rather than something in the code."
+        )
+
+    log = fetch_log_tail(client, job, number, lines=log_lines)
+    if not log.has_end:
+        # Said plainly: the opening of a build is where it says what it is about
+        # to do, not why it failed, and an agent handed it without warning would
+        # reason confidently about the wrong part of the run.
+        scope = (
+            f"first {log.lines} lines — radar could not fetch the end of this log, "
+            "so the failure itself is NOT below"
+        )
+    elif log.truncated:
+        scope = f"last {log.lines} lines"
+    else:
+        scope = f"all {log.lines} lines"
+    parts.append(f"## Console log ({scope})\n\n```\n{log.text}\n```")
+    return "\n\n".join(parts)
+
+
 def _format_issue(key: str, issue: dict, child: bool = False) -> str:
     fields = issue.get("fields", {}) or {}
     summary = fields.get("summary", "")
@@ -101,6 +168,44 @@ def build_inputs_section(shown: dict) -> str:
         body = f"```\n{text}\n```" if "\n" in text else f"`{text}`"
         parts.append(f"### {name}\n\n{body}")
     return "\n\n".join(parts)
+
+
+def jenkins_stdin_provider_for(
+    kind: str,
+    config: Config,
+    client,
+    job,
+    status,
+    number: int,
+) -> Callable[[str, dict], str] | None:
+    """The stdin bundle for a build analysis.
+
+    A sibling of ``stdin_provider_for`` rather than a branch inside it: that
+    one's signature is (project_id, mr_iid, jira keys), which says nothing about
+    a build, and threading both subjects through one function would make each
+    caller read the other's parameters.
+    """
+    skill = config.skill_by_name(kind)
+    if skill is None:
+        return None
+    fetch = skill.include_context and "jenkins_build" in skill.contexts
+    has_declared = skill.source is not None or bool(skill.inputs)
+    if not fetch and not has_declared:
+        return None
+
+    def provider(source_root: str = "", inputs: dict | None = None) -> str:
+        parts = []
+        if fetch:
+            parts.append(
+                build_jenkins_input(client, job, status, config.jenkins.log_tail_lines, number)
+            )
+        if source_root:
+            parts.append(build_source_section(source_root))
+        if inputs:
+            parts.append(build_inputs_section(inputs))
+        return "\n\n".join(p for p in parts if p)
+
+    return provider
 
 
 def stdin_provider_for(

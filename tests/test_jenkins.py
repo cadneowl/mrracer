@@ -306,11 +306,15 @@ def test_a_folder_url_is_flagged_rather_than_left_looking_like_a_new_job():
 
 
 class _FakeResponse:
-    def __init__(self, body: bytes):
-        self._body = body
+    """Stands in for an HTTPResponse, including the two things radar uses of it:
+    a size-bounded read, and the response headers."""
 
-    def read(self) -> bytes:
-        return self._body
+    def __init__(self, body: bytes, headers: dict | None = None):
+        self._body = body
+        self.headers = headers or {}
+
+    def read(self, amount: int | None = None) -> bytes:
+        return self._body if amount is None else self._body[:amount]
 
     def __enter__(self):
         return self
