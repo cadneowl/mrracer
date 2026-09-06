@@ -25,9 +25,9 @@ from markupsafe import Markup
 from ..coach import build_coach
 from ..commands import SNAPSHOT_KEYS, CommandJob, CommandRunner
 from ..config import Config
-from ..context import stdin_provider_for
+from ..context import jenkins_stdin_provider_for, stdin_provider_for
 from ..db import Database
-from ..jenkins import JenkinsMonitor, strip_view
+from ..jenkins import JenkinsMonitor, analysable_build, strip_view
 from ..jira import extract_keys
 from ..service import build_dashboard, build_threads
 
@@ -153,22 +153,56 @@ def create_app(
 
     # Skills that persist output: the board shows a re-openable badge per skill
     # that has a stored result for a given MR (row.stored_kinds decides which).
-    storing_skills = [_skill_view(s) for s in config.skills if s.stores_result]
+    storing_skills = [
+        _skill_view(s) for s in config.skills if s.stores_result and not s.analyses_builds
+    ]
 
     def context(view: str | None) -> dict:
         with Database(db_path) as db:
             data = build_dashboard(db, config, view=view)
         data["poll_interval_minutes"] = config.gitlab.poll_interval_minutes
         data["can_refresh"] = poll_now is not None
-        data["enabled_skills"] = [_skill_view(s) for s in config.skills if s.enabled]
+        data["enabled_skills"] = [
+            _skill_view(s) for s in config.skills if s.enabled and not s.analyses_builds
+        ]
         data["storing_skills"] = storing_skills
         return data
 
+    # The skill launched from the CI strip, if one is configured and enabled.
+    # There is at most one: two analyse buttons on a chip that is already small
+    # would be a menu, and nobody has asked for a second opinion per build.
+    build_skill = next(
+        (s for s in config.skills if s.enabled and s.analyses_builds), None
+    )
+
     def _ci_view() -> dict | None:
-        """The CI strip from cache — no I/O, so the strip's own tick is free."""
+        """The CI strip from cache — no I/O beyond the stored-analysis lookup."""
         if jenkins is None:
             return None
-        return strip_view(jenkins.snapshot()) | {"tick_s": _CI_TICK_S}
+        analysed: set[tuple[str, int, str]] = set()
+        if build_skill is not None:
+            with Database(db_path) as db:
+                analysed = db.analysed_builds()
+        view = strip_view(
+            jenkins.snapshot(),
+            analysed=analysed,
+            skill=build_skill.name if build_skill else "",
+        )
+        return view | {
+            "tick_s": _CI_TICK_S,
+            "skill": _skill_view(build_skill) if build_skill else None,
+        }
+
+    def _jenkins_job(job_name: str):
+        """The configured job by that name, or a 404.
+
+        Looked up rather than trusted: the name arrives in a URL, and every
+        request that follows it reaches a URL built from the config entry.
+        """
+        job = next((j for j in config.jenkins.jobs if j.name == job_name), None)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"no Jenkins job named {job_name!r}")
+        return job
 
     def _panel(request: Request, job, generated_at: str | None = None) -> HTMLResponse:
         skill = skills_by_name.get(job.kind)
@@ -209,7 +243,7 @@ def create_app(
             [snap.get("title"), snap.get("source_branch"), snap.get("description")],
             config.jira.project_keys,
         )
-        ctx = {"project_id": project_id, "mr_iid": mr_iid}
+        ctx = {"project_id": project_id, "mr_iid": mr_iid, "subject": f"!{mr_iid}"}
         ctx.update({k: snap.get(k, "") for k in SNAPSHOT_KEYS})
         ctx["jira_keys"] = " ".join(keys)
         ctx["jira_keys_csv"] = ",".join(keys)
@@ -250,6 +284,66 @@ def create_app(
         if view is None:
             raise HTTPException(status_code=404, detail="no Jenkins jobs are configured")
         return templates.TemplateResponse(request, "_ci.html", {"ci": view})
+
+    # Declared ahead of the /{kind}/... routes, like /partials and /threads: a
+    # skill named "jenkins" cannot shadow these, and the order says so rather
+    # than leaving it to chance.
+    @app.post("/jenkins/{job_name}/analyze", response_class=HTMLResponse)
+    def analyze_build(request: Request, job_name: str):
+        """Run the build-analysis skill over the job's last failed build."""
+        if build_skill is None or jenkins is None:
+            raise HTTPException(status_code=404, detail="no build-analysis skill is enabled")
+        job = _jenkins_job(job_name)
+        status = next((s for s in jenkins.snapshot().jobs if s.name == job_name), None)
+        build = analysable_build(status) if status else None
+        if build is None:
+            # The chip stopped being broken between the render and the click —
+            # a build went green, or radar lost contact with Jenkins.
+            raise HTTPException(
+                status_code=409, detail=f"{job_name} has no failed build to analyse right now"
+            )
+
+        kind = build_skill.name
+        ctx = {
+            "jenkins_job": job.name,
+            "build_number": build,
+            "build_url": f"{job.url}/{build}/",
+            "title": job.name,
+            "subject": f"#{build}",
+        }
+        client = jenkins.client
+
+        def on_success(finished) -> None:
+            with Database(db_path) as db:
+                db.save_build_analysis(job.name, build, kind, finished.output)
+
+        provider = jenkins_stdin_provider_for(kind, config, client, job, status)
+        started = runners[kind].start(
+            ctx,
+            on_success=on_success if build_skill.stores_result else None,
+            stdin_provider=provider,
+        )
+        return _panel(request, started)
+
+    @app.get("/jenkins/{job_name}/analysis/{build}", response_class=HTMLResponse)
+    def stored_analysis(request: Request, job_name: str, build: int):
+        """Re-open the analysis already stored for that exact build."""
+        if build_skill is None:
+            raise HTTPException(status_code=404, detail="no build-analysis skill is enabled")
+        job = _jenkins_job(job_name)
+        with Database(db_path) as db:
+            stored = db.get_build_analysis(job.name, build, build_skill.name)
+        if stored is None:
+            raise HTTPException(status_code=404, detail="no stored analysis for that build")
+        job_record = CommandJob(
+            id="stored",
+            kind=build_skill.name,
+            subject=f"#{build}",
+            title=job.name,
+            status="done",
+            output=stored["content"],
+        )
+        return _panel(request, job_record, generated_at=stored["generated_at"])
 
     @app.post("/refresh", response_class=HTMLResponse)
     def refresh(request: Request):
@@ -371,7 +465,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="no stored result")
         job = CommandJob(
             id="stored", kind=kind, project_id=project_id, mr_iid=mr_iid,
-            title=f"{plan['jira_keys']}", status="done", output=plan["content"],
+            subject=f"!{mr_iid}", title=f"{plan['jira_keys']}",
+            status="done", output=plan["content"],
         )
         return _panel(request, job, generated_at=plan["generated_at"])
 

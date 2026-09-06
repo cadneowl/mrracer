@@ -164,6 +164,39 @@ There's no limit on how many you list. They are fetched concurrently (eight at a
 time), so a pass costs about as long as the slowest job rather than the sum of
 them all, and one job hanging cannot delay the rest of the strip.
 
+#### Analysing what broke it
+
+A chip whose last completed build did **not** pass carries a 🔎 button. Pressing
+it gathers what Jenkins knows about the failure and hands it to a skill, the way
+the review button hands over an MR diff:
+
+* the commits Jenkins recorded for every build since the job last passed — sha,
+  author, date, subject and the files each one touched;
+* the tail of the broken build's console log (`jenkins.log_tail_lines`, default
+  400), which is where a failure prints.
+
+The skill needs no Jenkins access of its own — radar fetches both and pipes them
+on stdin. Declare one by giving it the `jenkins_build` context; the name
+`analyze` inherits that, plus `stores_result` and `include_context`:
+
+```yaml
+skills:
+  - name: analyze
+    enabled: true
+    command: claude -p "/analyze-build"
+```
+
+The result streams into the same panel the review and QA buttons use, and is
+saved against that build number: the chip then shows a ✓ that re-opens it, so
+the next person reads the analysis instead of paying for it again. A new build
+number is a new question, and the ✓ goes away.
+
+A build running over a red one still offers the button — the breakage is the
+news, and the build analysed is the last one that finished. A job that has never
+built, or that radar cannot currently reach, has nothing to analyse and offers
+nothing. Only the tail of the log is fetched, by byte offset, so a
+hundred-megabyte log costs two small requests rather than a download.
+
 #### A Jenkins with a private certificate
 
 `CERTIFICATE_VERIFY_FAILED … self-signed certificate in certificate chain` means
@@ -778,11 +811,13 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `slas` | Ordered rules; **first match wins**. Each has a `match` (optional `target_branch` glob and/or required `labels`) and `first_response_business_hours` / `approval_business_hours`. The last rule must be the default `match: {}`. |
 | `slas[].assignment_business_hours` | Optional budget for getting **any** reviewer onto an MR that has none — the [NO REVIEWERS](#mrs-with-no-reviewers) chip. Omitted everywhere, the check is off. Set it on **every** rule or none: first match wins outright, so a partial config would silently skip MRs matching the rules that lack it (radar refuses to load one). |
 | `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is **currently** a draft, or the MR carries any `labels` listed here. (Only the current draft state waives; historical draft periods are not subtracted from the clock.) |
-| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `env`, `env_unset`. The names `review` and `qa` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
+| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `env`, `env_unset`. The names `review`, `qa` and `analyze` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
+| `skills[].context` | Which backends radar fetches for the skill and pipes to it on stdin: `gitlab_diff`, `jira`, `jenkins_build`, or a list. `jenkins_build` also moves the skill: it is launched from the CI strip's 🔎 button on a broken job rather than from a merge-request row, and `checkout: worktree` is refused for it. |
 | `skills[].env` / `skills[].env_unset` | Extra environment for that skill's subprocess, and names it must not inherit. Values export as written; a valueless key is refused (use `env_unset`). radar's own credentials are stripped and refused in both, in any case spelling. radar exports `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` to every skill unless you exported one yourself — the second removes the CLI's own 10-minute background-agent cutoff, leaving `timeout_seconds` as the only clock. See [Headless agents and background work](#headless-agents-and-background-work). |
 | `jira` | `base_url` (builds the `PROJ-123` browse links on the board) and `project_keys` (optional filter so `UTF-8`-shaped tokens aren't matched). Not a credential — fetching a ticket uses `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` from the environment. |
 | `teams` | Named GitLab-username groups; each becomes an *authored* / *to review* filter pill on the board. |
 | `jenkins` | The jobs behind the [CI strip](#build-and-test-health-jenkins). `base_url` (optional, only for `path:` jobs), `poll_interval_seconds` (default 60, minimum 15), and `jobs`: each takes `url` (the job page as your browser shows it) **or** `path` (its job path under `base_url`), plus an optional `name` for the chip (defaults to the job's own last path segment). Omit the block and there is no strip. Not a credential — a Jenkins that refuses anonymous reads takes `JENKINS_USER`/`JENKINS_TOKEN` from the environment. |
+| `jenkins.log_tail_lines` | How many lines of a broken build's console log the [analyse button](#analysing-what-broke-it) hands to the skill (default 400, the tail). |
 | `jenkins.verify_ssl` | Defaults to `true`. `false` stops verifying Jenkins certificates entirely, for a private chain that cannot be trusted any other way — see [A Jenkins with a private certificate](#a-jenkins-with-a-private-certificate). Trusting the CA via `SSL_CERT_FILE` is the fix that keeps verification on and covers GitLab and Jira too; `radar check` warns while this is set. |
 | `gamification` | Consumed in Phase 3; carried verbatim for now. |
 

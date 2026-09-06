@@ -50,12 +50,18 @@ def test_example_config_is_loadable_and_current():
     cfg = load_config(Path(__file__).resolve().parent.parent / "config.example.yaml")
     # Every skill lives in `skills:`, including the two whose names carry
     # built-in capabilities. Nothing appears that the file did not declare.
-    assert [s.name for s in cfg.skills] == ["review", "qa", "dba"]
+    assert [s.name for s in cfg.skills] == ["review", "qa", "dba", "analyze"]
     assert all(not s.enabled for s in cfg.skills)  # opt in deliberately
     assert cfg.skill_by_name("review").contexts == ("gitlab_diff",)
     qa = cfg.skill_by_name("qa")
     assert qa.contexts == ("jira",) and qa.stores_result is True
     assert cfg.skill_by_name("dba").contexts == ()  # a plain name inherits nothing
+    # The CI strip's button. include_context comes on by default too: unlike a
+    # review, an analysis with no commits and no log has nothing to work from.
+    analyze = cfg.skill_by_name("analyze")
+    assert analyze.contexts == ("jenkins_build",)
+    assert (analyze.stores_result, analyze.include_context) == (True, True)
+    assert analyze.analyses_builds is True  # so it lives on the strip, not a row
 
 
 def test_working_dir_expands_tilde(tmp_path, monkeypatch):

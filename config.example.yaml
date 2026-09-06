@@ -131,6 +131,9 @@ jenkins:
   base_url: https://jenkins.example.com
   poll_interval_seconds: 60
   # verify_ssl: false
+  # How much of a broken build's console log the 🔎 analyse button hands to the
+  # skill (the tail, where the failure prints). Default 400.
+  # log_tail_lines: 400
   jobs:
     - name: backend-ci
       url: https://jenkins.example.com/job/hub/job/backend/job/main/
@@ -148,11 +151,21 @@ jenkins:
 #   {author} {head_sha}, plus {source_root} once the skill declares a `source:`,
 #   and {jira_keys} / {jira_keys_csv} from the keys found on the MR.
 #
-# This list is the ONLY place a skill is declared. Two names arrive with
+# This list is the ONLY place a skill is declared. Three names arrive with
 # defaults, because they are capabilities no command line can advertise:
 #   review   context: gitlab_diff                — the MR diff is piped to STDIN
 #   qa       context: jira + stores_result: true — the linked ticket(s) are piped
 #            to STDIN, and the output is saved and re-openable from the board
+#   analyze  context: jenkins_build + stores_result + include_context — the
+#            commits since the job last passed and the tail of the broken
+#            build's console log are piped to STDIN, and the result is saved
+#            against that build number
+#
+# `context: jenkins_build` is also what MOVES a skill: such a skill is launched
+# from the CI strip's 🔎 button on a broken job, never from a merge request row,
+# because it is about a build. (`checkout: worktree` is refused for one — a
+# worktree is made from an MR's ref, and there is no MR here.)
+#
 # Defaults, not magic: write `context:` or `stores_result:` yourself and yours
 # wins. Every other name starts with no capabilities at all. Declaring a skill
 # anywhere else (a top-level `review:` or `qa:` block, as older versions took)
@@ -325,6 +338,22 @@ skills:
     # source: { env: HUB_REPO_ROOT }
     # inputs:
     #   db_schema: { file: ./references/schema.sql }
+
+  # The CI strip's 🔎 button: what broke this build? radar gathers the commits
+  # Jenkins recorded since the job last passed, and the tail of the broken
+  # build's console log, and pipes both to the skill on STDIN — so it needs no
+  # Jenkins access of its own. The result is saved against that build number and
+  # re-opens from the ✓ until a new build replaces it.
+  #
+  # Placeholders for the command: {jenkins_job} {build_number} {build_url}
+  # {previous_build_number} (the MR ones are empty here, and vice versa).
+  - name: analyze
+    label: Build failure analysis
+    button: analyse
+    icon: "🔎"
+    enabled: false
+    command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/analyze-build"'
+    timeout_seconds: 600
 
 # Gamification config is consumed in Phase 3; kept here so the file is stable.
 gamification:

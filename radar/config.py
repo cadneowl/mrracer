@@ -141,6 +141,16 @@ class SkillConfig:
     env: tuple[tuple[str, str], ...] = ()  # NAME -> value, exported to the child
     env_unset: tuple[str, ...] = ()  # names the child must NOT inherit
 
+    @property
+    def analyses_builds(self) -> bool:
+        """Whether this skill is about a Jenkins build rather than a merge request.
+
+        Read from the declared capability rather than from the name, the same way
+        every other behaviour here is: a skill given `context: jenkins_build` is
+        launched from the CI strip and never appears on an MR row.
+        """
+        return "jenkins_build" in self.contexts
+
 
 # Backwards-compatible aliases (older names for the same shape).
 CommandConfig = SkillConfig
@@ -176,6 +186,11 @@ class JenkinsConfig:
     # see tls.py) keeps verification on and fixes every backend at once, so
     # `radar check` reports this as a warning for as long as it is set.
     verify_ssl: bool = True
+    # How much of a broken build's console log is handed to an analysis skill.
+    # The tail, because that is where a failure prints; big enough to hold a
+    # stack trace and the test summary above it, small enough to leave an agent
+    # room to think about it.
+    log_tail_lines: int = 400
 
 
 @dataclass(frozen=True)
@@ -370,7 +385,7 @@ def _parse_slas(raw: object) -> tuple[SLARule, ...]:
     return tuple(rules)
 
 
-_VALID_CONTEXTS = {"gitlab_diff", "jira"}
+_VALID_CONTEXTS = {"gitlab_diff", "jira", "jenkins_build"}
 _VALID_CHECKOUTS = {"none", "worktree"}
 
 # A skill name is interpolated into dashboard routes and htmx URLs
@@ -393,6 +408,13 @@ _BUILTIN_SKILLS: dict[str, dict] = {
     "qa": {
         "label": "QA test plan", "button": "QA plan", "icon": "🧪",
         "context": ["jira"], "stores_result": True,
+    },
+    # The CI strip's button. `include_context` is defaulted on as well, because
+    # unlike a review — which an agent can still do something with unaided — an
+    # analysis with no commits and no log has nothing whatsoever to work from.
+    "analyze": {
+        "label": "Build failure analysis", "button": "analyse", "icon": "🔎",
+        "context": ["jenkins_build"], "stores_result": True, "include_context": True,
     },
 }
 
@@ -526,7 +548,7 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
 
     contexts = _parse_contexts(raw.get("context", builtin.get("context")), ctx)
 
-    include_context = bool(raw.get("include_context", False))
+    include_context = bool(raw.get("include_context", builtin.get("include_context", False)))
     if include_context and not contexts:
         raise ConfigError(
             f"{ctx}.include_context is true but no 'context' source is set, so radar "
@@ -564,6 +586,14 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
             f"{ctx}: 'working_dir' and 'checkout: worktree' contradict each other — the "
             "worktree is where the merge request's code is, but working_dir would run the "
             "command elsewhere. Drop one."
+        )
+    if checkout == "worktree" and "jenkins_build" in contexts:
+        # A worktree is made from a merge request's ref at its head commit, and
+        # a build analysis has no merge request. Refused here rather than at the
+        # click, where it would read as a transient failure.
+        raise ConfigError(
+            f"{ctx}: 'checkout: worktree' needs a merge request to make a worktree of, and "
+            "a 'jenkins_build' skill analyses a build. Use a plain 'source:' checkout."
         )
     remote = str(raw.get("remote", "origin")).strip() or "origin"
 
@@ -731,6 +761,14 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
         # this particular setting to be wrong.
         raise ConfigError("jenkins.verify_ssl: expected true or false")
 
+    log_tail_lines = raw.get("log_tail_lines", 400)
+    try:
+        log_tail_lines = int(log_tail_lines)
+    except (TypeError, ValueError):
+        raise ConfigError("jenkins.log_tail_lines: expected an integer") from None
+    if log_tail_lines < 1:
+        raise ConfigError("jenkins.log_tail_lines: must be >= 1")
+
     jobs_raw = raw.get("jobs") or []
     if not isinstance(jobs_raw, list):
         raise ConfigError("jenkins.jobs: expected a list of job entries")
@@ -755,7 +793,10 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
         seen.add(name)
         jobs.append(JenkinsJob(name=name, url=url))
     return JenkinsConfig(
-        jobs=tuple(jobs), poll_interval_seconds=interval, verify_ssl=verify_ssl
+        jobs=tuple(jobs),
+        poll_interval_seconds=interval,
+        verify_ssl=verify_ssl,
+        log_tail_lines=log_tail_lines,
     )
 
 

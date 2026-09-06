@@ -7,7 +7,9 @@
     <div class="modal-head">
       <span class="modal-title">
         {{ icon }} {{ heading }} —
-        {{ job.title }} <span class="mrid">!{{ job.mr_iid }}</span>
+        {# `subject` is "!123" for a merge request and "#128" for a build, so
+           this heading reads correctly whichever the job is about. #}
+        {{ job.title }} <span class="mrid">{{ job.subject }}</span>
         {% if generated_at %}<span class="stamp">saved {{ generated_at[:19] }}Z</span>{% endif %}
       </span>
       <a class="modal-close" href="#" hx-get="/{{ kind }}/close" hx-target="#command-panel" hx-swap="innerHTML">✕</a>

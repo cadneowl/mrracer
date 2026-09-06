@@ -67,6 +67,10 @@ _RESULT_STATE = {
 
 _VERB = {SUCCESS: "passed", UNSTABLE: "unstable", FAILED: "failed", ABORTED: "aborted"}
 
+# States worth asking an agent about: a build that ran and did not pass. A job
+# that never built, or one radar could not reach, has no log to read.
+_ANALYSABLE = frozenset({FAILED, UNSTABLE, ABORTED})
+
 # Named in the strip's one-line summary; anything not here is either green or
 # already obvious from its dot.
 _SUMMARY_WORD = (
@@ -111,6 +115,7 @@ class JobStatus:
     url: str  # the job page
     state: str
     previous: str | None = None  # RUNNING only: what the last build did
+    previous_number: int | None = None  # RUNNING only: which build that was
     build_number: int | None = None
     build_url: str | None = None  # derived from url + number, never from Jenkins
     started_at: datetime | None = None
@@ -162,6 +167,7 @@ class JenkinsClient:
         getter: Callable[[str], dict] | None = None,
         timeout: int | None = None,
         verify_ssl: bool = True,
+        text_getter: Callable[[str], tuple[str, dict[str, str]]] | None = None,
     ):
         self._auth_header = None
         if credentials:
@@ -169,6 +175,7 @@ class JenkinsClient:
             encoded = base64.b64encode(f"{user}:{secret}".encode()).decode()
             self._auth_header = f"Basic {encoded}"
         self._getter = getter or self._http_get
+        self._text_getter = text_getter or self._http_get_text
         self._timeout = timeout or self.HTTP_TIMEOUT_S
 
         handlers: list[urllib.request.BaseHandler] = [_DropAuthOffHost()]
@@ -191,14 +198,38 @@ class JenkinsClient:
     def fetch(self, job: JenkinsJob) -> dict:
         return self._getter(f"{job.url}/api/json?tree={_TREE}")
 
+    def fetch_json(self, url: str) -> dict:
+        """Any other JSON endpoint on the same Jenkins (the builds list)."""
+        return self._getter(url)
+
+    def fetch_text(self, url: str) -> tuple[str, dict[str, str]]:
+        """A text endpoint, with its response headers.
+
+        The headers are the point: a console log is fetched by asking Jenkins
+        how big it is (``X-Text-Size``) and then asking for the tail, so the
+        body is never the whole of a very large log.
+        """
+        return self._text_getter(url)
+
     def _http_get(self, url: str) -> dict:
-        headers = {"Accept": "application/json"}
+        body, _ = self._http_get_raw(url, "application/json")
+        return body
+
+    def _http_get_text(self, url: str) -> tuple[str, dict[str, str]]:
+        body, headers = self._http_get_raw(url, "text/plain")
+        return body, headers
+
+    def _http_get_raw(self, url: str, accept: str) -> tuple:
+        headers = {"Accept": accept}
         if self._auth_header:
             headers["Authorization"] = self._auth_header
         req = urllib.request.Request(url, headers=headers)
         try:
             with self._opener.open(req, timeout=self._timeout) as resp:  # noqa: S310
-                body = resp.read()
+                # Bounded on both paths: a build log can be hundreds of
+                # megabytes, and radar only ever shows its tail.
+                body = resp.read(_MAX_BODY_BYTES)
+                response_headers = {k: v for k, v in resp.headers.items()}
         except urllib.error.HTTPError as exc:  # a subclass of OSError: keep it first
             raise JenkinsError(_http_message(exc.code)) from None
         except (OSError, http.client.HTTPException) as exc:
@@ -213,8 +244,11 @@ class JenkinsClient:
             # Never the URL: it is long, and the reason is the useful half.
             raise JenkinsError(f"unreachable: {exc}") from None
 
+        if accept == "text/plain":
+            return body.decode("utf-8", "replace"), response_headers
+
         try:
-            return json.loads(body.decode("utf-8"))
+            return json.loads(body.decode("utf-8")), response_headers
         except (json.JSONDecodeError, UnicodeDecodeError):
             # A 200 that is not JSON is almost always an SSO login page, which
             # never returns a 4xx — so without this the one diagnosis that
@@ -284,11 +318,16 @@ def map_status(payload: dict, job: JenkinsJob) -> JobStatus:
         return JobStatus(name=job.name, url=job.url, state=NEVER, message="no builds yet")
 
     if last.get("building"):
+        finished = completed or {}
+        finished_number = finished.get("number")
         return _status(
             job,
             RUNNING,
             last,
-            previous=_RESULT_STATE.get(str((completed or {}).get("result"))),
+            previous=_RESULT_STATE.get(str(finished.get("result"))),
+            # Kept rather than derived: build numbers skip (a deleted build, a
+            # renumbered job), so "the one before this" is not this one minus 1.
+            previous_number=finished_number if isinstance(finished_number, int) else None,
             estimated_s=_seconds(last.get("estimatedDuration")),
         )
 
@@ -309,6 +348,171 @@ def _status(job: JenkinsJob, state: str, build: dict, **extra) -> JobStatus:
         started_at=_epoch_ms(build.get("timestamp")),
         duration_s=_seconds(build.get("duration")),
         **extra,
+    )
+
+
+# --- what broke it: commits and the console log ----------------------------
+
+# Both spellings on purpose. A Pipeline job (WorkflowRun) reports `changeSets`,
+# a list, one entry per SCM; a freestyle job reports `changeSet`, a single
+# object. Asking for only one of them finds no commits at all on half the
+# Jenkins installations in existence, and finds them silently — an empty commit
+# list reads as "nothing changed", which is a conclusion rather than a gap.
+_CHANGE_FIELDS = "commitId,msg,comment,date,authorEmail,affectedPaths,author[fullName]"
+_BUILDS_TREE = (
+    "builds[number,result,building,timestamp,duration,"
+    f"changeSet[items[{_CHANGE_FIELDS}]],changeSets[items[{_CHANGE_FIELDS}]]]"
+)
+
+# How far back to look for the last green build. A job that has been broken for
+# more than this many builds reports the commits it can see and says so.
+BUILDS_WINDOW = 25
+
+# The tail actually pulled back, and how much of it is shown. The byte cap
+# bounds what crosses the network; the line count is what the skill reads.
+LOG_TAIL_BYTES = 256_000
+DEFAULT_LOG_TAIL_LINES = 400
+_MAX_BODY_BYTES = 4_000_000  # hard ceiling on any single response radar reads
+
+# Asking for a start beyond the end returns an empty body and, in the header,
+# the log's real size — which is how the tail is fetched without pulling the
+# whole log across the network first.
+_SIZE_PROBE_OFFSET = 1 << 50
+
+
+@dataclass(frozen=True)
+class Commit:
+    sha: str
+    author: str
+    when: str
+    message: str
+    files: tuple[str, ...] = ()
+
+    @property
+    def short_sha(self) -> str:
+        return self.sha[:12]
+
+
+@dataclass(frozen=True)
+class BuildLog:
+    text: str
+    lines: int  # lines in `text`
+    total_bytes: int  # size of the whole log, 0 when Jenkins would not say
+    truncated: bool
+
+
+def _changeset_items(build: dict) -> list[dict]:
+    """The SCM entries of one build, whichever shape this Jenkins reports."""
+    sets = build.get("changeSets")
+    if isinstance(sets, list):
+        return [
+            item
+            for changeset in sets
+            if isinstance(changeset, dict)
+            for item in (changeset.get("items") or [])
+        ]
+    return list((build.get("changeSet") or {}).get("items") or [])
+
+
+def _commit(item: dict) -> Commit:
+    author = (item.get("author") or {}).get("fullName") or item.get("authorEmail") or "unknown"
+    # `msg` is the subject line; `comment` is the whole message. The subject is
+    # what a reader scans, so it leads, and the body is left to the log.
+    message = str(item.get("msg") or item.get("comment") or "").strip().splitlines()
+    return Commit(
+        sha=str(item.get("commitId") or ""),
+        author=str(author),
+        when=str(item.get("date") or ""),
+        message=message[0] if message else "",
+        files=tuple(str(p) for p in (item.get("affectedPaths") or [])),
+    )
+
+
+def commit_range(builds: list[dict], broken_number: int) -> tuple[int | None, list[Commit]]:
+    """What landed between the last successful build and this broken one.
+
+    Pure, like ``map_status``: the walk is where this feature is most likely to
+    be wrong, and it should be testable without a Jenkins.
+
+    Returns the last green build's number (None if none is in the window) and
+    its commits, newest build first — the most recent change being the one most
+    worth looking at first. The broken build's own changes are included: they
+    are the prime suspects, not context.
+    """
+    numbered = [b for b in builds if isinstance(b.get("number"), int)]
+    seen: set[str] = set()
+    commits: list[Commit] = []
+    last_good: int | None = None
+
+    for build in sorted(numbered, key=lambda b: b["number"], reverse=True):
+        if build["number"] > broken_number:
+            continue  # a newer build than the one being analysed
+        if build.get("result") == "SUCCESS":
+            last_good = build["number"]
+            break
+        for item in _changeset_items(build):
+            commit = _commit(item)
+            # The same commit can be reported by two builds (a retry, or a
+            # build that picked up an unchanged head); say it once.
+            if commit.sha and commit.sha in seen:
+                continue
+            seen.add(commit.sha)
+            commits.append(commit)
+    return last_good, commits
+
+
+def fetch_builds(client: JenkinsClient, job: JenkinsJob, limit: int = BUILDS_WINDOW) -> list[dict]:
+    """The job's recent builds with their changesets, in one request."""
+    url = f"{job.url}/api/json?tree={_BUILDS_TREE}{{0,{limit}}}"
+    return list(client.fetch_json(url).get("builds") or [])
+
+
+def fetch_log_tail(
+    client: JenkinsClient,
+    job: JenkinsJob,
+    number: int,
+    lines: int = DEFAULT_LOG_TAIL_LINES,
+) -> BuildLog:
+    """The end of a build's console log — where the failure is.
+
+    Two small requests rather than one large one: Jenkins is asked for a slice
+    past the end, which answers with the log's size, and then for the last
+    ``LOG_TAIL_BYTES`` of it. Fetching ``consoleText`` instead would drag a
+    hundred-megabyte log across the network to read its last few hundred lines.
+    """
+    base = f"{job.url}/{number}"
+    text, total = "", 0
+    try:
+        _, headers = client.fetch_text(
+            f"{base}/logText/progressiveText?start={_SIZE_PROBE_OFFSET}"
+        )
+        total = int(headers.get("X-Text-Size") or headers.get("x-text-size") or 0)
+    except (JenkinsError, ValueError):
+        total = 0
+
+    # Whether anything was left behind is tracked as it happens, rather than
+    # inferred afterwards by comparing the decoded text's length against the
+    # size Jenkins reported: decoding and line-splitting both change that
+    # length, so the comparison would call a complete short log truncated.
+    from_offset = False
+    if total > 0:
+        start = max(0, total - LOG_TAIL_BYTES)
+        from_offset = start > 0
+        text, _ = client.fetch_text(f"{base}/logText/progressiveText?start={start}")
+    else:
+        # Either this Jenkins does not answer the probe, or the log is empty.
+        # consoleText is the universal spelling; the read is capped either way.
+        whole, _ = client.fetch_text(f"{base}/consoleText")
+        total = len(whole.encode("utf-8", "replace"))
+        from_offset = len(whole) > LOG_TAIL_BYTES
+        text = whole[-LOG_TAIL_BYTES:]
+
+    kept = text.splitlines()
+    return BuildLog(
+        text="\n".join(kept[-lines:]),
+        lines=min(len(kept), lines),
+        total_bytes=total,
+        truncated=from_offset or len(kept) > lines,
     )
 
 
@@ -368,6 +572,16 @@ class JenkinsMonitor:
             for job in self._jobs
         }
         self._checked_at: datetime | None = None
+
+    @property
+    def client(self) -> JenkinsClient:
+        """The configured client, for the one-off fetches an analysis makes.
+
+        Shared deliberately: it carries the credentials, the TLS decision and
+        the timeout the operator configured, and a second client built beside it
+        would be a second place for those to be got wrong.
+        """
+        return self._client
 
     def refresh(self) -> None:
         """One pass over every watched job. Never raises: a bad pass must take
@@ -480,6 +694,25 @@ def _finished_at(status: JobStatus) -> datetime | None:
     return status.started_at + timedelta(seconds=status.duration_s)
 
 
+def analysable_build(status: JobStatus) -> int | None:
+    """The build this chip would analyse, or None if there is nothing to explain.
+
+    One rule: the last *completed* build was not a success. That covers a build
+    running over a red job — where the breakage is still the news — and excludes
+    a job that has never built or that radar could not reach, neither of which
+    has a build to read a log from.
+    """
+    if status.stale:
+        return None
+    if status.state == RUNNING:
+        # The spinner's own build has no verdict yet; the question is about the
+        # last one that finished, whose result the ring is showing.
+        return status.previous_number if status.previous in _ANALYSABLE else None
+    if status.build_number is None:
+        return None
+    return status.build_number if status.state in _ANALYSABLE else None
+
+
 def job_view(status: JobStatus, now: datetime) -> dict:
     """One chip, ready for the template."""
     return {
@@ -496,13 +729,31 @@ def job_view(status: JobStatus, now: datetime) -> dict:
         # first build.
         "warn": status.stale or status.state == UNKNOWN,
         "detail": _detail(status, now),
+        # The build the analyse button would explain, or None for a chip with
+        # nothing to explain. The template decides what to draw; this decides
+        # whether there is anything to draw it for.
+        "analysable_build": analysable_build(status),
     }
 
 
-def strip_view(snapshot: Snapshot, now: datetime | None = None) -> dict:
-    """The whole CI strip: chips, a one-line summary, and how fresh it all is."""
+def strip_view(
+    snapshot: Snapshot,
+    now: datetime | None = None,
+    analysed: set[tuple[str, int, str]] | None = None,
+    skill: str = "",
+) -> dict:
+    """The whole CI strip: chips, a one-line summary, and how fresh it all is.
+
+    ``analysed`` is the set of (job, build, skill) that already have a stored
+    analysis, so a chip can offer to re-open one instead of paying for it again.
+    """
     now = now or datetime.now(UTC)
     jobs = [job_view(s, now) for s in snapshot.jobs]
+    for view in jobs:
+        build = view["analysable_build"]
+        view["analysed"] = bool(
+            skill and build is not None and (view["name"], build, skill) in (analysed or set())
+        )
 
     if snapshot.checked_at is None:
         # No pass has finished yet (the board opened in the second before the

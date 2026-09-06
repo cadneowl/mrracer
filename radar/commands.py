@@ -117,6 +117,13 @@ PLACEHOLDER_KEYS = (
     "jira_keys_csv",   # comma-separated, e.g. "PROJ-1,PROJ-2"
     "head_sha",        # the MR's head commit, as of the last poll
     "source_root",     # the checkout for this job (see skillcontext / worktree)
+    # Filled for a `jenkins_build` skill instead of the MR fields above. A
+    # skill only ever sees one set; the other substitutes to empty, which is
+    # what an absent placeholder has always done.
+    "jenkins_job",
+    "build_number",
+    "build_url",
+    "previous_build_number",
 )
 
 # Placeholders filled from the MR snapshot; the rest are computed per job.
@@ -329,9 +336,12 @@ def build_argv(command: str, ctx: dict) -> list[str]:
 @dataclass
 class CommandJob:
     id: str
-    kind: str  # "review" or "qa"
-    project_id: int
-    mr_iid: int
+    kind: str  # the skill's name
+    # A job is about a merge request or about a Jenkins build, never both, so
+    # the coordinates of the other one are absent rather than zero.
+    project_id: int | None = None
+    mr_iid: int | None = None
+    subject: str = ""  # "!123" or "backend-ci #128" — what the panel heads with
     title: str = ""
     status: str = "running"  # running / done / error
     output: str = ""
@@ -422,11 +432,14 @@ class CommandRunner:
         on_success: Callable[[CommandJob], None] | None = None,
         stdin_provider: Callable[[str], str] | None = None,
     ) -> CommandJob:
+        project_id = ctx.get("project_id")
+        mr_iid = ctx.get("mr_iid")
         job = CommandJob(
             id=uuid.uuid4().hex[:12],
             kind=self.kind,
-            project_id=int(ctx["project_id"]),
-            mr_iid=int(ctx["mr_iid"]),
+            project_id=int(project_id) if project_id not in (None, "") else None,
+            mr_iid=int(mr_iid) if mr_iid not in (None, "") else None,
+            subject=str(ctx.get("subject", "")),
             title=str(ctx.get("title", "")),
             started_mono=time.monotonic(),
             budget_s=self.config.timeout_seconds,
@@ -441,7 +454,13 @@ class CommandRunner:
             # here rather than launching an agent that would review nothing.
             # Cheap (env reads), so it stays on the request thread and the button
             # reports a misconfiguration immediately.
-            resolved = job_context(self.config, job.project_id, str(ctx.get("web_url") or ""))
+            # A build analysis has no GitLab project, so a `source:` mapping keyed
+            # by one cannot match; such a skill declares a `default:` or no
+            # source at all, and resolve_source falls back to it.
+            resolved = job_context(
+                self.config, job.project_id if job.project_id is not None else "",
+                str(ctx.get("web_url") or ""),
+            )
             resolved.raise_for_problems()
             if self.checkout == "worktree" and not resolved.source_root:
                 raise SkillContextError(

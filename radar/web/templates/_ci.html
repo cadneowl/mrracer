@@ -18,6 +18,22 @@
     <span class="ci-name">{{ job.name }}</span>
     {% if job.warn %}<span class="ci-warn">!</span>{% endif %}
   </a>
+  {# Only where there is something to explain: a build that ran and did not
+     pass. See jenkins.analysable_build for the one rule behind it. #}
+  {% if ci.skill and job.analysable_build %}
+    {% if job.analysed %}
+    <a class="ci-analyse is-done"
+       hx-get="/jenkins/{{ job.name | urlencode }}/analysis/{{ job.analysable_build }}"
+       hx-target="#command-panel" hx-swap="innerHTML" href="#"
+       title="Read the saved {{ ci.skill.label }} for build #{{ job.analysable_build }}">✓</a>
+    {% else %}
+    <button class="ci-analyse"
+            hx-post="/jenkins/{{ job.name | urlencode }}/analyze"
+            hx-target="#command-panel" hx-swap="innerHTML"
+            hx-disabled-elt="this"
+            title="{{ ci.skill.label }}: what changed since this job last passed, and what the log says about build #{{ job.analysable_build }}">{{ ci.skill.icon }}</button>
+    {% endif %}
+  {% endif %}
   {% endfor %}
 
   <span class="ci-checked">checked {{ ci.checked }}</span>
