@@ -317,7 +317,7 @@ def create_app(
             with Database(db_path) as db:
                 db.save_build_analysis(job.name, build, kind, finished.output)
 
-        provider = jenkins_stdin_provider_for(kind, config, client, job, status)
+        provider = jenkins_stdin_provider_for(kind, config, client, job, status, build)
         started = runners[kind].start(
             ctx,
             on_success=on_success if build_skill.stores_result else None,
@@ -379,6 +379,15 @@ def create_app(
     def start_command(request: Request, kind: str, project_id: int, mr_iid: int):
         if kind not in runners or not enabled[kind]:
             raise HTTPException(status_code=404, detail=f"{kind} is not enabled")
+        if skills_by_name[kind].analyses_builds:
+            # It is about a build, and this route is about a merge request: it
+            # would run with no context at all and file the result where nothing
+            # would ever show it. The board never offers this, but the URL is
+            # guessable and the refusal belongs here rather than in the template.
+            raise HTTPException(
+                status_code=404,
+                detail=f"{kind} analyses Jenkins builds, not merge requests",
+            )
         with Database(db_path) as db:
             snap = db.get_snapshot(project_id, mr_iid)
         if snap is None:
@@ -457,7 +466,7 @@ def create_app(
     @app.get("/{kind}/stored/{project_id}/{mr_iid}", response_class=HTMLResponse)
     def stored_plan(request: Request, kind: str, project_id: int, mr_iid: int):
         skill = skills_by_name.get(kind)
-        if skill is None or not skill.stores_result:
+        if skill is None or not skill.stores_result or skill.analyses_builds:
             raise HTTPException(status_code=404, detail=f"{kind} has no stored results")
         with Database(db_path) as db:
             plan = db.get_test_plan(project_id, mr_iid, kind)

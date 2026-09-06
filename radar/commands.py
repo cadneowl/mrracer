@@ -123,7 +123,6 @@ PLACEHOLDER_KEYS = (
     "jenkins_job",
     "build_number",
     "build_url",
-    "previous_build_number",
 )
 
 # Placeholders filled from the MR snapshot; the rest are computed per job.

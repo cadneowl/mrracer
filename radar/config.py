@@ -663,6 +663,17 @@ def _parse_skills(raw_top: dict, base_dir: Path) -> tuple[SkillConfig, ...]:
         seen.add(name)
         out.append(_parse_skill(entry, name, ctx, base_dir))
 
+    # The CI strip has one button per chip, so it can launch one skill. A second
+    # enabled `jenkins_build` skill would simply never appear anywhere — no
+    # button, no error — and a skill that is configured, enabled, and silently
+    # unreachable is worse than one refused with a reason.
+    analysers = [s.name for s in out if s.enabled and s.analyses_builds]
+    if len(analysers) > 1:
+        raise ConfigError(
+            "skills: more than one enabled skill declares 'context: jenkins_build' "
+            f"({', '.join(analysers)}), and the CI strip has one analyse button per "
+            "job. Leave one enabled."
+        )
     return tuple(out)
 
 

@@ -202,34 +202,43 @@ class JenkinsClient:
         """Any other JSON endpoint on the same Jenkins (the builds list)."""
         return self._getter(url)
 
-    def fetch_text(self, url: str) -> tuple[str, dict[str, str]]:
+    def fetch_text(self, url: str, headers: dict[str, str] | None = None) -> tuple:
         """A text endpoint, with its response headers.
 
-        The headers are the point: a console log is fetched by asking Jenkins
-        how big it is (``X-Text-Size``) and then asking for the tail, so the
-        body is never the whole of a very large log.
+        The headers matter in both directions: a console log is fetched by
+        asking Jenkins how big it is (``X-Text-Size``) and then for the tail, and
+        the fallback asks for a byte range — so the body is never the whole of a
+        very large log, and the answer says which part of it arrived.
         """
-        return self._text_getter(url)
+        return self._text_getter(url, headers or {})
 
     def _http_get(self, url: str) -> dict:
         body, _ = self._http_get_raw(url, "application/json")
         return body
 
-    def _http_get_text(self, url: str) -> tuple[str, dict[str, str]]:
-        body, headers = self._http_get_raw(url, "text/plain")
-        return body, headers
+    def _http_get_text(self, url: str, extra: dict[str, str] | None = None) -> tuple:
+        return self._http_get_raw(url, "text/plain", extra)
 
-    def _http_get_raw(self, url: str, accept: str) -> tuple:
-        headers = {"Accept": accept}
+    def _http_get_raw(self, url: str, accept: str, extra: dict[str, str] | None = None) -> tuple:
+        headers = {"Accept": accept, **(extra or {})}
         if self._auth_header:
             headers["Authorization"] = self._auth_header
         req = urllib.request.Request(url, headers=headers)
         try:
+            # A ceiling on both paths, but a different one and for different
+            # reasons: a log is *expected* to be longer than radar wants and is
+            # cut deliberately, while a JSON body that gets cut can only fail to
+            # parse — so that one is read with room to spare and refused loudly
+            # rather than silently truncated into a syntax error.
+            limit = _MAX_LOG_BYTES if accept == "text/plain" else _MAX_JSON_BYTES
             with self._opener.open(req, timeout=self._timeout) as resp:  # noqa: S310
-                # Bounded on both paths: a build log can be hundreds of
-                # megabytes, and radar only ever shows its tail.
-                body = resp.read(_MAX_BODY_BYTES)
+                body = resp.read(limit + 1)
                 response_headers = {k: v for k, v in resp.headers.items()}
+            if accept != "text/plain" and len(body) > limit:
+                raise JenkinsError(
+                    f"the response was larger than {limit // 1_000_000} MB, which is more "
+                    "than any job's build list should be — check the URL points at a job"
+                )
         except urllib.error.HTTPError as exc:  # a subclass of OSError: keep it first
             raise JenkinsError(_http_message(exc.code)) from None
         except (OSError, http.client.HTTPException) as exc:
@@ -372,7 +381,8 @@ BUILDS_WINDOW = 25
 # bounds what crosses the network; the line count is what the skill reads.
 LOG_TAIL_BYTES = 256_000
 DEFAULT_LOG_TAIL_LINES = 400
-_MAX_BODY_BYTES = 4_000_000  # hard ceiling on any single response radar reads
+_MAX_LOG_BYTES = 4_000_000  # ceiling on a console-log read
+_MAX_JSON_BYTES = 8_000_000  # ceiling on an api/json read, refused rather than cut
 
 # Asking for a start beyond the end returns an empty body and, in the header,
 # the log's real size — which is how the tail is fetched without pulling the
@@ -399,6 +409,11 @@ class BuildLog:
     lines: int  # lines in `text`
     total_bytes: int  # size of the whole log, 0 when Jenkins would not say
     truncated: bool
+    # Whether `text` reaches the end of the log. False means radar could only
+    # get the beginning — which is where a build says what it is about to do,
+    # not why it failed. The bundle says so rather than presenting the opening
+    # of a build as the reason it broke.
+    has_end: bool = True
 
 
 def _changeset_items(build: dict) -> list[dict]:
@@ -495,24 +510,39 @@ def fetch_log_tail(
     # size Jenkins reported: decoding and line-splitting both change that
     # length, so the comparison would call a complete short log truncated.
     from_offset = False
+    has_end = True
     if total > 0:
         start = max(0, total - LOG_TAIL_BYTES)
         from_offset = start > 0
         text, _ = client.fetch_text(f"{base}/logText/progressiveText?start={start}")
     else:
-        # Either this Jenkins does not answer the probe, or the log is empty.
-        # consoleText is the universal spelling; the read is capped either way.
-        whole, _ = client.fetch_text(f"{base}/consoleText")
-        total = len(whole.encode("utf-8", "replace"))
-        from_offset = len(whole) > LOG_TAIL_BYTES
-        text = whole[-LOG_TAIL_BYTES:]
+        # No size to work from, so ask for the last bytes directly. A server that
+        # honours the range gives the true end; one that ignores it gives the
+        # beginning, and a read of the beginning must NOT be dressed up as a
+        # tail — slicing the last bytes off a capped prefix would hand over the
+        # middle of the build and call it the failure.
+        text, response = client.fetch_text(
+            f"{base}/consoleText", {"Range": f"bytes=-{LOG_TAIL_BYTES}"}
+        )
+        ranged = any(key.lower() == "content-range" for key in response)
+        size = len(text.encode("utf-8", "replace"))
+        total = size
+        if ranged:
+            from_offset = True
+        elif size > _MAX_LOG_BYTES:  # the read hit its ceiling: a prefix, not all
+            from_offset, has_end = True, False
+        # else: the whole log came back and it is short — nothing was left out.
 
     kept = text.splitlines()
+    # With no end in hand the opening lines are at least coherent; the tail of a
+    # prefix is an arbitrary point in the middle.
+    shown = kept[-lines:] if has_end else kept[:lines]
     return BuildLog(
-        text="\n".join(kept[-lines:]),
-        lines=min(len(kept), lines),
+        text="\n".join(shown),
+        lines=len(shown),
         total_bytes=total,
         truncated=from_offset or len(kept) > lines,
+        has_end=has_end,
     )
 
 

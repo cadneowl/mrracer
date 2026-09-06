@@ -15,6 +15,7 @@ from radar.jenkins import (
     FAILED,
     RUNNING,
     JenkinsClient,
+    JenkinsError,
     JenkinsMonitor,
     analysable_build,
     commit_range,
@@ -121,7 +122,7 @@ def test_the_builds_request_asks_for_both_shapes_and_a_window():
 
 
 def _text_client(pages: dict, calls: list | None = None) -> JenkinsClient:
-    def text_getter(url):
+    def text_getter(url, headers=None):
         if calls is not None:
             calls.append(url)
         for fragment, answer in pages.items():
@@ -168,6 +169,81 @@ def test_a_short_log_is_not_called_truncated():
     log = fetch_log_tail(client, JOB, 128, lines=400)
 
     assert (log.text, log.truncated) == ("a\nb", False)
+
+
+def test_a_log_whose_end_cannot_be_reached_is_not_passed_off_as_the_tail():
+    """The read is capped from the *start* of the body, so slicing the last
+    bytes off a capped prefix hands over the middle of the build and calls it
+    the failure. Either the range works and the end really is here, or the
+    bundle has to say the end is missing."""
+    from radar.jenkins import _MAX_LOG_BYTES
+
+    prefix = "x" * (_MAX_LOG_BYTES + 10)
+    client = _text_client({"progressiveText": ("", {}), "consoleText": (prefix, {})})
+
+    log = fetch_log_tail(client, JOB, 128, lines=5)
+
+    assert log.has_end is False
+    assert log.truncated is True
+
+
+def test_a_ranged_fallback_really_is_the_end():
+    """A server that honours `Range: bytes=-N` answers with Content-Range, and
+    then what came back is the end of the log."""
+    calls: list[str] = []
+    client = _text_client(
+        {
+            "progressiveText": ("", {}),
+            "consoleText": ("...\nFinished: FAILURE", {"Content-Range": "bytes 900-919/920"}),
+        },
+        calls,
+    )
+
+    log = fetch_log_tail(client, JOB, 128, lines=400)
+
+    assert log.has_end is True
+    assert log.text.endswith("Finished: FAILURE")
+    assert log.truncated is True  # there was more before it
+
+
+def test_a_build_list_too_large_to_be_json_says_that_rather_than_blaming_auth():
+    """A truncated JSON body can never parse, and the not-JSON message sends the
+    reader off to fix credentials that are fine."""
+    from radar.jenkins import _MAX_JSON_BYTES
+
+    huge = b'{"builds": [' + b'{"number": 1},' * _MAX_JSON_BYTES
+
+    def fake_open(self, req, timeout=None):
+        return _FakeResponseBytes(huge)
+
+    import urllib.request as urlreq
+
+    client = JenkinsClient()
+    original = urlreq.OpenerDirector.open
+    urlreq.OpenerDirector.open = fake_open
+    try:
+        with pytest.raises(JenkinsError) as exc:
+            fetch_builds(client, JOB)
+    finally:
+        urlreq.OpenerDirector.open = original
+
+    assert "larger than" in str(exc.value)
+    assert "JENKINS_USER" not in str(exc.value)  # not an auth problem
+
+
+class _FakeResponseBytes:
+    def __init__(self, body: bytes):
+        self._body = body
+        self.headers = {}
+
+    def read(self, amount=None):
+        return self._body if amount is None else self._body[:amount]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 # --- which chips offer the button ------------------------------------------
@@ -241,7 +317,7 @@ def _analysis_client(items=_ONE_COMMIT):
     builds = {"builds": [_pipeline(128, "FAILURE", items), _pipeline(127, "SUCCESS")]}
     return JenkinsClient(
         getter=lambda url: builds,
-        text_getter=lambda url: (
+        text_getter=lambda url, headers=None: (
             ("", {"X-Text-Size": "40"}) if "1125899906842624" in url else ("boom\ntraceback", {})
         ),
     )
@@ -249,7 +325,7 @@ def _analysis_client(items=_ONE_COMMIT):
 
 def test_the_bundle_names_the_build_the_range_and_the_log():
     status = map_status(_payload(_build(128, "FAILURE")), JOB)
-    text = build_jenkins_input(_analysis_client(), JOB, status, log_lines=400)
+    text = build_jenkins_input(_analysis_client(), JOB, status, log_lines=400, number=128)
 
     assert "# Jenkins build failure: backend-ci #128" in text
     assert "Result: FAILED" in text
@@ -258,11 +334,42 @@ def test_the_bundle_names_the_build_the_range_and_the_log():
     assert "## Console log" in text and "traceback" in text
 
 
+def test_the_bundle_describes_the_build_being_analysed_not_the_one_now_running():
+    """The case the README advertises. The chip's own number is the *running*
+    build; the one being explained is the last that finished, and the header,
+    the commit range and the log all have to be about that one — otherwise the
+    skill reads a still-streaming log while the panel and the saved row say #128.
+    """
+    running_over_red = _payload(
+        _build(130, None, building=True, duration_s=None), _build(128, "FAILURE")
+    )
+    status = map_status(running_over_red, JOB)
+    assert (analysable_build(status), status.build_number) == (128, 130)
+
+    fetched: list[str] = []
+    client = JenkinsClient(
+        getter=lambda url: {"builds": [_pipeline(128, "FAILURE", _ONE_COMMIT)]},
+        text_getter=lambda url, headers=None: (
+            fetched.append(url) or ("", {"X-Text-Size": "9"})
+            if "1125899906842624" in url
+            else (fetched.append(url) or ("log", {}))
+        ),
+    )
+    text = build_jenkins_input(client, JOB, status, log_lines=400, number=128)
+
+    assert "# Jenkins build failure: backend-ci #128" in text
+    assert "#130" not in text  # never the build that has not finished
+    assert "Result: FAILED" in text  # what #128 did, not "RUNNING"
+    assert all("/128/" in url for url in fetched)  # the log fetched is #128's
+
+
 def test_a_build_with_no_commits_says_so_rather_than_staying_silent():
     """An empty list is evidence: it points at the environment rather than at
     the change, and a skill told nothing would have to guess which."""
     status = map_status(_payload(_build(128, "FAILURE")), JOB)
-    text = build_jenkins_input(_analysis_client(items=()), JOB, status, log_lines=400)
+    text = build_jenkins_input(
+        _analysis_client(items=()), JOB, status, log_lines=400, number=128
+    )
 
     assert "recorded no source changes" in text
     assert "environmental" in text
@@ -321,6 +428,36 @@ def test_analysing_runs_the_skill_and_stores_the_result(tmp_path):
     assert resp.status_code == 200
     assert "Build failure analysis" in resp.text
     assert "#128" in resp.text  # the panel heads with the build, not an MR
+
+
+def test_the_analysis_skill_cannot_be_launched_against_a_merge_request(tmp_path):
+    """Everywhere else keeps the two apart — the config refuses `checkout:
+    worktree`, the board filters it off MR rows — but the URL is guessable, and
+    the run would have no build context and file its result where nothing shows
+    it."""
+    _, _, client = _app(tmp_path, _BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, _monitor())
+
+    assert client.post("/analyze/101/1").status_code == 404
+    assert client.get("/analyze/stored/101/1").status_code == 404
+
+
+def test_two_enabled_analysis_skills_are_refused_rather_than_one_ignored(tmp_path):
+    """The strip has one button per job, so a second enabled `jenkins_build`
+    skill would be configured, enabled and silently unreachable."""
+    from radar.config import ConfigError
+
+    two = _ANALYZE_SKILL + """
+  - name: analyze2
+    enabled: true
+    context: jenkins_build
+    command: echo hi
+"""
+    path = tmp_path / "two.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + two, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+    assert "one analyse button" in str(exc.value)
 
 
 def test_an_unknown_job_name_is_refused(tmp_path):

@@ -346,7 +346,9 @@ skills:
   # re-opens from the ✓ until a new build replaces it.
   #
   # Placeholders for the command: {jenkins_job} {build_number} {build_url}
-  # {previous_build_number} (the MR ones are empty here, and vice versa).
+  # (the merge-request ones are empty here, and vice versa). Which build the
+  # last green one was is in the piped bundle, since finding it costs a Jenkins
+  # call that would otherwise happen while the button was waiting to respond.
   - name: analyze
     label: Build failure analysis
     button: analyse

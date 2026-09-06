@@ -43,20 +43,27 @@ def build_review_input(source, project_id: int, mr_iid: int) -> str:
     return "\n\n".join(parts)
 
 
-def build_jenkins_input(client, job, status, log_lines: int) -> str:
+def build_jenkins_input(client, job, status, log_lines: int, number: int) -> str:
     """Fetch what Jenkins knows about a broken build and format it for the skill.
 
     Two pieces of evidence, in the order a person would want them: what changed
     since the build last passed, and the end of the log where it failed. Both
     come from Jenkins alone, so an analysis needs no GitLab or git access.
-    """
-    from .jenkins import commit_range, fetch_builds, fetch_log_tail
 
-    number = status.build_number
+    ``number`` is passed in rather than read off ``status``: when a build is
+    running over a broken one, the chip's own number is the *running* build and
+    the one being explained is the last that finished. Reading it here would
+    describe one build while every other part of the job named the other.
+    """
+    from .jenkins import RUNNING, commit_range, fetch_builds, fetch_log_tail
+
+    # For a job building over a failure, the state to report is what the build
+    # being analysed did, not what the job is doing now.
+    result = (status.previous or "unknown") if status.state == RUNNING else status.state
     parts = [
         f"# Jenkins build failure: {job.name} #{number}\n\n"
-        f"Result: {status.state.upper()}\n"
-        f"Build: {status.link}"
+        f"Result: {result.upper()}\n"
+        f"Build: {job.url}/{number}/"
     ]
 
     last_good, commits = commit_range(fetch_builds(client, job), number)
@@ -87,7 +94,18 @@ def build_jenkins_input(client, job, status, log_lines: int) -> str:
         )
 
     log = fetch_log_tail(client, job, number, lines=log_lines)
-    scope = f"last {log.lines} lines" if log.truncated else f"all {log.lines} lines"
+    if not log.has_end:
+        # Said plainly: the opening of a build is where it says what it is about
+        # to do, not why it failed, and an agent handed it without warning would
+        # reason confidently about the wrong part of the run.
+        scope = (
+            f"first {log.lines} lines — radar could not fetch the end of this log, "
+            "so the failure itself is NOT below"
+        )
+    elif log.truncated:
+        scope = f"last {log.lines} lines"
+    else:
+        scope = f"all {log.lines} lines"
     parts.append(f"## Console log ({scope})\n\n```\n{log.text}\n```")
     return "\n\n".join(parts)
 
@@ -158,6 +176,7 @@ def jenkins_stdin_provider_for(
     client,
     job,
     status,
+    number: int,
 ) -> Callable[[str, dict], str] | None:
     """The stdin bundle for a build analysis.
 
@@ -177,7 +196,9 @@ def jenkins_stdin_provider_for(
     def provider(source_root: str = "", inputs: dict | None = None) -> str:
         parts = []
         if fetch:
-            parts.append(build_jenkins_input(client, job, status, config.jenkins.log_tail_lines))
+            parts.append(
+                build_jenkins_input(client, job, status, config.jenkins.log_tail_lines, number)
+            )
         if source_root:
             parts.append(build_source_section(source_root))
         if inputs:
