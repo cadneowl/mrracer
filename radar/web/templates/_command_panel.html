@@ -12,8 +12,80 @@
         {{ job.title }} <span class="mrid">{{ job.subject }}</span>
         {% if generated_at %}<span class="stamp">saved {{ generated_at[:19] }}Z</span>{% endif %}
       </span>
-      <a class="modal-close" href="#" hx-get="/{{ kind }}/close" hx-target="#command-panel" hx-swap="innerHTML">✕</a>
+      <span class="modal-actions">
+        {% if output and status != 'running' %}
+        {# The markdown the skill wrote, not the rendered HTML: what this is for
+           is pasting the finding into a ticket, a chat, or a commit message,
+           and all three want the source. #}
+        <button class="copy-btn" id="copy-{{ job.id }}" type="button"
+                title="Copy this output as markdown">⧉ copy</button>
+        {# Off-screen rather than `hidden`: the execCommand fallback below has to
+           be able to select it. The newline straight after the tag is deliberate
+           — HTML parsing eats one, so without it an output starting with a blank
+           line would come back one line short. #}
+        {# No aria-hidden: the fallback focuses this to select it, and a
+           focused node cannot be hidden from the accessibility tree — the
+           browser refuses, and the reader loses the thing the button is
+           talking about. tabindex keeps it out of the tab order instead. #}
+        <textarea class="copy-source" id="copy-src-{{ job.id }}"
+                  tabindex="-1" readonly>
+{{ output }}</textarea>
+        {% endif %}
+        <a class="modal-close" href="#" hx-get="/{{ kind }}/close" hx-target="#command-panel" hx-swap="innerHTML">✕</a>
+      </span>
     </div>
+    {% if output and status != 'running' %}
+    <script>
+    (function () {
+      var btn = document.getElementById("copy-{{ job.id }}");
+      var src = document.getElementById("copy-src-{{ job.id }}");
+      if (!btn || !src) return;
+
+      var resetTimer = null;
+
+      function say(text, ok) {
+        // Cleared first: a second copy at ~1.5s would otherwise be wiped by the
+        // first one's timer 100ms later, reading as if the click did nothing.
+        clearTimeout(resetTimer);
+        btn.textContent = text;
+        btn.classList.toggle("is-done", ok === true);
+        btn.classList.toggle("is-failed", ok === false);
+        resetTimer = setTimeout(function () {
+          btn.textContent = "⧉ copy";
+          btn.classList.remove("is-done", "is-failed");
+        }, 1600);
+      }
+
+      function legacy() {
+        // navigator.clipboard exists only in a secure context: localhost counts,
+        // plain http to a hostname does not — and that is how a radar someone
+        // shares on the network gets opened.
+        src.select();
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+        if (ok) {
+          window.getSelection().removeAllRanges();
+          btn.focus();
+          say("✓ copied", true);
+          return;
+        }
+        // Left selected on purpose. Clearing it and then saying "press Ctrl+C"
+        // — which is what this did — instructs the reader to copy nothing, and
+        // this is the path a browser that refuses both APIs actually takes.
+        say("press Ctrl+C", false);
+      }
+
+      btn.addEventListener("click", function () {
+        if (navigator.clipboard && window.isSecureContext) {
+          navigator.clipboard.writeText(src.value).then(
+            function () { say("✓ copied", true); }, legacy);
+        } else {
+          legacy();
+        }
+      });
+    })();
+    </script>
+    {% endif %}
     <div class="modal-body">
       {# `status`/`error`, not `job.*`: one read of the job's state per render — see _panel. #}
       {% if status == "running" %}

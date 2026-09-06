@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from radar import jenkins
+from radar.commands import CommandJob
 from radar.db import Database
 from radar.gitlab_client import FixtureSource
 from radar.jenkins import JenkinsClient, JenkinsMonitor
@@ -153,6 +154,89 @@ def test_without_jenkins_jobs_there_is_no_strip(config, tmp_path):
 
     assert 'id="ci-strip"' not in client.get("/").text
     assert client.get("/partials/ci").status_code == 404
+
+
+_QA_SKILL = """
+skills:
+  - name: qa
+    enabled: true
+    command: echo hi
+"""
+
+_WRITTEN = "## Cause\n\n- `pyyaml` 6.0.2 removed `Loader`\n\n```python\nfrom yaml import Loader\n```"
+
+
+def test_a_finished_panel_offers_the_markdown_for_copying(tmp_path):
+    """The copy button hands over what the skill wrote, not what the browser
+    drew: the reason to copy a finding is to paste it into a ticket, a chat or a
+    commit message, and all three want the source rather than rendered text."""
+    from radar.config import load_config
+    from tests.conftest import _BASE_CONFIG
+
+    path = tmp_path / "qa.yaml"
+    path.write_text(_BASE_CONFIG + _QA_SKILL, encoding="utf-8")
+    db_path = tmp_path / "copy.db"
+    Database(db_path).close()
+    with Database(db_path) as db:
+        db.save_test_plan(101, 1, "qa", "PROJ-1", _WRITTEN)
+
+    html = TestClient(create_app(load_config(path), str(db_path))).get("/qa/stored/101/1").text
+
+    assert 'class="copy-btn"' in html
+    # The markdown itself — headings and fences intact, not <h2> and <pre>.
+    carried = html.split('readonly>')[1].split("</textarea>")[0]
+    assert "## Cause" in carried and "```python" in carried
+    # And the rendered article is still there, so the panel reads as before.
+    assert "<h2>Cause</h2>" in html
+
+
+def _render_panel(**overrides) -> str:
+    """The command panel rendered straight from the template."""
+    from radar.web.app import templates
+
+    ctx = {
+        "job": CommandJob(id="x", kind="qa", subject="!1", title="t", status="running"),
+        "status": "running", "error": "", "kind": "qa", "heading": "QA", "icon": "*",
+        "generated_at": None, "remaining_s": None, "clock_text": "",
+        "output_html": None, "output": "",
+    }
+    ctx.update(overrides)
+    return templates.env.get_template("_command_panel.html").render(ctx)
+
+
+def test_a_panel_with_nothing_to_show_offers_no_copy_button():
+    """A running job has no output yet, and a button that copies an empty string
+    is one that claims to have done something."""
+    assert 'class="copy-btn"' not in _render_panel()
+
+
+def test_a_still_running_panel_offers_no_copy_button_even_with_output():
+    """The runner publishes `output` before it flips `status` to done, so a poll
+    landing in that window renders the spinner, the countdown and a fresh
+    EventSource. A copy button beside them would contradict all three — the
+    panel is built around one consistent read of the job's state."""
+    html = _render_panel(status="running", output="## Half an answer")
+
+    assert 'class="copy-btn"' not in html
+    assert "review-loading" in html  # it is still the running panel
+
+
+def test_output_kept_from_a_failed_run_is_copyable_too():
+    """A run killed by its timeout keeps whatever it wrote, and half an analysis
+    is exactly the thing worth pasting somewhere before it is lost."""
+    html = _render_panel(status="error", error="timed out", output="## Partial")
+
+    assert 'class="copy-btn"' in html
+    assert "## Partial" in html.split("readonly>")[1].split("</textarea>")[0]
+
+
+def test_skill_output_cannot_break_out_of_the_copy_field():
+    """Skill output is untrusted — it is an LLM's reply to attacker-influenceable
+    MR content — and it goes into a textarea, so escaping is what keeps it there."""
+    html = _render_panel(status="done", output="</textarea><script>alert(1)</script>")
+
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;/textarea&gt;" in html
 
 
 def _css() -> str:
