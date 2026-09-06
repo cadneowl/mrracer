@@ -150,8 +150,11 @@ jenkins:
   #   enabled: true
   #   skill: analyze
   #
-  # How much of the log the skill is given (the tail, where the failure prints):
-  # log_tail_lines: 400
+  # A build log runs to tens of megabytes, so radar hands it over as a FILE the
+  # skill can search, plus a short excerpt of the end inline. This is how many
+  # lines that excerpt holds (also capped by size, so one enormous line cannot
+  # become the whole prompt). The full commit list is written beside it.
+  # log_tail_lines: 120
   jobs:
     - name: backend-ci
       url: https://jenkins.example.com/job/hub/job/backend/job/main/

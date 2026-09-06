@@ -172,11 +172,20 @@ the review button hands over an MR diff:
 
 * the commits Jenkins recorded for every build since the job last passed — sha,
   author, date, subject and the files each one touched;
-* the tail of the broken build's console log (`jenkins.log_tail_lines`, default
-  400), which is where a failure prints.
+* the broken build's console log, which is where a failure prints.
 
-The skill needs no Jenkins access of its own — radar fetches both and pipes them
-on stdin. **Which skill runs is named in the `jenkins:` block**, next to the
+**Both arrive as files, with a short excerpt inline.** A build log runs to tens
+of megabytes and a monorepo merge lists thousands of paths per commit; piping
+either as prompt text buys one reply of *"prompt is too long"*. So radar writes
+the log and the full change list into a scratch directory, names both paths in
+the bundle, and inlines the last `jenkins.log_tail_lines` lines (default 120,
+also capped by size so a single enormous line cannot fill the prompt) plus the
+first 20 commits. A small failure is answerable from the excerpt alone; a real
+one is answerable by grepping the file, which is what an agent is good at. The
+files live exactly as long as the run that reads them.
+
+The skill needs no Jenkins access of its own — radar fetches everything and
+pipes the bundle on stdin. **Which skill runs is named in the `jenkins:` block**, next to the
 pipelines it is about:
 
 ```yaml
@@ -836,7 +845,7 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `teams` | Named GitLab-username groups; each becomes an *authored* / *to review* filter pill on the board. |
 | `jenkins` | The jobs behind the [CI strip](#build-and-test-health-jenkins). `base_url` (optional, only for `path:` jobs), `poll_interval_seconds` (default 60, minimum 15), and `jobs`: each takes `url` (the job page as your browser shows it) **or** `path` (its job path under `base_url`), plus an optional `name` for the chip (defaults to the job's own last path segment). Omit the block and there is no strip. Not a credential — a Jenkins that refuses anonymous reads takes `JENKINS_USER`/`JENKINS_TOKEN` from the environment. |
 | `jenkins.analysis` | Which skill the CI strip's 🔎 button runs: `enabled` and `skill` (the name of an entry in `skills:`). That name is the only thing that makes a skill the analyser — nothing about the skill itself does. Omit the block for no button; a wiring that cannot work (unknown skill, disabled skill, misspelled key) is refused when the config loads. See [Analysing what broke it](#analysing-what-broke-it). |
-| `jenkins.log_tail_lines` | How many lines of a broken build's console log the [analyse button](#analysing-what-broke-it) hands to the skill (default 400, the tail). |
+| `jenkins.log_tail_lines` | How many lines of the broken build's console log go *inline* in the bundle (default 120, the end of the log, also capped by size). The whole log and the whole change list are written to files the bundle names, so the skill can search them — see [Analysing what broke it](#analysing-what-broke-it). |
 | `jenkins.verify_ssl` | Defaults to `true`. `false` stops verifying Jenkins certificates entirely, for a private chain that cannot be trusted any other way — see [A Jenkins with a private certificate](#a-jenkins-with-a-private-certificate). Trusting the CA via `SSL_CERT_FILE` is the fix that keeps verification on and covers GitLab and Jira too; `radar check` warns while this is set. |
 | `gamification` | Consumed in Phase 3; carried verbatim for now. |
 

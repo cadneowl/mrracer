@@ -18,8 +18,26 @@ text for an LLM agent, and an ``env:`` value stays out of it by default (see
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from .config import Config, gitlab_credentials
+
+# How much of the change list goes inline. The rest is in the file beside it:
+# an agent needs enough to see the shape of what changed, not every path.
+_INLINE_COMMITS = 20
+_INLINE_FILES = 5
+
+
+def _commit_line(commit, file_limit: int | None) -> str:
+    """One commit, with its files capped (or not, for the file on disk)."""
+    head = f"- `{commit.short_sha}` {commit.author} {commit.when}".rstrip()
+    body = f"\n  {commit.message}" if commit.message else ""
+    if not commit.files:
+        return head + body
+    shown = commit.files if file_limit is None else commit.files[:file_limit]
+    more = len(commit.files) - len(shown)
+    files = f"\n  files: {', '.join(shown)}" + (f" (+{more} more)" if more else "")
+    return head + body + files
 
 
 def build_review_input(source, project_id: int, mr_iid: int) -> str:
@@ -43,7 +61,9 @@ def build_review_input(source, project_id: int, mr_iid: int) -> str:
     return "\n\n".join(parts)
 
 
-def build_jenkins_input(client, job, status, log_lines: int, number: int) -> str:
+def build_jenkins_input(
+    client, job, status, log_lines: int, number: int, dest_dir: str | None = None
+) -> str:
     """Fetch what Jenkins knows about a broken build and format it for the skill.
 
     Two pieces of evidence, in the order a person would want them: what changed
@@ -55,7 +75,7 @@ def build_jenkins_input(client, job, status, log_lines: int, number: int) -> str
     the one being explained is the last that finished. Reading it here would
     describe one build while every other part of the job named the other.
     """
-    from .jenkins import RUNNING, commit_range, fetch_builds, fetch_log_tail
+    from .jenkins import RUNNING, commit_range, fetch_builds, fetch_log_tail, slug
 
     # For a job building over a failure, the state to report is what the build
     # being analysed did, not what the job is doing now.
@@ -69,18 +89,29 @@ def build_jenkins_input(client, job, status, log_lines: int, number: int) -> str
     last_good, commits = commit_range(fetch_builds(client, job), number)
     if commits:
         since = f"the last successful build (#{last_good})" if last_good else "the builds on record"
-        listed = []
-        for commit in commits:
-            head = f"- `{commit.short_sha}` {commit.author} {commit.when}".rstrip()
-            body = f"\n  {commit.message}" if commit.message else ""
-            files = f"\n  files: {', '.join(commit.files)}" if commit.files else ""
-            listed.append(head + body + files)
-        note = (
-            ""
-            if last_good
-            else "\n\nNo successful build is within the window radar looked at, so these are "
-            "the changes it can see rather than the full range since it last passed."
-        )
+        total_files = sum(len(c.files) for c in commits)
+        listed = [_commit_line(c, _INLINE_FILES) for c in commits[:_INLINE_COMMITS]]
+
+        # Capped, because this section has no natural size: one merge commit in
+        # a monorepo lists thousands of paths, and twenty-five builds of them
+        # ran to megabytes — a prompt too long to send, spent on file names.
+        note = ""
+        if len(commits) > _INLINE_COMMITS or total_files > _INLINE_FILES * _INLINE_COMMITS:
+            note = (
+                f"\n\n{min(len(commits), _INLINE_COMMITS)} of {len(commits)} commits shown, "
+                f"{total_files} files touched in all."
+            )
+        if dest_dir:
+            full = Path(dest_dir) / f"{slug(job.name)}-{number}-commits.txt"
+            full.write_text(
+                "\n".join(_commit_line(c, None) for c in commits), encoding="utf-8"
+            )
+            note += f"\n\nEvery commit and file: {full}"
+        if not last_good:
+            note += (
+                "\n\nNo successful build is within the window radar looked at, so these are "
+                "the changes it can see rather than the full range since it last passed."
+            )
         parts.append(f"## Commits since {since}\n\n" + "\n".join(listed) + note)
     else:
         # Said out loud: an empty list is evidence too — it points at the
@@ -93,7 +124,23 @@ def build_jenkins_input(client, job, status, log_lines: int, number: int) -> str
             " rather than something in the code."
         )
 
-    log = fetch_log_tail(client, job, number, lines=log_lines)
+    log = fetch_log_tail(client, job, number, lines=log_lines, dest_dir=dest_dir)
+    if log.path:
+        # The file first, then the excerpt: what an agent should do with a large
+        # log is search it, and it can only do that if it knows where it is.
+        held = f"{log.slab_lines:,} lines, {log.slab_bytes / 1_000_000:.1f} MB"
+        whole = (
+            f"the last {held} of {log.total_bytes / 1_000_000:.1f} MB"
+            if log.total_bytes > log.slab_bytes
+            else held
+        )
+        parts.append(
+            f"## Console log\n\nThe log is at `{log.path}` ({whole}). Open or search it for "
+            "anything the excerpt below does not cover — the first error is usually well "
+            f"above the end.\n\nLast {log.lines} lines:\n\n```\n{log.text}\n```"
+        )
+        return "\n\n".join(parts)
+
     if not log.has_end:
         # Said plainly: the opening of a build is where it says what it is about
         # to do, not why it failed, and an agent handed it without warning would
@@ -189,14 +236,18 @@ def jenkins_stdin_provider_for(
     if skill is None:
         return None
 
-    def provider(source_root: str = "", inputs: dict | None = None) -> str:
+    def provider(
+        source_root: str = "", inputs: dict | None = None, scratch: str = ""
+    ) -> str:
         # Always the evidence: being named in `jenkins.analysis.skill` is what
         # gets it, so there is no second switch to forget. (`include_context`
         # gates the merge-request fetches, where a skill may sensibly want none;
         # an analysis with no commits and no log has nothing to work from, and
         # the loader refuses that setting on this skill rather than ignoring it.)
         parts = [
-            build_jenkins_input(client, job, status, config.jenkins.log_tail_lines, number)
+            build_jenkins_input(
+                client, job, status, config.jenkins.log_tail_lines, number, scratch
+            )
         ]
         if source_root:
             parts.append(build_source_section(source_root))
@@ -258,7 +309,9 @@ def stdin_provider_for(
         return None
     worktree = getattr(skill, "checkout", "none") == "worktree"
 
-    def provider(source_root: str = "", inputs: dict | None = None) -> str:
+    def provider(
+        source_root: str = "", inputs: dict | None = None, scratch: str = ""
+    ) -> str:
         parts = [section() for section in fetchers]
         if source_root:
             parts.append(build_source_section(source_root, worktree=worktree))

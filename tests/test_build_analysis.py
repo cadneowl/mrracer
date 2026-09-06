@@ -5,6 +5,8 @@ Every fetch goes through an injected getter, so nothing here touches a Jenkins.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -139,7 +141,7 @@ def test_only_the_tail_of_a_huge_log_is_fetched():
     calls: list[str] = []
     body = "\n".join(f"line {i}" for i in range(1000))
     client = _text_client(
-        {"start=1125899906842624": ("", {"X-Text-Size": "9000000"}), "start=8744000": (body, {})},
+        {"start=1125899906842624": ("", {"X-Text-Size": "9000000"}), "start=7000000": (body, {})},
         calls,
     )
 
@@ -149,7 +151,7 @@ def test_only_the_tail_of_a_huge_log_is_fetched():
     assert (log.lines, log.truncated) == (5, True)
     assert log.total_bytes == 9000000
     # The probe, then the tail — and the tail is asked for by byte offset.
-    assert len(calls) == 2 and "start=8744000" in calls[1]  # 9,000,000 - 256,000
+    assert len(calls) == 2 and "start=7000000" in calls[1]  # 9,000,000 - 2,000,000
 
 
 def test_a_jenkins_that_will_not_report_a_size_falls_back_to_consoletext():
@@ -185,6 +187,24 @@ def test_a_log_whose_end_cannot_be_reached_is_not_passed_off_as_the_tail():
 
     assert log.has_end is False
     assert log.truncated is True
+
+
+def test_a_log_of_enormous_lines_cannot_become_the_prompt(tmp_path):
+    """A line count bounds nothing on its own. A build printing a JSON document
+    or a base64 blob per line reaches megabytes in a hundred lines — which is
+    the "prompt is too long" that sent the evidence to files in the first place,
+    and which raising the slab size made worse before this cap existed."""
+    log = "\n".join("x" * 20_000 for _ in range(200))
+    client = _text_client(
+        {"1125899906842624": ("", {"X-Text-Size": str(len(log))}), "start=": (log, {})}
+    )
+
+    result = fetch_log_tail(client, JOB, 93, lines=120, dest_dir=str(tmp_path))
+
+    assert len(result.text) < 25_000, f"excerpt is {len(result.text):,} chars"
+    assert "chars in the file" in result.text  # each clipped line says so
+    # Nothing is lost: the file holds the lines whole.
+    assert len(pathlib.Path(result.path).read_text(encoding="utf-8")) > 1_000_000
 
 
 def test_a_ranged_fallback_really_is_the_end():
@@ -361,6 +381,50 @@ def test_the_bundle_describes_the_build_being_analysed_not_the_one_now_running()
     assert "#130" not in text  # never the build that has not finished
     assert "Result: FAILED" in text  # what #128 did, not "RUNNING"
     assert all("/128/" in url for url in fetched)  # the log fetched is #128's
+
+
+def test_the_bundle_stays_small_however_ugly_the_build_is(tmp_path):
+    """What this exists to stop: "Prompt is too long". A monorepo merge lists
+    thousands of paths per commit and twenty-five builds of them ran to
+    megabytes, all of it file names. The evidence goes to files; the prompt gets
+    an excerpt and the paths."""
+    commits = [
+        {
+            "commitId": f"{i:040x}",
+            "msg": f"commit {i}",
+            "date": "2026-09-06",
+            "author": {"fullName": "dev"},
+            "affectedPaths": [f"src/pkg{j}/module{j}.py" for j in range(4000)],
+        }
+        for i in range(25)
+    ]
+    huge_log = "\n".join(f"[{i:06d}] building" for i in range(200_000))
+    client = JenkinsClient(
+        getter=lambda url: {
+            "builds": [_pipeline(93, "FAILURE", commits), _pipeline(92, "SUCCESS")]
+        },
+        text_getter=lambda url, headers=None: (
+            ("", {"X-Text-Size": str(len(huge_log))})
+            if "1125899906842624" in url
+            else (huge_log[-2_000_000:], {})
+        ),
+    )
+    status = map_status(_payload(_build(93, "FAILURE")), JOB)
+
+    text = build_jenkins_input(client, JOB, status, 120, 93, dest_dir=str(tmp_path))
+
+    # Inline: kilobytes, not megabytes. Unbounded, this was ~2.8 MB.
+    assert len(text) < 40_000, f"bundle is {len(text):,} chars"
+    assert "20 of 25 commits shown" in text and "100000 files touched in all" in text
+
+    # And nothing is lost — the whole of both is on disk, named in the bundle.
+    log_file = tmp_path / "backend-ci-93.log"
+    commits_file = tmp_path / "backend-ci-93-commits.txt"
+    assert str(log_file) in text and str(commits_file) in text
+    assert log_file.stat().st_size > 1_000_000
+    assert commits_file.read_text(encoding="utf-8").count("src/pkg0/module0.py") == 25
+    # The excerpt is the end of the log, which is where the failure is.
+    assert text.rstrip().endswith("[199999] building\n```")
 
 
 def test_a_build_with_no_commits_says_so_rather_than_staying_silent():
