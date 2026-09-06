@@ -140,8 +140,12 @@ jenkins:
   #
   # radar pipes the commits and the log tail to that skill on stdin, and saves
   # its answer against the build number. A wiring that could not work — an
-  # unknown skill, a disabled one — is refused when the config loads, rather
-  # than showing a strip that looks fine and offers nothing.
+  # unknown skill, a disabled one, a misspelled key — is refused when the config
+  # loads, rather than showing a strip that looks fine and offers nothing.
+  #
+  # Uncommenting this is half the job: the `analyze` skill at the bottom of this
+  # file ships `enabled: false` like every other, and naming a disabled skill
+  # here is refused. Turn both on.
   # analysis:
   #   enabled: true
   #   skill: analyze

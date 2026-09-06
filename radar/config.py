@@ -566,13 +566,12 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
 
     contexts = _parse_contexts(raw.get("context", builtin.get("context")), ctx)
 
+    # Checked in `_check_analysis_wiring` rather than here: whether an empty
+    # `context:` is a mistake depends on what this skill is wired to, and this
+    # function is parsed before anything knows that. Telling the CI strip's
+    # skill to "set context: gitlab_diff or jira" would be advice that is wrong
+    # for it, and that quietens the message without changing anything.
     include_context = bool(raw.get("include_context", builtin.get("include_context", False)))
-    if include_context and not contexts:
-        raise ConfigError(
-            f"{ctx}.include_context is true but no 'context' source is set, so radar "
-            "wouldn't know what to fetch. Set context: gitlab_diff or jira, or drop "
-            "include_context."
-        )
 
     stores_result = bool(raw.get("stores_result", builtin.get("stores_result", False)))
 
@@ -742,6 +741,26 @@ def _job_name(entry: dict, url: str) -> str:
     return unquote(segments[-1]) if segments else url
 
 
+# The button is spelled "analyse" everywhere it is written in prose, and the key
+# is "analysis" — so a misspelling is the likeliest way to write this block, and
+# an ignored key here reproduces the exact failure this wiring exists to remove.
+_JENKINS_KEYS = frozenset(
+    {"base_url", "poll_interval_seconds", "verify_ssl", "log_tail_lines", "analysis", "jobs"}
+)
+_ANALYSIS_KEYS = frozenset({"enabled", "skill"})
+_ANALYSIS_NAME = "analyze"
+
+
+def _reject_unknown(raw: dict, known: frozenset[str], ctx: str) -> None:
+    """Refuse keys this block does not read, naming the ones it does."""
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ConfigError(
+            f"{ctx}: unknown key(s) {', '.join(repr(k) for k in unknown)} — "
+            f"this block reads {', '.join(sorted(known))}"
+        )
+
+
 def _parse_jenkins_analysis(raw: object) -> JenkinsAnalysis:
     """Parse ``jenkins.analysis`` — the analyse button's wiring.
 
@@ -754,6 +773,7 @@ def _parse_jenkins_analysis(raw: object) -> JenkinsAnalysis:
         return JenkinsAnalysis()
     if not isinstance(raw, dict):
         raise ConfigError("jenkins.analysis: expected a mapping with 'skill' and 'enabled'")
+    _reject_unknown(raw, _ANALYSIS_KEYS, "jenkins.analysis")
 
     skill = str(raw.get("skill", "") or "").strip()
     enabled = raw.get("enabled", bool(skill))
@@ -778,6 +798,7 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
         return JenkinsConfig()
     if not isinstance(raw, dict):
         raise ConfigError("jenkins: expected a mapping")
+    _reject_unknown(raw, _JENKINS_KEYS, "jenkins")
 
     base_raw = raw.get("base_url")
     base_url = _http_url(base_raw, "jenkins.base_url") if base_raw else None
@@ -884,7 +905,36 @@ def _check_analysis_wiring(jenkins: JenkinsConfig, skills: tuple[SkillConfig, ..
     because there is nothing to notice and nothing to search for.
     """
     wiring = jenkins.analysis
+
+    for skill in skills:
+        # Deferred from `_parse_skill`, which cannot know what a skill is wired
+        # to (see the note there). An MR skill that fetches nothing has nothing
+        # to include; the wired skill is handled below.
+        if skill.include_context and not skill.contexts and skill.name != wiring.skill:
+            raise ConfigError(
+                f"skills[{skill.name}].include_context is true but no 'context' source is "
+                "set, so radar wouldn't know what to fetch. Set context: gitlab_diff or "
+                "jira, or drop include_context."
+            )
+
     if not wiring.enabled:
+        # A skill radar itself gives build-analysis cosmetics to, enabled and
+        # wired to nothing, is a button on every merge-request row running a
+        # command written for a build. That is the shape the previous release
+        # documented, so it is refused with the line that fixes it rather than
+        # left to be discovered on the board.
+        stray = next((s for s in skills if s.name == _ANALYSIS_NAME and s.enabled), None)
+        if stray is not None:
+            raise ConfigError(
+                f"a skill named {_ANALYSIS_NAME!r} is enabled but nothing wires it to the "
+                "CI strip, so it would appear as a button on every merge request instead. "
+                "Point at it from the jenkins block:\n\n"
+                "  jenkins:\n"
+                "    analysis:\n"
+                "      enabled: true\n"
+                f"      skill: {_ANALYSIS_NAME}\n\n"
+                "or rename the skill if it really is a merge-request one."
+            )
         return
 
     named = next((s for s in skills if s.name == wiring.skill), None)
@@ -912,6 +962,27 @@ def _check_analysis_wiring(jenkins: JenkinsConfig, skills: tuple[SkillConfig, ..
         raise ConfigError(
             "jenkins.analysis is enabled but no jenkins.jobs are configured, so there is "
             "no chip for the analyse button to appear on."
+        )
+
+    # Settings that describe a merge-request skill and do nothing here. Refused
+    # rather than ignored: a value radar reads and disregards is indistinguish-
+    # able from one it honours until someone depends on it.
+    inert = [
+        name
+        for name, is_set in (
+            ("context", bool(named.contexts)),
+            ("include_context", named.include_context),
+            ("stores_result", named.stores_result),
+        )
+        if is_set
+    ]
+    if inert:
+        raise ConfigError(
+            f"jenkins.analysis.skill names {wiring.skill!r}, which sets "
+            f"{', '.join(inert)} — those describe a merge-request skill and do nothing "
+            "for a build analysis. Being named here is what gets this skill the build's "
+            "commits and console log, and its answer is always saved against the build "
+            "number. Remove them."
         )
 
 

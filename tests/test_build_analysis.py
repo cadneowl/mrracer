@@ -482,7 +482,7 @@ def test_radar_check_says_which_skill_the_button_runs(tmp_path):
     wired = tmp_path / "wired.yaml"
     wired.write_text(_BASE_CONFIG + _WIRED, encoding="utf-8")
     unwired = tmp_path / "unwired.yaml"
-    unwired.write_text(_BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, encoding="utf-8")
+    unwired.write_text(_BASE_CONFIG + _JENKINS_JOBS + _OTHER_SKILL, encoding="utf-8")
 
     import radar.jenkins as jenkins_mod
 
@@ -498,20 +498,81 @@ def test_radar_check_says_which_skill_the_button_runs(tmp_path):
     assert off.status == "skip" and "jenkins.analysis.skill" in off.detail
 
 
+_OTHER_SKILL = """
+skills:
+  - name: poke
+    enabled: true
+    command: echo hi
+"""
+
+
 def test_an_unwired_skill_is_just_a_skill(tmp_path):
     """The complaint this shape answers: a skill does not turn a button on by
-    being named something, or by declaring anything. Only the wiring does."""
+    being named something, or by declaring anything. Only the wiring does — and
+    an unwired skill is an ordinary merge-request one."""
     path = tmp_path / "unwired.yaml"
-    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, encoding="utf-8")
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + _OTHER_SKILL, encoding="utf-8")
     config = load_config(path)
 
     assert config.analysis_skill is None
-    assert config.skill_by_name("analyze") is not None  # declared, just not wired
+    assert config.skill_by_name("poke") is not None  # declared, just not wired
 
     db_path = tmp_path / "unwired.db"
     Database(db_path).close()
     client = TestClient(create_app(config, str(db_path), jenkins=_monitor()))
-    assert "/analyze" not in client.get("/partials/ci").text
+    assert "/jenkins/" not in client.get("/partials/ci").text  # no strip button
+
+
+def test_the_shape_the_previous_release_documented_is_refused_not_misplaced(tmp_path):
+    """`skills: - name: analyze` used to inherit the build-analysis capability
+    from its name. With the wiring explicit it inherits only a label and an
+    icon, so left unwired it would render "🔎 analyse" on every merge-request
+    row and run a build command with no build. Refused, with the fix quoted."""
+    path = tmp_path / "old.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+
+    message = str(exc.value)
+    assert "nothing wires it to the CI strip" in message
+    assert "skill: analyze" in message  # the line to paste
+
+
+@pytest.mark.parametrize(
+    "setting", ["context: jira", "include_context: true", "stores_result: true"]
+)
+def test_merge_request_settings_on_the_wired_skill_are_refused_not_ignored(tmp_path, setting):
+    """A value radar reads and disregards is indistinguishable from one it
+    honours, until somebody depends on it."""
+    skills = _ANALYZE_SKILL.replace(
+        "    command:", f"    {setting}\n    command:"
+    )
+    path = tmp_path / "inert.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + _WIRING + skills, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+    assert "do nothing for a build analysis" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        ("  analyse: {enabled: true, skill: analyze}\n", "unknown key(s) 'analyse'"),
+        ("  analysis: {enabled: true, skil: analyze}\n", "unknown key(s) 'skil'"),
+    ],
+)
+def test_a_misspelled_key_is_refused_rather_than_dropped(tmp_path, block, expected):
+    """The button is spelled "analyse" in every sentence and the key is
+    "analysis", so this is the likeliest way to write the block — and an ignored
+    key here reproduces exactly the silence this wiring exists to remove."""
+    path = tmp_path / "typo.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + block + _ANALYZE_SKILL, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+    assert expected in str(exc.value)
 
 
 def test_an_unknown_job_name_is_refused(tmp_path):
