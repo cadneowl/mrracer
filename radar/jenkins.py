@@ -44,7 +44,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .config import JenkinsJob
+from .config import DEFAULT_LOG_TAIL_LINES, JenkinsJob
 
 log = logging.getLogger("radar.jenkins")
 
@@ -382,7 +382,6 @@ BUILDS_WINDOW = 25
 # The tail actually pulled back, and how much of it is shown. The byte cap
 # bounds what crosses the network; the line count is what the skill reads.
 LOG_TAIL_BYTES = 2_000_000
-DEFAULT_LOG_TAIL_LINES = 120
 # Ceilings on what goes *inline*. The line count says how much of the end to
 # show; these say how big that is allowed to get, because a line count on its
 # own bounds nothing — one build printing a JSON document per line reaches
@@ -497,7 +496,7 @@ def fetch_builds(client: JenkinsClient, job: JenkinsJob, limit: int = BUILDS_WIN
     return list(client.fetch_json(url).get("builds") or [])
 
 
-def _excerpt(lines: list[str], keep_last: bool) -> list[str]:
+def _excerpt(lines: list[str], keep_last: bool, have_file: bool) -> list[str]:
     """Bound the inline excerpt by bytes as well as by line count.
 
     A line count alone bounds nothing: a build that prints a JSON document or a
@@ -510,7 +509,8 @@ def _excerpt(lines: list[str], keep_last: bool) -> list[str]:
         if len(line) <= _EXCERPT_LINE_CHARS:
             return line
         elided = len(line) - _EXCERPT_LINE_CHARS
-        return line[:_EXCERPT_LINE_CHARS] + f"… (+{elided} chars in the file)"
+        where = " in the file" if have_file else ""
+        return line[:_EXCERPT_LINE_CHARS] + f"… (+{elided} chars{where})"
 
     clipped = [clip(line) for line in lines]
     ordered = list(reversed(clipped)) if keep_last else clipped
@@ -589,12 +589,15 @@ def fetch_log_tail(
             from_offset = True
         elif size > _MAX_LOG_BYTES:  # the read hit its ceiling: a prefix, not all
             from_offset, has_end = True, False
+            total = 0  # how much more there is, nobody said
         # else: the whole log came back and it is short — nothing was left out.
 
     kept = text.splitlines()
     # With no end in hand the opening lines are at least coherent; the tail of a
     # prefix is an arbitrary point in the middle.
-    shown = _excerpt(kept[-lines:] if has_end else kept[:lines], keep_last=has_end)
+    shown = _excerpt(
+        kept[-lines:] if has_end else kept[:lines], keep_last=has_end, have_file=bool(dest_dir)
+    )
 
     path = None
     if dest_dir:
@@ -608,7 +611,7 @@ def fetch_log_tail(
         text="\n".join(shown),
         lines=len(shown),
         total_bytes=total,
-        truncated=from_offset or len(kept) > lines,
+        truncated=from_offset or len(shown) < len(kept),
         has_end=has_end,
         path=path,
         slab_bytes=len(text.encode("utf-8", "replace")),

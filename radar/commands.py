@@ -545,13 +545,17 @@ class CommandRunner:
         # the child would leave the two phases most likely to hang unbounded.
         deadline = time.monotonic() + self.config.timeout_seconds
         worktree = None
-        # Somewhere for this run's evidence to live. A build log runs to tens of
-        # megabytes: it is handed over as a file the skill can search, not as
-        # prompt text, and it exists for exactly as long as the run that reads
-        # it. Made here rather than by the provider so the `finally` below owns
-        # its removal the way it owns the worktree's.
-        scratch = tempfile.mkdtemp(prefix="radar-job-")
+        scratch = ""
         try:
+            # Somewhere for this run's evidence to live. A build log runs to tens
+            # of megabytes: it is handed over as a file the skill can search, not
+            # as prompt text, and it lives exactly as long as the run that reads
+            # it — the `finally` below owns its removal the way it owns the
+            # worktree's. Inside the try, because this function is a thread
+            # target with nothing above it: a mkdtemp that raises (no TMPDIR, a
+            # full disk) would kill the worker before the catch-all runs and
+            # leave the job "running" for a panel that tails it forever.
+            scratch = tempfile.mkdtemp(prefix="radar-job-")
             if self.checkout == "worktree":
                 self._add(job, "log", "preparing this merge request's worktree…")
                 worktree = create_mr_worktree(
@@ -573,7 +577,8 @@ class CommandRunner:
             log.exception("%s worker crashed", self.kind)
             _fail(job, f"unexpected error: {exc}")
         finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+            if scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
             if worktree is not None:
                 worktree.cleanup()
 

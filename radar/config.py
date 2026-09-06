@@ -30,6 +30,13 @@ class ConfigError(Exception):
     """Raised when config.yaml is missing, malformed, or invalid."""
 
 
+# How many lines of a broken build's console log go inline in the analysis
+# bundle. Lives here, where the config default is, and is imported by the module
+# that uses it: the two were separate numbers once, and lowering one left the
+# documentation describing a value no unset config ever got.
+DEFAULT_LOG_TAIL_LINES = 120
+
+
 # The credential variables radar reads for itself. Named here once: they are
 # stripped from every skill's environment (see ``commands._ENV_DENYLIST``) and
 # refused in a skill's own ``env:`` block, so neither path can hand a skill
@@ -197,7 +204,7 @@ class JenkinsConfig:
     # The tail, because that is where a failure prints; big enough to hold a
     # stack trace and the test summary above it, small enough to leave an agent
     # room to think about it.
-    log_tail_lines: int = 400
+    log_tail_lines: int = DEFAULT_LOG_TAIL_LINES
 
 
 @dataclass(frozen=True)
@@ -820,7 +827,7 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
         # this particular setting to be wrong.
         raise ConfigError("jenkins.verify_ssl: expected true or false")
 
-    log_tail_lines = raw.get("log_tail_lines", 400)
+    log_tail_lines = raw.get("log_tail_lines", DEFAULT_LOG_TAIL_LINES)
     try:
         log_tail_lines = int(log_tail_lines)
     except (TypeError, ValueError):

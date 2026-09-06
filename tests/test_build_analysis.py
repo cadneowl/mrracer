@@ -427,6 +427,42 @@ def test_the_bundle_stays_small_however_ugly_the_build_is(tmp_path):
     assert text.rstrip().endswith("[199999] building\n```")
 
 
+def test_a_log_radar_only_has_the_start_of_is_never_described_as_the_end(tmp_path):
+    """A Jenkins that reports no size and ignores a byte range leaves radar
+    holding the build's *opening*. Saying "last N lines" over that, or naming
+    its size as the whole log's, is how an agent comes to reason confidently
+    about the wrong part of a run — and the file makes it worse, because now it
+    can grep, find nothing, and conclude the error is not in the log at all."""
+    from radar.jenkins import _MAX_LOG_BYTES
+
+    prefix = "\n".join(f"[{i:06d}] starting up" for i in range(200_000))[: _MAX_LOG_BYTES + 10]
+    client = JenkinsClient(
+        getter=lambda url: {"builds": [_pipeline(93, "FAILURE")]},
+        text_getter=lambda url, headers=None: (
+            ("", {}) if "progressiveText" in url else (prefix, {})
+        ),
+    )
+    status = map_status(_payload(_build(93, "FAILURE")), JOB)
+
+    text = build_jenkins_input(client, JOB, status, 120, 93, dest_dir=str(tmp_path))
+
+    assert "First 120 lines" in text and "Last 120 lines" not in text
+    assert "the FIRST" in text  # what the file holds, not "the last X of Y"
+    assert "end of this log could not be fetched" in text
+    assert "is NOT below" in text
+
+
+def test_the_documented_default_is_the_one_an_unset_config_gets(tmp_path):
+    """Two copies of one number drifted the moment one was lowered: the README
+    and the example promised 120 inline lines while every unset config got 400."""
+    from radar.jenkins import DEFAULT_LOG_TAIL_LINES
+
+    path = tmp_path / "plain.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS, encoding="utf-8")
+
+    assert load_config(path).jenkins.log_tail_lines == DEFAULT_LOG_TAIL_LINES == 120
+
+
 def test_a_build_with_no_commits_says_so_rather_than_staying_silent():
     """An empty list is evidence: it points at the environment rather than at
     the change, and a skill told nothing would have to guess which."""

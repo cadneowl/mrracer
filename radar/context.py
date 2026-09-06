@@ -104,7 +104,12 @@ def build_jenkins_input(
         if dest_dir:
             full = Path(dest_dir) / f"{slug(job.name)}-{number}-commits.txt"
             full.write_text(
-                "\n".join(_commit_line(c, None) for c in commits), encoding="utf-8"
+                "\n".join(_commit_line(c, None) for c in commits),
+                encoding="utf-8",
+                # A commit message can carry a lone surrogate (json.loads makes
+                # one out of a \udXXX escape). Without this the write raises and
+                # the whole analysis is lost over one mangled character.
+                errors="replace",
             )
             note += f"\n\nEvery commit and file: {full}"
         if not last_good:
@@ -125,36 +130,52 @@ def build_jenkins_input(
         )
 
     log = fetch_log_tail(client, job, number, lines=log_lines, dest_dir=dest_dir)
-    if log.path:
-        # The file first, then the excerpt: what an agent should do with a large
-        # log is search it, and it can only do that if it knows where it is.
-        held = f"{log.slab_lines:,} lines, {log.slab_bytes / 1_000_000:.1f} MB"
-        whole = (
+    parts.append(_log_section(log))
+    return "\n\n".join(parts)
+
+
+def _log_section(log) -> str:
+    """The console log: where the file is, what part of it this is, and an excerpt.
+
+    ``has_end`` governs every sentence here. Radar can end up holding the
+    *beginning* of a log — a Jenkins that reports no size and ignores a byte
+    range leaves nothing else to read — and the opening of a build is where it
+    says what it is about to do, not why it failed. Describing that as the tail,
+    or as the whole log, is how an agent comes to reason confidently about the
+    wrong part of a run.
+    """
+    held = f"{log.slab_lines:,} lines, {log.slab_bytes / 1_000_000:.1f} MB"
+    if not log.has_end:
+        size = f"the FIRST {held}; the log is longer and its end could not be fetched"
+        hint = (
+            "the end of this log could not be fetched, so the failure itself is NOT below "
+            "and is not at the end of the file either"
+        )
+        where = f"First {log.lines} lines"
+    else:
+        size = (
             f"the last {held} of {log.total_bytes / 1_000_000:.1f} MB"
             if log.total_bytes > log.slab_bytes
             else held
         )
-        parts.append(
-            f"## Console log\n\nThe log is at `{log.path}` ({whole}). Open or search it for "
-            "anything the excerpt below does not cover — the first error is usually well "
-            f"above the end.\n\nLast {log.lines} lines:\n\n```\n{log.text}\n```"
-        )
-        return "\n\n".join(parts)
+        hint = "the first error is usually well above the end"
+        where = f"Last {log.lines} lines"
 
-    if not log.has_end:
-        # Said plainly: the opening of a build is where it says what it is about
-        # to do, not why it failed, and an agent handed it without warning would
-        # reason confidently about the wrong part of the run.
-        scope = (
-            f"first {log.lines} lines — radar could not fetch the end of this log, "
-            "so the failure itself is NOT below"
+    if log.path:
+        return (
+            f"## Console log\n\nThe log is at `{log.path}` ({size}). Open or search it for "
+            f"anything the excerpt below does not cover — {hint}.\n\n{where}:\n\n"
+            f"```\n{log.text}\n```"
         )
+
+    # No file: the excerpt is all there is, so the heading carries the caveat.
+    if not log.has_end:
+        scope = f"first {log.lines} lines — {hint}"
     elif log.truncated:
         scope = f"last {log.lines} lines"
     else:
         scope = f"all {log.lines} lines"
-    parts.append(f"## Console log ({scope})\n\n```\n{log.text}\n```")
-    return "\n\n".join(parts)
+    return f"## Console log ({scope})\n\n```\n{log.text}\n```"
 
 
 def _format_issue(key: str, issue: dict, child: bool = False) -> str:
