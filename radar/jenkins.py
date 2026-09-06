@@ -31,6 +31,7 @@ import base64
 import http.client
 import json
 import logging
+import re
 import ssl
 import threading
 import urllib.error
@@ -40,9 +41,10 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlparse
 
-from .config import JenkinsJob
+from .config import DEFAULT_LOG_TAIL_LINES, JenkinsJob
 
 log = logging.getLogger("radar.jenkins")
 
@@ -379,8 +381,13 @@ BUILDS_WINDOW = 25
 
 # The tail actually pulled back, and how much of it is shown. The byte cap
 # bounds what crosses the network; the line count is what the skill reads.
-LOG_TAIL_BYTES = 256_000
-DEFAULT_LOG_TAIL_LINES = 400
+LOG_TAIL_BYTES = 2_000_000
+# Ceilings on what goes *inline*. The line count says how much of the end to
+# show; these say how big that is allowed to get, because a line count on its
+# own bounds nothing — one build printing a JSON document per line reaches
+# megabytes in a hundred of them.
+_EXCERPT_CHARS = 20_000
+_EXCERPT_LINE_CHARS = 2_000
 _MAX_LOG_BYTES = 4_000_000  # ceiling on a console-log read
 _MAX_JSON_BYTES = 8_000_000  # ceiling on an api/json read, refused rather than cut
 
@@ -405,10 +412,17 @@ class Commit:
 
 @dataclass(frozen=True)
 class BuildLog:
-    text: str
+    text: str  # the inline excerpt: the last `lines` lines
     lines: int  # lines in `text`
     total_bytes: int  # size of the whole log, 0 when Jenkins would not say
     truncated: bool
+    # Where the whole slab radar pulled back was written, if anywhere. A build
+    # log runs to tens of megabytes and an agent cannot be handed that as prompt
+    # text, but it can open a file and search it — so the excerpt is what a
+    # small failure needs, and this is what a real one does.
+    path: str | None = None
+    slab_bytes: int = 0  # how much of the log the file holds
+    slab_lines: int = 0
     # Whether `text` reaches the end of the log. False means radar could only
     # get the beginning — which is where a build says what it is about to do,
     # not why it failed. The bundle says so rather than presenting the opening
@@ -482,11 +496,50 @@ def fetch_builds(client: JenkinsClient, job: JenkinsJob, limit: int = BUILDS_WIN
     return list(client.fetch_json(url).get("builds") or [])
 
 
+def _excerpt(lines: list[str], keep_last: bool, have_file: bool) -> list[str]:
+    """Bound the inline excerpt by bytes as well as by line count.
+
+    A line count alone bounds nothing: a build that prints a JSON document or a
+    base64 blob per line puts megabytes into the prompt in a hundred lines, and
+    "prompt is too long" is what comes back. So each line is clipped, and lines
+    are then dropped from the far end until the whole thing fits. Everything
+    dropped is still in the file the bundle names.
+    """
+    def clip(line: str) -> str:
+        if len(line) <= _EXCERPT_LINE_CHARS:
+            return line
+        elided = len(line) - _EXCERPT_LINE_CHARS
+        where = " in the file" if have_file else ""
+        return line[:_EXCERPT_LINE_CHARS] + f"… (+{elided} chars{where})"
+
+    clipped = [clip(line) for line in lines]
+    ordered = list(reversed(clipped)) if keep_last else clipped
+    out: list[str] = []
+    size = 0
+    for line in ordered:
+        size += len(line) + 1
+        if size > _EXCERPT_CHARS and out:
+            break
+        out.append(line)
+    return list(reversed(out)) if keep_last else out
+
+
+def slug(text: str) -> str:
+    """A job name as a filename component: no separators, no surprises.
+
+    Job names carry spaces and slashes ("hub/e2e/nightly build"), and these
+    names reach the filesystem.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-")
+    return cleaned or "job"
+
+
 def fetch_log_tail(
     client: JenkinsClient,
     job: JenkinsJob,
     number: int,
     lines: int = DEFAULT_LOG_TAIL_LINES,
+    dest_dir: str | None = None,
 ) -> BuildLog:
     """The end of a build's console log — where the failure is.
 
@@ -494,6 +547,11 @@ def fetch_log_tail(
     past the end, which answers with the log's size, and then for the last
     ``LOG_TAIL_BYTES`` of it. Fetching ``consoleText`` instead would drag a
     hundred-megabyte log across the network to read its last few hundred lines.
+
+    With ``dest_dir``, that slab is written there and the returned excerpt is
+    only its last ``lines`` lines. A log of few, very long lines — a JSON dump,
+    a base64 blob — would otherwise put a quarter of a megabyte into a prompt on
+    its own, and an agent can do nothing with a window it cannot move.
     """
     base = f"{job.url}/{number}"
     text, total = "", 0
@@ -531,18 +589,33 @@ def fetch_log_tail(
             from_offset = True
         elif size > _MAX_LOG_BYTES:  # the read hit its ceiling: a prefix, not all
             from_offset, has_end = True, False
+            total = 0  # how much more there is, nobody said
         # else: the whole log came back and it is short — nothing was left out.
 
     kept = text.splitlines()
     # With no end in hand the opening lines are at least coherent; the tail of a
     # prefix is an arbitrary point in the middle.
-    shown = kept[-lines:] if has_end else kept[:lines]
+    shown = _excerpt(
+        kept[-lines:] if has_end else kept[:lines], keep_last=has_end, have_file=bool(dest_dir)
+    )
+
+    path = None
+    if dest_dir:
+        # The whole slab, for an agent to search. Written before the excerpt is
+        # cut, so what it reads is a superset of what it was shown.
+        target = Path(dest_dir) / f"{slug(job.name)}-{number}.log"
+        target.write_text(text, encoding="utf-8", errors="replace")
+        path = str(target)
+
     return BuildLog(
         text="\n".join(shown),
         lines=len(shown),
         total_bytes=total,
-        truncated=from_offset or len(kept) > lines,
+        truncated=from_offset or len(shown) < len(kept),
         has_end=has_end,
+        path=path,
+        slab_bytes=len(text.encode("utf-8", "replace")),
+        slab_lines=len(kept),
     )
 
 

@@ -74,7 +74,10 @@ def test_build_argv_allows_literal_flags():
 def test_runner_reports_flag_smuggling_as_job_error():
     cfg = ReviewConfig(enabled=True, command="mytool {title}", timeout_seconds=30)
     runner = CommandRunner(cfg, "review")
-    job = runner.start({"project_id": 1, "mr_iid": 2, "title": "-rf"})
+    # Awaited, not read straight back: the refusal happens on the worker thread
+    # (the argv cannot be built until a worktree has given it a source root), so
+    # reading the status here was always a race the main thread happened to win.
+    job = _await(runner, runner.start({"project_id": 1, "mr_iid": 2, "title": "-rf"}))
     assert job.status == "error"
     assert "flag" in job.error
 

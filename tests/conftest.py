@@ -43,6 +43,26 @@ gamification:
 """
 
 
+@pytest.fixture(autouse=True)
+def _own_working_directory(tmp_path, monkeypatch):
+    """Run every test from a directory of its own.
+
+    radar reads a ``.env`` from beside the config it was given *and* from the
+    process working directory, so without this a ``.env`` in whatever directory
+    pytest was started from reaches tests that never mentioned one. The tests
+    that assert nothing was found break, and so does the one that clears
+    GITLAB_URL — ``run_checks`` re-reads the file and puts it back.
+
+    A fresh checkout has no ``.env``, and a machine actually running radar
+    does. So the suite passed for whoever wrote it and failed with five or six
+    unrelated-looking errors for everyone running it where it matters. Tests
+    that care about the working directory chdir again themselves.
+    """
+    home = tmp_path / "cwd"
+    home.mkdir()
+    monkeypatch.chdir(home)
+
+
 @pytest.fixture
 def config(tmp_path):
     path = tmp_path / "config.yaml"

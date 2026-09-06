@@ -36,8 +36,10 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -543,7 +545,17 @@ class CommandRunner:
         # the child would leave the two phases most likely to hang unbounded.
         deadline = time.monotonic() + self.config.timeout_seconds
         worktree = None
+        scratch = ""
         try:
+            # Somewhere for this run's evidence to live. A build log runs to tens
+            # of megabytes: it is handed over as a file the skill can search, not
+            # as prompt text, and it lives exactly as long as the run that reads
+            # it — the `finally` below owns its removal the way it owns the
+            # worktree's. Inside the try, because this function is a thread
+            # target with nothing above it: a mkdtemp that raises (no TMPDIR, a
+            # full disk) would kill the worker before the catch-all runs and
+            # leave the job "running" for a panel that tails it forever.
+            scratch = tempfile.mkdtemp(prefix="radar-job-")
             if self.checkout == "worktree":
                 self._add(job, "log", "preparing this merge request's worktree…")
                 worktree = create_mr_worktree(
@@ -554,7 +566,9 @@ class CommandRunner:
                     timeout_s=deadline - time.monotonic(),
                 )
             source_root = str(worktree.path) if worktree else (resolved.source_root or "")
-            self._execute(job, ctx, source_root, resolved, deadline, on_success, stdin_provider)
+            self._execute(
+                job, ctx, source_root, resolved, deadline, on_success, stdin_provider, scratch
+            )
         except WorktreeError as exc:
             _fail(job, str(exc))
         except TimeoutError as exc:
@@ -563,6 +577,8 @@ class CommandRunner:
             log.exception("%s worker crashed", self.kind)
             _fail(job, f"unexpected error: {exc}")
         finally:
+            if scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
             if worktree is not None:
                 worktree.cleanup()
 
@@ -575,6 +591,7 @@ class CommandRunner:
         deadline: float,
         on_success,
         stdin_provider=None,
+        scratch: str = "",
     ) -> None:
         # Built here, not in `start`, because a worktree's path is only known
         # once the worker has made it — and `{source_root}` must name the tree
@@ -597,7 +614,7 @@ class CommandRunner:
         if stdin_provider is not None:
             self._add(job, "log", "fetching context…")
             stdin_text = _with_deadline(
-                lambda: stdin_provider(source_root, resolved.inputs.shown),
+                lambda: stdin_provider(source_root, resolved.inputs.shown, scratch),
                 deadline - time.monotonic(),
                 "fetching context",
             )

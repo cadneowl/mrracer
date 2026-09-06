@@ -92,7 +92,7 @@ def test_runner_pipes_stdin_provider_to_command():
     runner = CommandRunner(cfg, "review")
     job = runner.start(
         {"project_id": 1, "mr_iid": 2},
-        stdin_provider=lambda root="", inputs=None: "# Diff\nHELLO-FROM-STDIN",
+        stdin_provider=lambda root="", inputs=None, scratch="": "# Diff\nHELLO-FROM-STDIN",
     )
     done = _await(runner, job)
     assert done.status == "done"
@@ -108,7 +108,7 @@ def test_a_hanging_context_fetch_fails_the_job_instead_of_running_forever():
     """
     stuck = threading.Event()
 
-    def never_returns(source_root="", inputs=None):
+    def never_returns(source_root="", inputs=None, scratch=""):
         stuck.wait(30)  # a server that accepts the connection and says nothing
         return "too late"
 
@@ -140,7 +140,7 @@ def test_the_command_gets_what_is_left_of_the_budget():
         runner,
         runner.start(
             {"project_id": 1, "mr_iid": 2},
-            stdin_provider=lambda root="", inputs=None: (time.sleep(3), "ctx")[1],
+            stdin_provider=lambda root="", inputs=None, scratch="": (time.sleep(3), "ctx")[1],
         ),
         timeout=30,
     )
@@ -149,7 +149,7 @@ def test_the_command_gets_what_is_left_of_the_budget():
 
 
 def test_runner_stdin_provider_failure_is_job_error():
-    def boom(source_root="", inputs=None):
+    def boom(source_root="", inputs=None, scratch=""):
         raise RuntimeError("fetch failed")
 
     cfg = ReviewConfig(enabled=True, command=ECHO_STDIN, timeout_seconds=30)
@@ -229,7 +229,9 @@ skills:
     import radar.web.app as appmod
 
     def fake_provider(kind, cfg, pid, iid, keys):
-        return (lambda root="", inputs=None: "BACKEND-DIFF-MARKER") if kind == "review" else None
+        if kind != "review":
+            return None
+        return lambda root="", inputs=None, scratch="": "BACKEND-DIFF-MARKER"
 
     monkeypatch.setattr(appmod, "stdin_provider_for", fake_provider)
 
