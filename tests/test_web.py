@@ -210,6 +210,17 @@ def test_a_panel_with_nothing_to_show_offers_no_copy_button():
     assert 'class="copy-btn"' not in _render_panel()
 
 
+def test_a_still_running_panel_offers_no_copy_button_even_with_output():
+    """The runner publishes `output` before it flips `status` to done, so a poll
+    landing in that window renders the spinner, the countdown and a fresh
+    EventSource. A copy button beside them would contradict all three — the
+    panel is built around one consistent read of the job's state."""
+    html = _render_panel(status="running", output="## Half an answer")
+
+    assert 'class="copy-btn"' not in html
+    assert "review-loading" in html  # it is still the running panel
+
+
 def test_output_kept_from_a_failed_run_is_copyable_too():
     """A run killed by its timeout keeps whatever it wrote, and half an analysis
     is exactly the thing worth pasting somewhere before it is lost."""
