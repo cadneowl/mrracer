@@ -237,6 +237,10 @@ def create_app(
                 # Also rendered for a failed job: a run killed by the timeout
                 # keeps whatever it had written, and half a review beats none.
                 "output_html": _render_markdown(output) if output.strip() else None,
+                # The markdown itself, for the copy button. Rendered into a
+                # textarea, so Jinja's escaping is what keeps skill output —
+                # which is untrusted — from breaking out of it.
+                "output": output if output.strip() else "",
             },
         )
 

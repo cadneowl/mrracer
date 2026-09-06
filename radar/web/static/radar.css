@@ -258,6 +258,20 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .modal-title { font-weight: 600; }
 .modal-close { color: var(--muted); text-decoration: none; font-size: 18px; padding: 0 6px; }
 .modal-close:hover { color: var(--text); }
+.modal-actions { display: inline-flex; align-items: center; gap: 10px; }
+.copy-btn {
+  padding: 3px 10px; border-radius: 20px; font-size: 12px; cursor: pointer;
+  background: var(--panel-2); color: var(--muted); border: 1px solid var(--line);
+}
+.copy-btn:hover { border-color: var(--green); color: var(--text); }
+.copy-btn.is-done { color: var(--green); border-color: var(--green); }
+.copy-btn.is-failed { color: var(--amber); border-color: var(--amber); }
+/* Off screen rather than display:none — the execCommand fallback has to be able
+   to select it, and a hidden element cannot be selected. */
+.copy-source {
+  position: fixed; left: -9999px; top: 0; width: 1px; height: 1px;
+  opacity: 0; border: 0; padding: 0;
+}
 .modal-body { padding: 18px; overflow-y: auto; }
 
 .review-loading { color: var(--muted); display: flex; align-items: center; gap: 10px; padding: 20px 0 10px; }
