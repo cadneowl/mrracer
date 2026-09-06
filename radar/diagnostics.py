@@ -212,6 +212,28 @@ def _check_jenkins(config: Config) -> list[Check]:
             )
         )
 
+    # Which skill the analyse button runs, said out loud: it is configured in
+    # one place and visible in none, and "why is there no button" is exactly the
+    # question `radar check` should be able to answer.
+    wiring = config.jenkins.analysis
+    if config.analysis_skill is not None:
+        out.append(
+            Check(
+                "jenkins.analysis",
+                "ok",
+                f"the analyse button runs the {config.analysis_skill.name!r} skill",
+            )
+        )
+    else:
+        out.append(
+            Check(
+                "jenkins.analysis",
+                "skip",
+                "no analyse button — set jenkins.analysis.skill to the name of a skill"
+                + (" (analysis.enabled is false)" if wiring.skill else ""),
+            )
+        )
+
     client = JenkinsClient(
         credentials=credentials,
         timeout=_JENKINS_CHECK_TIMEOUT_S,

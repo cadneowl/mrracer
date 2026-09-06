@@ -154,7 +154,9 @@ def create_app(
     # Skills that persist output: the board shows a re-openable badge per skill
     # that has a stored result for a given MR (row.stored_kinds decides which).
     storing_skills = [
-        _skill_view(s) for s in config.skills if s.stores_result and not s.analyses_builds
+        _skill_view(s)
+        for s in config.skills
+        if s.stores_result and s is not config.analysis_skill
     ]
 
     def context(view: str | None) -> dict:
@@ -163,17 +165,17 @@ def create_app(
         data["poll_interval_minutes"] = config.gitlab.poll_interval_minutes
         data["can_refresh"] = poll_now is not None
         data["enabled_skills"] = [
-            _skill_view(s) for s in config.skills if s.enabled and not s.analyses_builds
+            _skill_view(s)
+            for s in config.skills
+            if s.enabled and s is not config.analysis_skill
         ]
         data["storing_skills"] = storing_skills
         return data
 
-    # The skill launched from the CI strip, if one is configured and enabled.
-    # There is at most one: two analyse buttons on a chip that is already small
-    # would be a menu, and nobody has asked for a second opinion per build.
-    build_skill = next(
-        (s for s in config.skills if s.enabled and s.analyses_builds), None
-    )
+    # Named in `jenkins.analysis.skill`, resolved once at load. Nothing here
+    # infers it from a skill's name or contexts: which button exists is a fact
+    # about the configuration, and the config says it in one place.
+    build_skill = config.analysis_skill
 
     def _ci_view() -> dict | None:
         """The CI strip from cache — no I/O beyond the stored-analysis lookup."""
@@ -318,11 +320,7 @@ def create_app(
                 db.save_build_analysis(job.name, build, kind, finished.output)
 
         provider = jenkins_stdin_provider_for(kind, config, client, job, status, build)
-        started = runners[kind].start(
-            ctx,
-            on_success=on_success if build_skill.stores_result else None,
-            stdin_provider=provider,
-        )
+        started = runners[kind].start(ctx, on_success=on_success, stdin_provider=provider)
         return _panel(request, started)
 
     @app.get("/jenkins/{job_name}/analysis/{build}", response_class=HTMLResponse)
@@ -379,7 +377,7 @@ def create_app(
     def start_command(request: Request, kind: str, project_id: int, mr_iid: int):
         if kind not in runners or not enabled[kind]:
             raise HTTPException(status_code=404, detail=f"{kind} is not enabled")
-        if skills_by_name[kind].analyses_builds:
+        if skills_by_name[kind] is config.analysis_skill:
             # It is about a build, and this route is about a merge request: it
             # would run with no context at all and file the result where nothing
             # would ever show it. The board never offers this, but the URL is
@@ -466,7 +464,7 @@ def create_app(
     @app.get("/{kind}/stored/{project_id}/{mr_iid}", response_class=HTMLResponse)
     def stored_plan(request: Request, kind: str, project_id: int, mr_iid: int):
         skill = skills_by_name.get(kind)
-        if skill is None or not skill.stores_result or skill.analyses_builds:
+        if skill is None or not skill.stores_result or skill is config.analysis_skill:
             raise HTTPException(status_code=404, detail=f"{kind} has no stored results")
         with Database(db_path) as db:
             plan = db.get_test_plan(project_id, mr_iid, kind)

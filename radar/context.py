@@ -188,7 +188,11 @@ def jenkins_stdin_provider_for(
     skill = config.skill_by_name(kind)
     if skill is None:
         return None
-    fetch = skill.include_context and "jenkins_build" in skill.contexts
+    # Wired to the strip, so it gets the strip's evidence: there is no second
+    # switch to forget. `include_context` gates the MR fetches, where a skill
+    # may sensibly want none; an analysis with no commits and no log has nothing
+    # whatsoever to work from.
+    fetch = True
     has_declared = skill.source is not None or bool(skill.inputs)
     if not fetch and not has_declared:
         return None

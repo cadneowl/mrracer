@@ -176,15 +176,33 @@ the review button hands over an MR diff:
   400), which is where a failure prints.
 
 The skill needs no Jenkins access of its own — radar fetches both and pipes them
-on stdin. Declare one by giving it the `jenkins_build` context; the name
-`analyze` inherits that, plus `stores_result` and `include_context`:
+on stdin. **Which skill runs is named in the `jenkins:` block**, next to the
+pipelines it is about:
 
 ```yaml
+jenkins:
+  analysis:
+    enabled: true
+    skill: analyze-build    # names an entry in `skills:` below
+  jobs:
+    - name: CI
+      path: hub/backend/main
+
 skills:
-  - name: analyze
+  - name: analyze-build
     enabled: true
     command: claude -p "/analyze-build"
 ```
+
+That name is the *only* thing that decides whether the button exists. A skill
+does not become the analyser by being called something, or by declaring
+anything — with ten skills on a board, which one a button runs should be a line
+you can read rather than a property you have to know to go looking for.
+
+A wiring that could not work is refused when the config loads, naming what is
+wrong: an unknown skill, a skill left `enabled: false`, `analysis.enabled` with
+no skill named, or no jobs to put a button on. Each of those used to render a
+strip that looked completely normal and simply offered nothing.
 
 The result streams into the same panel the review and QA buttons use, and is
 saved against that build number: the chip then shows a ✓ that re-opens it, so
