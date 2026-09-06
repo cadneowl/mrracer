@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from radar.config import JenkinsJob, load_config
+from radar.config import ConfigError, JenkinsJob, load_config
 from radar.context import build_jenkins_input
 from radar.db import Database
 from radar.jenkins import (
@@ -377,12 +377,16 @@ def test_a_build_with_no_commits_says_so_rather_than_staying_silent():
 
 # --- the web layer ---------------------------------------------------------
 
+# The wiring under test: the jenkins block names the skill, and the skill is an
+# ordinary skill. Nothing about its name or its contexts decides anything.
+_WIRING = "  analysis: {enabled: true, skill: analyze}\n"
 _ANALYZE_SKILL = """
 skills:
   - name: analyze
     enabled: true
     command: python -c "import sys; sys.stdout.write(sys.stdin.read())"
 """
+_WIRED = _JENKINS_JOBS + _WIRING + _ANALYZE_SKILL
 
 
 def _app(tmp_path, config_text, monitor):
@@ -402,15 +406,15 @@ def _monitor(result="FAILURE"):
 
 
 def test_the_button_is_offered_only_where_there_is_something_to_explain(tmp_path):
-    broken = _app(tmp_path, _BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, _monitor("FAILURE"))[2]
-    green = _app(tmp_path, _BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, _monitor("SUCCESS"))[2]
+    broken = _app(tmp_path, _BASE_CONFIG + _WIRED, _monitor("FAILURE"))[2]
+    green = _app(tmp_path, _BASE_CONFIG + _WIRED, _monitor("SUCCESS"))[2]
 
     assert "/jenkins/backend-ci/analyze" in broken.get("/partials/ci").text
     assert "/analyze" not in green.get("/partials/ci").text
 
 
 def test_an_analysis_skill_never_appears_on_a_merge_request_row(tmp_path):
-    _, _, client = _app(tmp_path, _BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, _monitor())
+    _, _, client = _app(tmp_path, _BASE_CONFIG + _WIRED, _monitor())
     page = client.get("/").text
 
     # The board's own buttons post to /{kind}/{project}/{mr}; the strip's posts
@@ -421,7 +425,7 @@ def test_an_analysis_skill_never_appears_on_a_merge_request_row(tmp_path):
 
 def test_analysing_runs_the_skill_and_stores_the_result(tmp_path):
     config, db_path, client = _app(
-        tmp_path, _BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, _monitor()
+        tmp_path, _BASE_CONFIG + _WIRED, _monitor()
     )
 
     resp = client.post("/jenkins/backend-ci/analyze")
@@ -435,33 +439,144 @@ def test_the_analysis_skill_cannot_be_launched_against_a_merge_request(tmp_path)
     worktree`, the board filters it off MR rows — but the URL is guessable, and
     the run would have no build context and file its result where nothing shows
     it."""
-    _, _, client = _app(tmp_path, _BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, _monitor())
+    _, _, client = _app(tmp_path, _BASE_CONFIG + _WIRED, _monitor())
 
     assert client.post("/analyze/101/1").status_code == 404
     assert client.get("/analyze/stored/101/1").status_code == 404
 
 
-def test_two_enabled_analysis_skills_are_refused_rather_than_one_ignored(tmp_path):
-    """The strip has one button per job, so a second enabled `jenkins_build`
-    skill would be configured, enabled and silently unreachable."""
-    from radar.config import ConfigError
-
-    two = _ANALYZE_SKILL + """
-  - name: analyze2
-    enabled: true
-    context: jenkins_build
-    command: echo hi
-"""
-    path = tmp_path / "two.yaml"
-    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + two, encoding="utf-8")
+@pytest.mark.parametrize(
+    ("wiring", "skills", "expected"),
+    [
+        # Every one of these used to render a strip that looked entirely normal
+        # and simply offered no button — nothing to notice, nothing to search.
+        (
+            "  analysis: {enabled: true, skill: nope}\n",
+            _ANALYZE_SKILL,
+            "no skill named 'nope'",
+        ),
+        (
+            "  analysis: {enabled: true, skill: analyze}\n",
+            "skills:\n  - name: analyze\n    command: echo hi\n",
+            "enabled: false",
+        ),
+        ("  analysis: {enabled: true}\n", _ANALYZE_SKILL, "no 'skill' is named"),
+    ],
+)
+def test_a_wiring_that_would_show_no_button_is_refused_at_load(
+    tmp_path, wiring, skills, expected
+):
+    path = tmp_path / "wiring.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + wiring + skills, encoding="utf-8")
 
     with pytest.raises(ConfigError) as exc:
         load_config(path)
-    assert "one analyse button" in str(exc.value)
+    assert expected in str(exc.value)
+
+
+def test_radar_check_says_which_skill_the_button_runs(tmp_path):
+    """"Why is there no button" should be answerable without reading the config
+    file — the wiring lives in one place and was visible in none."""
+    from radar.diagnostics import _check_jenkins
+
+    wired = tmp_path / "wired.yaml"
+    wired.write_text(_BASE_CONFIG + _WIRED, encoding="utf-8")
+    unwired = tmp_path / "unwired.yaml"
+    unwired.write_text(_BASE_CONFIG + _JENKINS_JOBS + _OTHER_SKILL, encoding="utf-8")
+
+    import radar.jenkins as jenkins_mod
+
+    monkey = jenkins_mod.JenkinsClient.fetch
+    jenkins_mod.JenkinsClient.fetch = lambda self, job: {"lastBuild": None}
+    try:
+        on = {c.name: c for c in _check_jenkins(load_config(wired))}["jenkins.analysis"]
+        off = {c.name: c for c in _check_jenkins(load_config(unwired))}["jenkins.analysis"]
+    finally:
+        jenkins_mod.JenkinsClient.fetch = monkey
+
+    assert on.status == "ok" and "'analyze'" in on.detail
+    assert off.status == "skip" and "jenkins.analysis.skill" in off.detail
+
+
+_OTHER_SKILL = """
+skills:
+  - name: poke
+    enabled: true
+    command: echo hi
+"""
+
+
+def test_an_unwired_skill_is_just_a_skill(tmp_path):
+    """The complaint this shape answers: a skill does not turn a button on by
+    being named something, or by declaring anything. Only the wiring does — and
+    an unwired skill is an ordinary merge-request one."""
+    path = tmp_path / "unwired.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + _OTHER_SKILL, encoding="utf-8")
+    config = load_config(path)
+
+    assert config.analysis_skill is None
+    assert config.skill_by_name("poke") is not None  # declared, just not wired
+
+    db_path = tmp_path / "unwired.db"
+    Database(db_path).close()
+    client = TestClient(create_app(config, str(db_path), jenkins=_monitor()))
+    assert "/jenkins/" not in client.get("/partials/ci").text  # no strip button
+
+
+def test_the_shape_the_previous_release_documented_is_refused_not_misplaced(tmp_path):
+    """`skills: - name: analyze` used to inherit the build-analysis capability
+    from its name. With the wiring explicit it inherits only a label and an
+    icon, so left unwired it would render "🔎 analyse" on every merge-request
+    row and run a build command with no build. Refused, with the fix quoted."""
+    path = tmp_path / "old.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+
+    message = str(exc.value)
+    assert "nothing wires it to the CI strip" in message
+    assert "skill: analyze" in message  # the line to paste
+
+
+@pytest.mark.parametrize(
+    "setting", ["context: jira", "include_context: true", "stores_result: true"]
+)
+def test_merge_request_settings_on_the_wired_skill_are_refused_not_ignored(tmp_path, setting):
+    """A value radar reads and disregards is indistinguishable from one it
+    honours, until somebody depends on it."""
+    skills = _ANALYZE_SKILL.replace(
+        "    command:", f"    {setting}\n    command:"
+    )
+    path = tmp_path / "inert.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + _WIRING + skills, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+    assert "do nothing for a build analysis" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        ("  analyse: {enabled: true, skill: analyze}\n", "unknown key(s) 'analyse'"),
+        ("  analysis: {enabled: true, skil: analyze}\n", "unknown key(s) 'skil'"),
+    ],
+)
+def test_a_misspelled_key_is_refused_rather_than_dropped(tmp_path, block, expected):
+    """The button is spelled "analyse" in every sentence and the key is
+    "analysis", so this is the likeliest way to write the block — and an ignored
+    key here reproduces exactly the silence this wiring exists to remove."""
+    path = tmp_path / "typo.yaml"
+    path.write_text(_BASE_CONFIG + _JENKINS_JOBS + block + _ANALYZE_SKILL, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+    assert expected in str(exc.value)
 
 
 def test_an_unknown_job_name_is_refused(tmp_path):
-    _, _, client = _app(tmp_path, _BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, _monitor())
+    _, _, client = _app(tmp_path, _BASE_CONFIG + _WIRED, _monitor())
 
     assert client.post("/jenkins/not-a-job/analyze").status_code == 404
     assert client.get("/jenkins/not-a-job/analysis/1").status_code == 404
@@ -470,7 +585,7 @@ def test_an_unknown_job_name_is_refused(tmp_path):
 def test_a_green_job_cannot_be_analysed_even_by_url(tmp_path):
     """The chip stopped being broken between the render and the click."""
     _, _, client = _app(
-        tmp_path, _BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, _monitor("SUCCESS")
+        tmp_path, _BASE_CONFIG + _WIRED, _monitor("SUCCESS")
     )
     resp = client.post("/jenkins/backend-ci/analyze")
 
@@ -479,7 +594,7 @@ def test_a_green_job_cannot_be_analysed_even_by_url(tmp_path):
 
 
 def test_a_stored_analysis_re_opens_for_that_build(tmp_path):
-    _, db_path, client = _app(tmp_path, _BASE_CONFIG + _JENKINS_JOBS + _ANALYZE_SKILL, _monitor())
+    _, db_path, client = _app(tmp_path, _BASE_CONFIG + _WIRED, _monitor())
     with Database(db_path) as db:
         db.save_build_analysis("backend-ci", 128, "analyze", "## It was the pyyaml bump")
 

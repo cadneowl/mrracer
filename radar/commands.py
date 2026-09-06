@@ -117,9 +117,9 @@ PLACEHOLDER_KEYS = (
     "jira_keys_csv",   # comma-separated, e.g. "PROJ-1,PROJ-2"
     "head_sha",        # the MR's head commit, as of the last poll
     "source_root",     # the checkout for this job (see skillcontext / worktree)
-    # Filled for a `jenkins_build` skill instead of the MR fields above. A
-    # skill only ever sees one set; the other substitutes to empty, which is
-    # what an absent placeholder has always done.
+    # Filled for the skill `jenkins.analysis.skill` names, instead of the MR
+    # fields above. A skill only ever sees one set; the other substitutes to
+    # empty, which is what an absent placeholder has always done.
     "jenkins_job",
     "build_number",
     "build_url",

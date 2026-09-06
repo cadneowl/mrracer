@@ -141,15 +141,7 @@ class SkillConfig:
     env: tuple[tuple[str, str], ...] = ()  # NAME -> value, exported to the child
     env_unset: tuple[str, ...] = ()  # names the child must NOT inherit
 
-    @property
-    def analyses_builds(self) -> bool:
-        """Whether this skill is about a Jenkins build rather than a merge request.
 
-        Read from the declared capability rather than from the name, the same way
-        every other behaviour here is: a skill given `context: jenkins_build` is
-        launched from the CI strip and never appears on an MR row.
-        """
-        return "jenkins_build" in self.contexts
 
 
 # Backwards-compatible aliases (older names for the same shape).
@@ -174,10 +166,25 @@ class JenkinsJob:
 
 
 @dataclass(frozen=True)
+class JenkinsAnalysis:
+    """Which skill the CI strip's analyse button runs, if any.
+
+    Declared here, in the block where the pipelines are configured, rather than
+    inferred from something about a skill: with a board carrying ten skills,
+    which one a button runs should be a sentence you can read, not a property
+    you have to know to look for.
+    """
+
+    enabled: bool = False
+    skill: str = ""
+
+
+@dataclass(frozen=True)
 class JenkinsConfig:
     """Which Jenkins jobs the board watches, and how often to ask Jenkins."""
 
     jobs: tuple[JenkinsJob, ...] = ()
+    analysis: JenkinsAnalysis = field(default_factory=JenkinsAnalysis)
     poll_interval_seconds: int = 60
     # An escape hatch for an internal Jenkins whose certificate chain radar
     # cannot be made to trust. It switches verification off for every Jenkins
@@ -225,6 +232,18 @@ class Config:
             if team.name == name:
                 return team
         return None
+
+    @property
+    def analysis_skill(self) -> SkillConfig | None:
+        """The skill the CI strip's analyse button runs, or None if unwired.
+
+        Resolved once, from the one place that decides it. Everything else asks
+        this rather than testing a property of a skill: whether a button appears
+        is a fact about the configuration, not about a skill's name or contexts.
+        """
+        if not self.jenkins.analysis.enabled:
+            return None
+        return self.skill_by_name(self.jenkins.analysis.skill)
 
     def skill_by_name(self, name: str) -> SkillConfig | None:
         """The skill declared under ``name``, or None if the config never names it.
@@ -385,7 +404,7 @@ def _parse_slas(raw: object) -> tuple[SLARule, ...]:
     return tuple(rules)
 
 
-_VALID_CONTEXTS = {"gitlab_diff", "jira", "jenkins_build"}
+_VALID_CONTEXTS = {"gitlab_diff", "jira"}
 _VALID_CHECKOUTS = {"none", "worktree"}
 
 # A skill name is interpolated into dashboard routes and htmx URLs
@@ -409,12 +428,11 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         "label": "QA test plan", "button": "QA plan", "icon": "🧪",
         "context": ["jira"], "stores_result": True,
     },
-    # The CI strip's button. `include_context` is defaulted on as well, because
-    # unlike a review — which an agent can still do something with unaided — an
-    # analysis with no commits and no log has nothing whatsoever to work from.
+    # Cosmetics only. What makes a skill the CI strip's analyser is being named
+    # in `jenkins.analysis.skill`, not what it is called — a board with ten
+    # skills should not turn on a feature because one of them has a magic name.
     "analyze": {
         "label": "Build failure analysis", "button": "analyse", "icon": "🔎",
-        "context": ["jenkins_build"], "stores_result": True, "include_context": True,
     },
 }
 
@@ -548,13 +566,12 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
 
     contexts = _parse_contexts(raw.get("context", builtin.get("context")), ctx)
 
+    # Checked in `_check_analysis_wiring` rather than here: whether an empty
+    # `context:` is a mistake depends on what this skill is wired to, and this
+    # function is parsed before anything knows that. Telling the CI strip's
+    # skill to "set context: gitlab_diff or jira" would be advice that is wrong
+    # for it, and that quietens the message without changing anything.
     include_context = bool(raw.get("include_context", builtin.get("include_context", False)))
-    if include_context and not contexts:
-        raise ConfigError(
-            f"{ctx}.include_context is true but no 'context' source is set, so radar "
-            "wouldn't know what to fetch. Set context: gitlab_diff or jira, or drop "
-            "include_context."
-        )
 
     stores_result = bool(raw.get("stores_result", builtin.get("stores_result", False)))
 
@@ -586,14 +603,6 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
             f"{ctx}: 'working_dir' and 'checkout: worktree' contradict each other — the "
             "worktree is where the merge request's code is, but working_dir would run the "
             "command elsewhere. Drop one."
-        )
-    if checkout == "worktree" and "jenkins_build" in contexts:
-        # A worktree is made from a merge request's ref at its head commit, and
-        # a build analysis has no merge request. Refused here rather than at the
-        # click, where it would read as a transient failure.
-        raise ConfigError(
-            f"{ctx}: 'checkout: worktree' needs a merge request to make a worktree of, and "
-            "a 'jenkins_build' skill analyses a build. Use a plain 'source:' checkout."
         )
     remote = str(raw.get("remote", "origin")).strip() or "origin"
 
@@ -663,17 +672,6 @@ def _parse_skills(raw_top: dict, base_dir: Path) -> tuple[SkillConfig, ...]:
         seen.add(name)
         out.append(_parse_skill(entry, name, ctx, base_dir))
 
-    # The CI strip has one button per chip, so it can launch one skill. A second
-    # enabled `jenkins_build` skill would simply never appear anywhere — no
-    # button, no error — and a skill that is configured, enabled, and silently
-    # unreachable is worse than one refused with a reason.
-    analysers = [s.name for s in out if s.enabled and s.analyses_builds]
-    if len(analysers) > 1:
-        raise ConfigError(
-            "skills: more than one enabled skill declares 'context: jenkins_build' "
-            f"({', '.join(analysers)}), and the CI strip has one analyse button per "
-            "job. Leave one enabled."
-        )
     return tuple(out)
 
 
@@ -743,6 +741,53 @@ def _job_name(entry: dict, url: str) -> str:
     return unquote(segments[-1]) if segments else url
 
 
+# The button is spelled "analyse" everywhere it is written in prose, and the key
+# is "analysis" — so a misspelling is the likeliest way to write this block, and
+# an ignored key here reproduces the exact failure this wiring exists to remove.
+_JENKINS_KEYS = frozenset(
+    {"base_url", "poll_interval_seconds", "verify_ssl", "log_tail_lines", "analysis", "jobs"}
+)
+_ANALYSIS_KEYS = frozenset({"enabled", "skill"})
+_ANALYSIS_NAME = "analyze"
+
+
+def _reject_unknown(raw: dict, known: frozenset[str], ctx: str) -> None:
+    """Refuse keys this block does not read, naming the ones it does."""
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ConfigError(
+            f"{ctx}: unknown key(s) {', '.join(repr(k) for k in unknown)} — "
+            f"this block reads {', '.join(sorted(known))}"
+        )
+
+
+def _parse_jenkins_analysis(raw: object) -> JenkinsAnalysis:
+    """Parse ``jenkins.analysis`` — the analyse button's wiring.
+
+    ``enabled`` defaults to true once a skill is named, because naming one is
+    the intent; ``enabled: false`` turns the button off without unpicking the
+    wiring, which is what someone wants when they are switching it off for a
+    week rather than for good.
+    """
+    if raw is None:
+        return JenkinsAnalysis()
+    if not isinstance(raw, dict):
+        raise ConfigError("jenkins.analysis: expected a mapping with 'skill' and 'enabled'")
+    _reject_unknown(raw, _ANALYSIS_KEYS, "jenkins.analysis")
+
+    skill = str(raw.get("skill", "") or "").strip()
+    enabled = raw.get("enabled", bool(skill))
+    if not isinstance(enabled, bool):
+        raise ConfigError("jenkins.analysis.enabled: expected true or false")
+    if enabled and not skill:
+        raise ConfigError(
+            "jenkins.analysis.enabled is true but no 'skill' is named, so there is "
+            "nothing for the analyse button to run. Name a skill from the 'skills' "
+            "list, or set enabled: false."
+        )
+    return JenkinsAnalysis(enabled=enabled, skill=skill)
+
+
 def _parse_jenkins(raw: object) -> JenkinsConfig:
     """Parse the optional ``jenkins:`` block behind the board's CI strip.
 
@@ -753,6 +798,7 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
         return JenkinsConfig()
     if not isinstance(raw, dict):
         raise ConfigError("jenkins: expected a mapping")
+    _reject_unknown(raw, _JENKINS_KEYS, "jenkins")
 
     base_raw = raw.get("base_url")
     base_url = _http_url(base_raw, "jenkins.base_url") if base_raw else None
@@ -764,6 +810,8 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
         raise ConfigError("jenkins.poll_interval_seconds: expected an integer") from None
     if interval < _JENKINS_MIN_INTERVAL_S:
         raise ConfigError(f"jenkins.poll_interval_seconds: must be >= {_JENKINS_MIN_INTERVAL_S}")
+
+    analysis = _parse_jenkins_analysis(raw.get("analysis"))
 
     verify_ssl = raw.get("verify_ssl", True)
     if not isinstance(verify_ssl, bool):
@@ -805,6 +853,7 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
         jobs.append(JenkinsJob(name=name, url=url))
     return JenkinsConfig(
         jobs=tuple(jobs),
+        analysis=analysis,
         poll_interval_seconds=interval,
         verify_ssl=verify_ssl,
         log_tail_lines=log_tail_lines,
@@ -846,6 +895,95 @@ def _parse_waive(raw: object) -> WaiveConfig:
     if not isinstance(labels_raw, list):
         raise ConfigError("waive.labels: expected a list of strings")
     return WaiveConfig(draft=draft, labels=tuple(str(x) for x in labels_raw))
+
+
+def _check_analysis_wiring(jenkins: JenkinsConfig, skills: tuple[SkillConfig, ...]) -> None:
+    """Refuse a wiring that would silently produce no button.
+
+    Every way this can be wrong used to show up as a strip that looked entirely
+    normal and simply offered nothing — the worst way for configuration to fail,
+    because there is nothing to notice and nothing to search for.
+    """
+    wiring = jenkins.analysis
+
+    for skill in skills:
+        # Deferred from `_parse_skill`, which cannot know what a skill is wired
+        # to (see the note there). An MR skill that fetches nothing has nothing
+        # to include; the wired skill is handled below.
+        if skill.include_context and not skill.contexts and skill.name != wiring.skill:
+            raise ConfigError(
+                f"skills[{skill.name}].include_context is true but no 'context' source is "
+                "set, so radar wouldn't know what to fetch. Set context: gitlab_diff or "
+                "jira, or drop include_context."
+            )
+
+    if not wiring.enabled:
+        # A skill radar itself gives build-analysis cosmetics to, enabled and
+        # wired to nothing, is a button on every merge-request row running a
+        # command written for a build. That is the shape the previous release
+        # documented, so it is refused with the line that fixes it rather than
+        # left to be discovered on the board.
+        stray = next((s for s in skills if s.name == _ANALYSIS_NAME and s.enabled), None)
+        if stray is not None:
+            raise ConfigError(
+                f"a skill named {_ANALYSIS_NAME!r} is enabled but nothing wires it to the "
+                "CI strip, so it would appear as a button on every merge request instead. "
+                "Point at it from the jenkins block:\n\n"
+                "  jenkins:\n"
+                "    analysis:\n"
+                "      enabled: true\n"
+                f"      skill: {_ANALYSIS_NAME}\n\n"
+                "or rename the skill if it really is a merge-request one."
+            )
+        return
+
+    named = next((s for s in skills if s.name == wiring.skill), None)
+    if named is None:
+        available = ", ".join(s.name for s in skills) or "none are declared"
+        raise ConfigError(
+            f"jenkins.analysis.skill: no skill named {wiring.skill!r} — the 'skills' "
+            f"list has {available}"
+        )
+    if not named.enabled:
+        raise ConfigError(
+            f"jenkins.analysis.skill names {wiring.skill!r}, but that skill has "
+            "enabled: false, so the analyse button would have nothing to run. Enable the "
+            "skill, or set jenkins.analysis.enabled: false."
+        )
+    if named.checkout == "worktree":
+        # A worktree is made from a merge request's ref at its head commit, and a
+        # build analysis has no merge request.
+        raise ConfigError(
+            f"jenkins.analysis.skill names {wiring.skill!r}, which uses 'checkout: "
+            "worktree' — that needs a merge request to make a worktree of, and this skill "
+            "analyses a build. Use a plain 'source:' checkout."
+        )
+    if not jenkins.jobs:
+        raise ConfigError(
+            "jenkins.analysis is enabled but no jenkins.jobs are configured, so there is "
+            "no chip for the analyse button to appear on."
+        )
+
+    # Settings that describe a merge-request skill and do nothing here. Refused
+    # rather than ignored: a value radar reads and disregards is indistinguish-
+    # able from one it honours until someone depends on it.
+    inert = [
+        name
+        for name, is_set in (
+            ("context", bool(named.contexts)),
+            ("include_context", named.include_context),
+            ("stores_result", named.stores_result),
+        )
+        if is_set
+    ]
+    if inert:
+        raise ConfigError(
+            f"jenkins.analysis.skill names {wiring.skill!r}, which sets "
+            f"{', '.join(inert)} — those describe a merge-request skill and do nothing "
+            "for a build analysis. Being named here is what gets this skill the build's "
+            "commits and console log, and its answer is always saved against the build "
+            "number. Remove them."
+        )
 
 
 def load_config(path: str | Path) -> Config:
@@ -894,6 +1032,8 @@ def load_config(path: str | Path) -> Config:
     gamification = raw.get("gamification") or {}
     if not isinstance(gamification, dict):
         raise ConfigError("gamification: expected a mapping")
+
+    _check_analysis_wiring(jenkins, skills)
 
     return Config(
         gitlab=GitLabSettings(projects=projects, poll_interval_minutes=poll_interval),

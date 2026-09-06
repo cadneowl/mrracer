@@ -131,8 +131,26 @@ jenkins:
   base_url: https://jenkins.example.com
   poll_interval_seconds: 60
   # verify_ssl: false
-  # How much of a broken build's console log the 🔎 analyse button hands to the
-  # skill (the tail, where the failure prints). Default 400.
+
+  # The 🔎 analyse button on a broken chip: what changed since this job last
+  # passed, and what the log says. `skill` names an entry in the `skills:` list
+  # below — that name is the ONLY thing that decides whether the button exists,
+  # so a board with ten skills turns this on by saying so here rather than by
+  # something being true of one of them. Omit this block and there is no button.
+  #
+  # radar pipes the commits and the log tail to that skill on stdin, and saves
+  # its answer against the build number. A wiring that could not work — an
+  # unknown skill, a disabled one, a misspelled key — is refused when the config
+  # loads, rather than showing a strip that looks fine and offers nothing.
+  #
+  # Uncommenting this is half the job: the `analyze` skill at the bottom of this
+  # file ships `enabled: false` like every other, and naming a disabled skill
+  # here is refused. Turn both on.
+  # analysis:
+  #   enabled: true
+  #   skill: analyze
+  #
+  # How much of the log the skill is given (the tail, where the failure prints):
   # log_tail_lines: 400
   jobs:
     - name: backend-ci
@@ -151,20 +169,17 @@ jenkins:
 #   {author} {head_sha}, plus {source_root} once the skill declares a `source:`,
 #   and {jira_keys} / {jira_keys_csv} from the keys found on the MR.
 #
-# This list is the ONLY place a skill is declared. Three names arrive with
+# This list is the ONLY place a skill is declared. Two names arrive with
 # defaults, because they are capabilities no command line can advertise:
 #   review   context: gitlab_diff                — the MR diff is piped to STDIN
 #   qa       context: jira + stores_result: true — the linked ticket(s) are piped
 #            to STDIN, and the output is saved and re-openable from the board
-#   analyze  context: jenkins_build + stores_result + include_context — the
-#            commits since the job last passed and the tail of the broken
-#            build's console log are piped to STDIN, and the result is saved
-#            against that build number
 #
-# `context: jenkins_build` is also what MOVES a skill: such a skill is launched
-# from the CI strip's 🔎 button on a broken job, never from a merge request row,
-# because it is about a build. (`checkout: worktree` is refused for one — a
-# worktree is made from an MR's ref, and there is no MR here.)
+# A skill is a merge-request button unless something points at it elsewhere.
+# `jenkins.analysis.skill` above is one such pointer: the skill it names becomes
+# the CI strip's analyse button instead, is given the build's commits and log on
+# STDIN, and has its answer saved per build. Nothing about the skill itself says
+# so — which is the point, since a board can carry ten of them.
 #
 # Defaults, not magic: write `context:` or `stores_result:` yourself and yours
 # wins. Every other name starts with no capabilities at all. Declaring a skill
@@ -339,11 +354,11 @@ skills:
     # inputs:
     #   db_schema: { file: ./references/schema.sql }
 
-  # The CI strip's 🔎 button: what broke this build? radar gathers the commits
-  # Jenkins recorded since the job last passed, and the tail of the broken
-  # build's console log, and pipes both to the skill on STDIN — so it needs no
-  # Jenkins access of its own. The result is saved against that build number and
-  # re-opens from the ✓ until a new build replaces it.
+  # An ordinary skill that happens to be the one `jenkins.analysis.skill` names
+  # above. Call it whatever you like — this one is `analyze` only because that
+  # name carries a ready-made label and icon. Being named up there is what gets
+  # it the build's commits and console-log tail on STDIN, and what gets its
+  # answer saved against the build number and re-opened from the ✓.
   #
   # Placeholders for the command: {jenkins_job} {build_number} {build_url}
   # (the merge-request ones are empty here, and vice versa). Which build the

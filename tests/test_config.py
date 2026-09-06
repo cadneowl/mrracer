@@ -56,12 +56,14 @@ def test_example_config_is_loadable_and_current():
     qa = cfg.skill_by_name("qa")
     assert qa.contexts == ("jira",) and qa.stores_result is True
     assert cfg.skill_by_name("dba").contexts == ()  # a plain name inherits nothing
-    # The CI strip's button. include_context comes on by default too: unlike a
-    # review, an analysis with no commits and no log has nothing to work from.
+    # The CI strip's skill is an ordinary skill: it inherits a label and an icon
+    # from its name and nothing else. What makes it the analyse button is
+    # `jenkins.analysis.skill` naming it — and the shipped example leaves that
+    # commented out, so the example has no button and no skill claiming one.
     analyze = cfg.skill_by_name("analyze")
-    assert analyze.contexts == ("jenkins_build",)
-    assert (analyze.stores_result, analyze.include_context) == (True, True)
-    assert analyze.analyses_builds is True  # so it lives on the strip, not a row
+    assert analyze.contexts == ()
+    assert cfg.analysis_skill is None
+    assert cfg.jenkins.analysis.enabled is False
 
 
 def test_working_dir_expands_tilde(tmp_path, monkeypatch):

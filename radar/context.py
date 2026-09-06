@@ -188,17 +188,16 @@ def jenkins_stdin_provider_for(
     skill = config.skill_by_name(kind)
     if skill is None:
         return None
-    fetch = skill.include_context and "jenkins_build" in skill.contexts
-    has_declared = skill.source is not None or bool(skill.inputs)
-    if not fetch and not has_declared:
-        return None
 
     def provider(source_root: str = "", inputs: dict | None = None) -> str:
-        parts = []
-        if fetch:
-            parts.append(
-                build_jenkins_input(client, job, status, config.jenkins.log_tail_lines, number)
-            )
+        # Always the evidence: being named in `jenkins.analysis.skill` is what
+        # gets it, so there is no second switch to forget. (`include_context`
+        # gates the merge-request fetches, where a skill may sensibly want none;
+        # an analysis with no commits and no log has nothing to work from, and
+        # the loader refuses that setting on this skill rather than ignoring it.)
+        parts = [
+            build_jenkins_input(client, job, status, config.jenkins.log_tail_lines, number)
+        ]
         if source_root:
             parts.append(build_source_section(source_root))
         if inputs:

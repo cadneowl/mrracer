@@ -212,6 +212,38 @@ def _check_jenkins(config: Config) -> list[Check]:
             )
         )
 
+    # Which skill the analyse button runs, said out loud: it is configured in
+    # one place and visible in none, and "why is there no button" is exactly the
+    # question `radar check` should be able to answer.
+    wiring = config.jenkins.analysis
+    if config.analysis_skill is not None:
+        out.append(
+            Check(
+                "jenkins.analysis",
+                "ok",
+                f"the analyse button runs the {config.analysis_skill.name!r} skill",
+            )
+        )
+    elif wiring.skill:
+        # Wired, deliberately off. Telling the operator to set the key they have
+        # already set correctly is the kind of advice that wastes an afternoon.
+        out.append(
+            Check(
+                "jenkins.analysis",
+                "skip",
+                f"no analyse button — {wiring.skill!r} is wired but "
+                "jenkins.analysis.enabled is false",
+            )
+        )
+    else:
+        out.append(
+            Check(
+                "jenkins.analysis",
+                "skip",
+                "no analyse button — set jenkins.analysis.skill to the name of a skill",
+            )
+        )
+
     client = JenkinsClient(
         credentials=credentials,
         timeout=_JENKINS_CHECK_TIMEOUT_S,
@@ -244,7 +276,13 @@ def _check_commands(config: Config) -> list[Check]:
             continue
         exe = _first_token(skill.command)
         if exe and shutil.which(exe):
-            fetched = ", ".join(skill.contexts) if skill.include_context else ""
+            if skill is config.analysis_skill:
+                # Its evidence comes from the wiring, not from `context:`, so
+                # reading those fields here would report that radar fetches
+                # nothing for the one skill it always fetches for.
+                fetched = "the build's commits and console log"
+            else:
+                fetched = ", ".join(skill.contexts) if skill.include_context else ""
             ctx = f" · fetches {fetched}" if fetched else ""
             out.append(Check(f"{name}.command", "ok", f"'{exe}' on PATH{ctx}"))
         else:
