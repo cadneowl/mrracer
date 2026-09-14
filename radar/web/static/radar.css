@@ -292,6 +292,29 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .progress-log li.plog-tool { color: var(--text); }
 .progress-log li.plog-text { color: #9fb4d8; }
 .progress-log li:last-child { border-bottom: none; }
+
+/* Who is doing what inside a job (_job_health.html). */
+.job-health { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 12px; }
+.health-row {
+  display: flex; align-items: center; gap: 10px; font-size: 12px;
+  padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px;
+}
+.health-name { font-weight: 600; min-width: 90px; }
+.health-state { color: var(--muted); min-width: 110px; white-space: nowrap; }
+.health-note { color: var(--muted); flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.health-session { color: var(--muted); font-size: 11px; cursor: help; }
+.health-done .health-state { color: var(--green); }
+.health-error .health-state { color: var(--red); }
+.health-pending { opacity: 0.6; }
+.health-stalled { border-color: var(--amber); }
+.health-stalled .health-note { color: var(--amber); }
+.health-stop {
+  background: transparent; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 6px; font-size: 11px; padding: 2px 8px; cursor: pointer;
+}
+.health-stop:hover { color: var(--red); border-color: var(--red); }
+.health-stop-all { align-self: flex-end; }
 .spinner {
   width: 16px; height: 16px; border-radius: 50%;
   border: 2px solid var(--line); border-top-color: var(--green);

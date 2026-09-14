@@ -50,8 +50,15 @@ def test_example_config_is_loadable_and_current():
     cfg = load_config(Path(__file__).resolve().parent.parent / "config.example.yaml")
     # Every skill lives in `skills:`, including the two whose names carry
     # built-in capabilities. Nothing appears that the file did not declare.
-    assert [s.name for s in cfg.skills] == ["review", "qa", "dba", "analyze"]
+    assert [s.name for s in cfg.skills] == [
+        "review", "qa", "dba", "full-review", "synthesize", "analyze",
+    ]
     assert all(not s.enabled for s in cfg.skills)  # opt in deliberately
+    # The pipeline's steps resolve, and its budget is the one they allow:
+    # max(review 600, dba 600) + synthesize 600.
+    full = cfg.skill_by_name("full-review")
+    assert full.pipeline == (("review", "dba"), ("synthesize",))
+    assert full.timeout_seconds == 1200
     assert cfg.skill_by_name("review").contexts == ("gitlab_diff",)
     qa = cfg.skill_by_name("qa")
     assert qa.contexts == ("jira",) and qa.stores_result is True

@@ -269,9 +269,23 @@ def _check_jenkins(config: Config) -> list[Check]:
 
 def _check_commands(config: Config) -> list[Check]:
     out = []
+    # A step runs whenever an enabled pipeline does, whether or not it has a
+    # button of its own, so its command has to resolve even with enabled: false.
+    steps = {
+        step for s in config.skills if s.enabled for stage in s.pipeline for step in stage
+    }
     for skill in config.skills:
         name = skill.name
-        if not skill.enabled:
+        if skill.pipeline:
+            if not skill.enabled:
+                out.append(Check(f"{name}.pipeline", "skip", "disabled"))
+                continue
+            flow = " → ".join(" + ".join(stage) for stage in skill.pipeline)
+            out.append(
+                Check(f"{name}.pipeline", "ok", f"{flow} · up to {skill.timeout_seconds}s")
+            )
+            continue
+        if not skill.enabled and name not in steps:
             out.append(Check(f"{name}.command", "skip", "disabled"))
             continue
         exe = _first_token(skill.command)

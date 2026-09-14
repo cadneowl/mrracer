@@ -214,7 +214,7 @@ skills:
     #  3. --output-format stream-json --verbose : emit live events so the dashboard
     #     shows real-time progress. Plain commands still work (stdout -> progress
     #     log); they just aren't as granular.
-    command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/code-review"'
+    command: 'claude -p --permission-mode dontAsk --disallowedTools "ListAgents SendMessage" --output-format stream-json --verbose "/code-review"'
     # Where to run the command. Leave null and radar runs it in the `source:`
     # checkout resolved for this MR's project (below); null with no source =
     # radar's CWD. Set it to override both (~ and $VARS expand).
@@ -327,7 +327,7 @@ skills:
   # so radar keeps a copy of the output and the board shows a re-openable badge.
   - name: qa
     enabled: false
-    command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/qa-testplan"'
+    command: 'claude -p --permission-mode dontAsk --disallowedTools "ListAgents SendMessage" --output-format stream-json --verbose "/qa-testplan"'
     working_dir: null
     timeout_seconds: 900
     # include_context: radar fetches the linked Jira ticket(s) — and an epic's
@@ -349,13 +349,49 @@ skills:
     button: DBA            # short button text (optional; defaults to label)
     icon: "🗄"             # button emoji (optional; defaults to ▶)
     enabled: false
-    command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/dba"'
+    command: 'claude -p --permission-mode dontAsk --disallowedTools "ListAgents SendMessage" --output-format stream-json --verbose "/dba"'
     working_dir: null      # null = the resolved source checkout, else radar's CWD
     timeout_seconds: 600
     # context: gitlab_diff
     # source: { env: HUB_REPO_ROOT }
     # inputs:
     #   db_schema: { file: ./references/schema.sql }
+
+  # A pipeline: one button that runs other skills and hands their answers on.
+  # Instead of a command it lists stages, run in order; the skills inside
+  # `parallel:` run at the same time, each as its own process. Every step after
+  # the first stage gets an "## Earlier steps" section on STDIN, after its own
+  # bundle, holding what each earlier step wrote — or that it failed, and why.
+  # The pipeline's answer is the last stage's.
+  #
+  # A step is an ordinary skill and runs exactly as its own button would: its
+  # context:, source:, checkout:, env: and timeout_seconds all apply, which is
+  # why a pipeline refuses those keys on itself. A step needs no button — leave
+  # it enabled: false and it only ever runs inside the pipeline.
+  #
+  # timeout_seconds is worked out for you: the slowest step of each stage,
+  # summed. Each step stops on its own timeout, so a smaller figure is refused.
+  # A step that fails is reported to the next stage and the run carries on; a
+  # stage where every step failed ends it. Pipelines do not nest, a step runs
+  # once per pipeline, and the skill jenkins.analysis.skill names can be neither
+  # a pipeline nor a step.
+  - name: full-review
+    label: Full review
+    icon: "🧭"
+    enabled: false
+    stores_result: true
+    pipeline:
+      - parallel: [review, dba]
+      - skill: synthesize
+
+  # The last step above. Write its prompt to read "## Earlier steps" from STDIN
+  # and merge the findings: drop duplicates, rank by severity, and say where the
+  # reviewers disagree.
+  - name: synthesize
+    label: Synthesis
+    enabled: false
+    command: 'claude -p --permission-mode dontAsk --disallowedTools "ListAgents SendMessage" --output-format stream-json --verbose "/review-synthesis"'
+    timeout_seconds: 600
 
   # An ordinary skill that happens to be the one `jenkins.analysis.skill` names
   # above. Call it whatever you like — this one is `analyze` only because that
@@ -372,7 +408,7 @@ skills:
     button: analyse
     icon: "🔎"
     enabled: false
-    command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/analyze-build"'
+    command: 'claude -p --permission-mode dontAsk --disallowedTools "ListAgents SendMessage" --output-format stream-json --verbose "/analyze-build"'
     timeout_seconds: 600
 
 # Gamification config is consumed in Phase 3; kept here so the file is stable.
