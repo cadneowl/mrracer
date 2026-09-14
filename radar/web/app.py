@@ -13,6 +13,7 @@ import json
 import time
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import quote
 
 import markdown as md
 import nh3
@@ -303,11 +304,20 @@ def create_app(
             and (status == "running" or isinstance(runner, PipelineRunner))
         )
         health = _health_context(job.kind, job) if show_rows else {"rows": []}
+        # A build analysis — saved, finished or failed — can be run again over
+        # the job's latest failed build; the analyse route replaces what was
+        # saved. `title` is the Jenkins job's name for these jobs.
+        rerun_url = (
+            f"/jenkins/{quote(job.title, safe='')}/analyze"
+            if build_skill is not None and skill is build_skill and job.title
+            else None
+        )
         return templates.TemplateResponse(
             request,
             "_command_panel.html",
             {
                 **health,
+                "rerun_url": rerun_url,
                 "job": job,
                 "status": status,
                 "error": error,

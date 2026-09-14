@@ -13,6 +13,14 @@
         {% if generated_at %}<span class="stamp">saved {{ generated_at[:19] }}Z</span>{% endif %}
       </span>
       <span class="modal-actions">
+        {% if rerun_url and status != 'running' %}
+        {# A saved or failed build analysis is not the last word: run the skill
+           again over the job's latest failed build, replacing what was saved. #}
+        <button class="copy-btn rerun-btn" type="button"
+                hx-post="{{ rerun_url }}" hx-target="#command-panel" hx-swap="innerHTML"
+                hx-disabled-elt="this"
+                title="Run {{ heading }} again on the latest failed build; the new answer replaces the saved one">↻ rerun</button>
+        {% endif %}
         {% if output and status != 'running' %}
         {# The markdown the skill wrote, not the rendered HTML: what this is for
            is pasting the finding into a ticket, a chat, or a commit message,
