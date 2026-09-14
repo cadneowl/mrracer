@@ -266,6 +266,9 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .copy-btn:hover { border-color: var(--green); color: var(--text); }
 .copy-btn.is-done { color: var(--green); border-color: var(--green); }
 .copy-btn.is-failed { color: var(--amber); border-color: var(--amber); }
+/* Runs a build analysis again; shares the copy button's shape. */
+.rerun-btn:hover { border-color: var(--blue); }
+.rerun-btn:disabled { opacity: 0.5; cursor: wait; }
 /* Off screen rather than display:none — the execCommand fallback has to be able
    to select it, and a hidden element cannot be selected. */
 .copy-source {

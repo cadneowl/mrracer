@@ -6,6 +6,8 @@ Every fetch goes through an injected getter, so nothing here touches a Jenkins.
 from __future__ import annotations
 
 import pathlib
+import re
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -705,3 +707,33 @@ def test_a_stored_analysis_re_opens_for_that_build(tmp_path):
     assert resp.status_code == 200
     assert "It was the pyyaml bump" in resp.text
     assert client.get("/jenkins/backend-ci/analysis/999").status_code == 404
+
+
+def test_a_saved_analysis_can_be_run_again_and_the_new_answer_replaces_it(tmp_path):
+    _, db_path, client = _app(tmp_path, _BASE_CONFIG + _WIRED, _monitor())
+    with Database(db_path) as db:
+        db.save_build_analysis("backend-ci", 128, "analyze", "## A stale guess")
+
+    saved = client.get("/jenkins/backend-ci/analysis/128").text
+    assert 'hx-post="/jenkins/backend-ci/analyze"' in saved  # the panel offers a rerun
+
+    rerun = client.post("/jenkins/backend-ci/analyze")
+    assert rerun.status_code == 200
+    assert "↻ rerun" not in rerun.text  # nothing to rerun while it is running
+    job_id = re.search(r'data-job-id="([0-9a-f]+)"', rerun.text).group(1)
+    # This fake Jenkins cannot serve the log, so the run ends in an error — which
+    # is exactly the other case the button exists for: a failed run is rerun too.
+    for _ in range(300):
+        ended = client.get(f"/analyze/status/{job_id}").text
+        if "review-output" in ended or "review-error" in ended:
+            break
+        time.sleep(0.05)
+    assert 'hx-post="/jenkins/backend-ci/analyze"' in ended
+
+
+def test_only_a_build_analysis_panel_offers_a_rerun(tmp_path):
+    _, db_path, client = _app(tmp_path, _BASE_CONFIG + _WIRED, _monitor())
+    with Database(db_path) as db:
+        db.save_build_analysis("backend-ci", 128, "analyze", "## saved")
+    assert "↻ rerun" in client.get("/jenkins/backend-ci/analysis/128").text
+    assert "↻ rerun" not in client.get("/").text
