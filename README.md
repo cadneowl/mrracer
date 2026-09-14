@@ -622,6 +622,102 @@ it under `skills:` and give it `- name: review`.
 Every enabled skill also appears in `radar check`, so you can confirm its command
 is on `PATH` before clicking it.
 
+### Chain skills into a pipeline
+
+One button can run several skills and hand their answers on. A pipeline is a
+`skills:` entry with a `pipeline:` instead of a `command:`:
+
+```yaml
+skills:
+  - name: full-review
+    label: Full review
+    icon: "🧭"
+    enabled: true
+    stores_result: true
+    pipeline:
+      - parallel: [review, db-review, qa]   # these three at the same time
+      - skill: synthesize                   # then this, having read all three
+
+  - name: synthesize
+    label: Synthesis
+    enabled: false        # no button of its own; it only runs inside the pipeline
+    command: 'claude -p --permission-mode dontAsk --output-format stream-json --verbose "/review-synthesis"'
+    timeout_seconds: 600
+```
+
+Stages run in order. A stage is one skill's name (`- review` or `- skill: review`)
+or `- parallel: [...]`, whose skills run **at the same time, each as its own
+process**. The pipeline's answer is the last stage's: a single step's output as
+it is, or several under a heading each.
+
+**Every step runs exactly as its own button would.** Its `context:`, `source:`,
+`checkout: worktree`, `inputs:`, `env:` and `timeout_seconds` all apply — the QA
+step still gets the Jira ticket, the DBA step still gets its worktree — which is
+why a pipeline refuses those keys on itself: it has nothing to apply them to. A
+step that `stores_result` still saves, so a QA plan made inside a pipeline shows
+its ✓ badge like any other. A step needs no button of its own: leave it
+`enabled: false` and it runs only inside the pipeline (`radar check` still
+checks its command).
+
+**What a later step is handed.** After its own stdin bundle, every step past the
+first stage gets an `## Earlier steps` section: a `### <label>` per earlier step
+with what it wrote, or `(failed)` with the error — plus, for a step that ran out
+of time, whatever it had written by then.
+Write the synthesizing skill to read that section — drop duplicate findings,
+rank them, say where the reviewers disagree. The section introduces itself as
+text written by other agents that quotes the MR, to be weighed as evidence
+rather than obeyed.
+
+**Failures.** A failed step does not stop the run: a synthesis of two reviews out
+of three beats none, and it is told which one is missing. A stage in which
+*every* step failed does stop it, since the next stage would have nothing to
+work from; the panel shows each step's error.
+
+**Budget.** `timeout_seconds` is worked out for you — the slowest step of each
+stage, summed. Each step is stopped by its own timeout and nothing stops it
+sooner, so that sum is the longest a run can take, and it is what the panel's
+countdown shows. Set `timeout_seconds` higher if you like; a lower figure is
+refused.
+
+**Progress.** The panel streams every step's live log, each line prefixed with
+the step it came from (`[db-review] 🔧 Read: …`), plus a line as each stage
+starts and each step ends.
+
+**Keep the steps from talking to each other.** The steps of one stage run at the
+same time in the same checkout, so each `claude -p` sees the others as busy Claude
+sessions on the machine. A model that loses track of its own work can message one
+of them and wait for an answer that never comes — a real `review` step did exactly
+that, polling a sibling that had already finished until its timeout ran out. Give
+every skill's command `--disallowedTools "ListAgents SendMessage"`; no board skill
+needs either tool. (Clicking two board buttons at once has the same exposure; a
+pipeline just guarantees it.)
+
+**Seeing inside a run.** Above the live log the panel keeps a row per step (one
+row for a plain skill), refreshed every few seconds: its state and how long it
+has run, what it is doing right now, and its Claude session id — hover it for the
+`claude --resume` line that opens the whole conversation, reasoning and all.
+Subagents are named in the log as they start and end, and their own tool calls
+are marked `↳`. A run that has done nothing but *wait* — list other sessions,
+message one, poll a background task, `sleep` — for five minutes turns amber and
+says what it is waiting on, rather than looking busy. **■ stop** ends that step
+now and keeps whatever it wrote; the next stage is told it was stopped and the
+pipeline carries on. **■ stop the whole pipeline** also skips every stage still to
+come. The rows stay on the panel once a pipeline finishes, so a failed step says
+why.
+
+**Why radar runs the steps rather than an agent.** A skill *could* fan out to
+subagents itself, but inside radar those run one after another (see [Headless
+agents](#headless-agents-and-background-work)), because a background subagent
+answers with a placeholder first. A pipeline gets real parallelism without that
+trade, keeps the order in config rather than in a model's judgement, and shows
+each step's progress.
+
+Refused when the config loads, with the reason: a step naming no skill, a step
+with no command, a pipeline as a step (they don't nest), a skill listed twice, a
+pipeline with no stages, command-level keys on the pipeline itself, and the
+Jenkins analysis skill as either a pipeline or a step (it analyses a build; a
+pipeline runs for a merge request).
+
 ### Headless agents and background work
 
 A skill that shells out to `claude -p` can hand its real work to a background
@@ -894,6 +990,9 @@ GitLab REST ─▶ gitlab_client ─▶ poller ─▶ [ events ]  (append-only, 
 - `jenkins.py` — the CI strip: a small Jenkins client, the state table behind
   the dots, and the background-refreshed cache every request renders from (no
   request path ever calls Jenkins).
+- `commands.py` — launch one skill's command for a job, stream its progress.
+- `pipeline.py` — run several skills as one job: stages in order, the steps of
+  a stage in parallel, each later step handed the earlier steps' answers.
 - `service.py` / `web/` — read-side dashboard and recompute.
 
 > **Design note (extension):** clock fairness needs to know when the author

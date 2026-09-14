@@ -277,6 +277,7 @@ def _async_agent_launched(obj: dict) -> bool:
 _TOOL_DETAIL_KEYS = (
     "description", "command", "file_path", "notebook_path", "pattern",
     "query", "url", "prompt", "path", "skill", "subagent_type",
+    "to",  # SendMessage: which session a run is talking to is the whole story
 )
 
 
@@ -364,12 +365,73 @@ class CommandJob:
     # from the MR's project, so two projects reviewed by one skill run in their
     # own checkouts (see `CommandRunner.start`).
     cwd: str | None = None
+    # What the panel needs to tell a working run from a stuck one (see
+    # `job_health`): the Claude session to resume for the whole conversation,
+    # when the run last did something other than wait, how many waits since
+    # then, and the latest of them.
+    session_id: str = ""
+    last_work_mono: float = 0.0
+    waits_since_work: int = 0
+    waiting_on: str = ""
+    ended_mono: float = 0.0
+    # Set from the panel; only the worker that owns the process acts on it.
+    stop_requested: threading.Event = field(default_factory=threading.Event)
+    # A pipeline's steps as they start, by step name (see `pipeline`).
+    steps: dict[str, CommandJob] = field(default_factory=dict)
 
 
 def _fail(job: CommandJob, message: str) -> None:
     """Move a job to a terminal error state (error text set before status)."""
     job.error = message[:8000]
     job.status = "error"
+
+
+# Tools a run calls to wait for something rather than to do anything: polling
+# other sessions or background tasks. A run that calls nothing else for long
+# enough is stuck — the case this exists for is a review that messaged a
+# sibling pipeline step and then polled it for half an hour.
+_WAIT_TOOLS = frozenset({"ListAgents", "SendMessage", "TaskOutput", "Monitor"})
+_SLEEP_RE = re.compile(r"^\s*sleep\s+\d")
+
+# A run is stalled after this long with nothing but waiting, and at least this
+# many waits: one long sleep before a check is patience, not a loop.
+STALL_AFTER_S = 300
+_STALL_MIN_WAITS = 3
+
+
+def is_wait(name: str, tool_input: object) -> bool:
+    """Whether a tool call waits for something instead of doing work."""
+    if name in _WAIT_TOOLS:
+        return True
+    return (
+        name == "Bash"
+        and isinstance(tool_input, dict)
+        and bool(_SLEEP_RE.match(str(tool_input.get("command") or "")))
+    )
+
+
+def request_stop(job: CommandJob) -> bool:
+    """Ask the worker running ``job`` to stop it; False if it has already ended."""
+    if job.status != "running":
+        return False
+    job.stop_requested.set()
+    return True
+
+
+def job_health(job: CommandJob, now: float | None = None) -> dict:
+    """How a job is doing, as numbers the panel phrases (see ``web.app``)."""
+    now = time.monotonic() if now is None else now
+    running = job.status == "running"
+    idle = max(0.0, now - (job.last_work_mono or job.started_mono)) if running else 0.0
+    return {
+        "status": job.status,
+        "elapsed_s": int(max(0.0, (job.ended_mono or now) - job.started_mono)),
+        "idle_s": int(idle),
+        "stalled": running and job.waits_since_work >= _STALL_MIN_WAITS and idle >= STALL_AFTER_S,
+        "waiting_on": job.waiting_on if job.waits_since_work else "",
+        "session_id": job.session_id,
+        "last_line": job.progress[-1]["text"] if job.progress else "",
+    }
 
 
 def _with_deadline(fn: Callable[[], object], seconds: float, what: str) -> object:
@@ -427,12 +489,8 @@ class CommandRunner:
         """"none" (run in the configured source) or "worktree" (one per job)."""
         return getattr(self.config, "checkout", "none")
 
-    def start(
-        self,
-        ctx: dict,
-        on_success: Callable[[CommandJob], None] | None = None,
-        stdin_provider: Callable[[str], str] | None = None,
-    ) -> CommandJob:
+    def _admit(self, ctx: dict) -> CommandJob:
+        """A new running job for this context, registered so the panel finds it."""
         project_id = ctx.get("project_id")
         mr_iid = ctx.get("mr_iid")
         job = CommandJob(
@@ -449,6 +507,15 @@ class CommandRunner:
             self._jobs[job.id] = job
             while len(self._jobs) > _MAX_JOBS:  # evict oldest so serve doesn't leak
                 self._jobs.pop(next(iter(self._jobs)))
+        return job
+
+    def start(
+        self,
+        ctx: dict,
+        on_success: Callable[[CommandJob], None] | None = None,
+        stdin_provider: Callable[[str], str] | None = None,
+    ) -> CommandJob:
+        job = self._admit(ctx)
         try:
             # Resolve the skill's declared context first: a required var that is
             # unset, or a source root that is not a directory, refuses the job
@@ -535,6 +602,16 @@ class CommandRunner:
 
     # --- execution ---------------------------------------------------------
 
+    def stop(self, job_id: str, step: str | None = None) -> bool:
+        """Stop a running job from the panel; False if it is unknown or ended.
+
+        Only asks: the worker that owns the process does the kill (see
+        ``_execute``), so a stop never races the reap of the child it targets.
+        ``step`` names a pipeline's step, and a plain skill has none.
+        """
+        job = self.get(job_id)
+        return job is not None and step is None and request_stop(job)
+
     def _run(self, job: CommandJob, ctx: dict, resolved, on_success, stdin_provider=None) -> None:
         # Catch-all guarantees a terminal state; a worker crash must never leave
         # the job "running" (the UI would tail it forever).
@@ -577,6 +654,8 @@ class CommandRunner:
             log.exception("%s worker crashed", self.kind)
             _fail(job, f"unexpected error: {exc}")
         finally:
+            # The panel's elapsed time stops here rather than counting on.
+            job.ended_mono = time.monotonic()
             if scratch:
                 shutil.rmtree(scratch, ignore_errors=True)
             if worktree is not None:
@@ -688,16 +767,30 @@ class CommandRunner:
         # handed to somebody else. Here the child is provably unreaped when the
         # kill goes out, so its group id is still its own.
         remaining = max(1.0, deadline - time.monotonic())
-        timed_out = False
-        try:
-            proc.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        wait_until = time.monotonic() + remaining
+        timed_out = stopped = False
+        # Waited in slices of a second so a stop from the panel is acted on at
+        # once. The request only sets a flag; the kill still happens here.
+        while True:
+            left = wait_until - time.monotonic()
+            # poll() first: a child that exited just as the stop arrived is a
+            # finished run, not a stopped one.
+            if job.stop_requested.is_set() and proc.poll() is None:
+                stopped = True
+            elif left <= 0:
+                timed_out = True
+            else:
+                try:
+                    proc.wait(timeout=min(left, 1.0))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
             # Kills the tree: with the wait ceiling defaulted to 0 the CLI never
             # reaps its own background agents, so this is the only thing that
             # stops one from running (and spending) past the job.
             _kill_tree(proc, pgid)
             proc.wait()
+            break
 
         if _join_all(drains, _DRAIN_GRACE):
             # The child is gone but our pipes are still held: it left something
@@ -728,6 +821,14 @@ class CommandRunner:
         # Blank line between results: a run can report more than one, and gluing
         # them together swallows the heading or list the next one opens with.
         output = ("\n\n".join(result_parts) if result_parts else "".join(raw_parts))[:_MAX_OUTPUT]
+
+        if stopped:
+            # Kept, like a timeout's: what a stuck run wrote is the evidence of
+            # where it got stuck.
+            job.output = output
+            ran = int(time.monotonic() - job.started_mono)
+            _fail(job, f"{self.kind} was stopped from the panel after {ran}s")
+            return
 
         if timed_out:
             # Keep what the run did manage to say. A long review that ran out of
@@ -840,18 +941,29 @@ class CommandRunner:
 
         event_type = obj.get("type")
         if event_type == "assistant":
+            # A subagent's turns arrive on this same stream, tagged with the tool
+            # call that started it; marked, so the log says who is acting.
+            mark = "↳ " if obj.get("parent_tool_use_id") else ""
             for block in _content_blocks(obj):
                 if not isinstance(block, dict):
                     continue
                 block_type = block.get("type")
                 if block_type == "tool_use":
                     name = block.get("name")
-                    self._add(job, "tool", _tool_detail(
-                        name if isinstance(name, str) and name else "tool",
-                        block.get("input"),
-                    ))
+                    name = name if isinstance(name, str) and name else "tool"
+                    tool_input = block.get("input")
+                    detail = _tool_detail(name, tool_input)
+                    # Waiting and working look identical in a scrolling log; this
+                    # is what lets the panel say which one a run is doing.
+                    if is_wait(name, tool_input):
+                        job.waits_since_work += 1
+                        job.waiting_on = detail
+                    else:
+                        job.last_work_mono = time.monotonic()
+                        job.waits_since_work, job.waiting_on = 0, ""
+                    self._add(job, "tool", mark + detail)
                 elif block_type == "text" and str(block.get("text", "")).strip():
-                    self._add(job, "text", _short(block["text"]))
+                    self._add(job, "text", mark + _short(block["text"]))
         elif event_type == "result":
             res = obj.get("result")
             if isinstance(res, str):
@@ -866,8 +978,24 @@ class CommandRunner:
             # subtype keeps the old wording rather than vanishing: a CLI that
             # stops labelling its init should still show a session line.
             subtype = obj.get("subtype")
+            session = obj.get("session_id")
+            if subtype == "init" and isinstance(session, str) and not job.session_id:
+                job.session_id = session[:100]  # the panel's `claude --resume` handle
             if not isinstance(subtype, str) or not subtype.strip() or subtype == "init":
                 self._add(job, "log", "session started")
+            elif subtype == "task_started":
+                description = _short(str(obj.get("description") or "a subagent"), 90)
+                stats.setdefault("tasks", {})[str(obj.get("task_id"))] = description
+                where = " in the background" if obj.get("is_backgrounded") else ""
+                self._add(job, "log", f"subagent started{where}: {description}")
+            elif subtype == "task_notification":
+                description = stats.get("tasks", {}).get(str(obj.get("task_id")), "a subagent")
+                status = _short(str(obj.get("status") or "ended"), 30)
+                self._add(job, "log", f"subagent {status}: {description}")
+            elif subtype in ("task_progress", "task_updated"):
+                # A running subagent's own tool calls already reach the log, marked;
+                # these would add a line per tick that says nothing more.
+                pass
             else:
                 # Child-controlled text, so bounded like every other line here.
                 self._add(job, "log", _short(subtype.replace("_", " "), 90))

@@ -1,0 +1,32 @@
+{# Who is doing what inside a job: one row per pipeline step (or one for a
+   plain skill), each saying whether it is working or only waiting, and
+   offering to stop it. Refreshes itself every 3s while the job runs; the
+   finished fragment omits the trigger, which stops the polling — and closing
+   the panel removes the element, which stops it too. #}
+<div class="job-health"
+     {% if live %}hx-get="/{{ kind }}/health/{{ job.id }}" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
+  {% for row in rows %}
+  <div class="health-row health-{{ row.state }}{% if row.stalled %} health-stalled{% endif %}">
+    <span class="health-name">{{ row.label }}</span>
+    <span class="health-state">{{ row.state_text }}</span>
+    <span class="health-note" title="{{ row.note }}">{{ row.note }}</span>
+    {% if row.session_id %}
+    {# The whole conversation lives in that Claude session; resuming it is how
+       to read what the agent was thinking, not just which tools it called. #}
+    <code class="health-session" title="See the whole conversation: {{ row.resume }}">{{ row.session_id[:8] }}</code>
+    {% endif %}
+    {% if row.can_stop %}
+    <button class="health-stop" type="button"
+            hx-post="/{{ kind }}/stop/{{ job.id }}{% if row.step %}?step={{ row.step|urlencode }}{% endif %}"
+            hx-target="closest .job-health" hx-swap="outerHTML"
+            hx-confirm="Stop {{ row.label }}?{% if row.step %} The pipeline carries on without it.{% endif %}">■ stop</button>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% if stop_all %}
+  <button class="health-stop health-stop-all" type="button"
+          hx-post="/{{ kind }}/stop/{{ job.id }}"
+          hx-target="closest .job-health" hx-swap="outerHTML"
+          hx-confirm="Stop every running step, and skip the stages still to come?">■ stop the whole pipeline</button>
+  {% endif %}
+</div>

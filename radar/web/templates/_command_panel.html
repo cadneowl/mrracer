@@ -87,6 +87,9 @@
     </script>
     {% endif %}
     <div class="modal-body">
+      {# A row per pipeline step, or one for a running skill: working or only
+         waiting, and a way to stop it. Absent from a re-opened stored result. #}
+      {% if rows %}{% include "_job_health.html" %}{% endif %}
       {# `status`/`error`, not `job.*`: one read of the job's state per render — see _panel. #}
       {% if status == "running" %}
       <div class="review-loading">

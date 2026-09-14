@@ -23,12 +23,13 @@ from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 
 from ..coach import build_coach
-from ..commands import SNAPSHOT_KEYS, CommandJob, CommandRunner
+from ..commands import SNAPSHOT_KEYS, CommandJob, job_health
 from ..config import Config
 from ..context import jenkins_stdin_provider_for, stdin_provider_for
 from ..db import Database
 from ..jenkins import JenkinsMonitor, analysable_build, strip_view
 from ..jira import extract_keys
+from ..pipeline import PipelineRunner, build_runners
 from ..service import build_dashboard, build_threads
 
 _BASE = Path(__file__).parent
@@ -110,6 +111,80 @@ def _clock_text(remaining_s: int | None) -> str:
     return f"{remaining_s // 60}:{remaining_s % 60:02d} left"
 
 
+def _duration(seconds: int) -> str:
+    """"45s", "10m", "1h 04m" — how long, at a glance."""
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+
+
+def _health_row(job: CommandJob, name: str, label: str, step: str | None, now: float) -> dict:
+    """One row of the panel's who-is-doing-what table (see _job_health.html)."""
+    health = job_health(job, now)
+    status, elapsed = health["status"], _duration(health["elapsed_s"])
+    if status == "running":
+        state_text = f"running {elapsed}"
+        if health["stalled"]:
+            note = (
+                f"⚠ only waiting for {_duration(health['idle_s'])} — "
+                f"last: {health['waiting_on']}"
+            )
+        elif health["waiting_on"]:
+            note = f"waiting: {health['waiting_on']}"
+        else:
+            note = health["last_line"]
+    elif status == "done":
+        state_text, note = f"✓ done in {elapsed}", ""
+    else:
+        error = job.error.strip()
+        state_text, note = f"✗ failed after {elapsed}", error.splitlines()[0] if error else ""
+    session = health["session_id"]
+    resume = f"claude --resume {session}"
+    return {
+        "name": name,
+        "label": label or name,
+        "step": step,
+        "state": status,
+        "state_text": state_text,
+        "note": _short_note(note),
+        "stalled": health["stalled"],
+        "session_id": session,
+        # A session is resumed from the directory it ran in, or it isn't found.
+        "resume": f"cd {job.cwd} && {resume}" if job.cwd else resume,
+        "can_stop": status == "running",
+    }
+
+
+def _short_note(text: str, limit: int = 200) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _health_rows(runner, job: CommandJob, now: float | None = None) -> list[dict]:
+    """A row per step of a pipeline's job — started or not — or one row for a
+    plain skill's job."""
+    now = time.monotonic() if now is None else now
+    if not isinstance(runner, PipelineRunner):
+        return [_health_row(job, runner.kind, runner.config.label, None, now)]
+    rows = []
+    for stage in runner.config.pipeline:
+        for name in stage:
+            label = runner.steps[name].config.label
+            child = job.steps.get(name)
+            if child is not None:
+                rows.append(_health_row(child, name, label, name, now))
+                continue
+            rows.append({
+                "name": name, "label": label or name, "step": name, "state": "pending",
+                "state_text": "pending",
+                "note": "" if job.status == "running" else "did not run",
+                "stalled": False, "session_id": "", "resume": "", "can_stop": False,
+            })
+    return rows
+
+
 def _render_markdown(text: str) -> Markup:
     html = md.markdown(text, extensions=["fenced_code", "tables", "sane_lists"])
     clean = nh3.clean(
@@ -145,7 +220,7 @@ def create_app(
     # without a restart bringing the new code that goes with it.
     templates.env.globals["css_version"] = _asset_version(_BASE / "static" / "radar.css")
     skills_by_name = {s.name: s for s in config.skills}
-    runners = {s.name: CommandRunner(s, s.name) for s in config.skills}
+    runners = build_runners(config.skills)
     enabled = {s.name: s.enabled for s in config.skills}
 
     def _skill_view(s) -> dict:
@@ -218,10 +293,21 @@ def create_app(
         status = job.status
         output, error = job.output, job.error
         remaining_s = _remaining_s(job, status)
+        # Rows for a pipeline always — a finished one still says which step
+        # failed and why — and for a plain skill while it runs. Never for a
+        # re-opened stored result: it has no steps and nothing left to stop.
+        runner = runners.get(job.kind)
+        show_rows = (
+            runner is not None
+            and job.id != "stored"
+            and (status == "running" or isinstance(runner, PipelineRunner))
+        )
+        health = _health_context(job.kind, job) if show_rows else {"rows": []}
         return templates.TemplateResponse(
             request,
             "_command_panel.html",
             {
+                **health,
                 "job": job,
                 "status": status,
                 "error": error,
@@ -377,6 +463,50 @@ def create_app(
                 note["body_html"] = _render_markdown(note["body"])
         return templates.TemplateResponse(request, "_threads.html", data)
 
+    def _health_context(kind: str, job: CommandJob) -> dict:
+        """What _job_health.html needs: the rows, and whether to keep refreshing."""
+        runner = runners[kind]
+        running = job.status == "running"
+        return {
+            "kind": kind,
+            "job": job,
+            "rows": _health_rows(runner, job),
+            "live": running,
+            "stop_all": running and isinstance(runner, PipelineRunner),
+        }
+
+    def _running_job(kind: str, job_id: str) -> CommandJob:
+        runner = runners.get(kind)
+        job = runner.get(job_id) if runner is not None else None
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown job")
+        return job
+
+    # Both declared ahead of POST /{kind}/{project_id}/{mr_iid}. Its segments are
+    # untyped until validation, so "/review/stop/<id>" would match that route
+    # and be refused as a bad merge-request number rather than reach this one.
+    @app.get("/{kind}/health/{job_id}", response_class=HTMLResponse)
+    def job_health_rows(request: Request, kind: str, job_id: str):
+        job = _running_job(kind, job_id)
+        return templates.TemplateResponse(
+            request, "_job_health.html", _health_context(kind, job)
+        )
+
+    @app.post("/{kind}/stop/{job_id}", response_class=HTMLResponse)
+    def stop_job(request: Request, kind: str, job_id: str, step: str | None = None):
+        """Stop a job — or one step of a pipeline, which carries on without it."""
+        job = _running_job(kind, job_id)
+        runner = runners[kind]
+        if step is not None and (
+            not isinstance(runner, PipelineRunner) or step not in runner.steps
+        ):
+            raise HTTPException(status_code=404, detail=f"{kind} has no step named {step!r}")
+        # False when it had already ended; the rows returned say so either way.
+        runner.stop(job_id, step)
+        return templates.TemplateResponse(
+            request, "_job_health.html", _health_context(kind, job)
+        )
+
     @app.post("/{kind}/{project_id}/{mr_iid}", response_class=HTMLResponse)
     def start_command(request: Request, kind: str, project_id: int, mr_iid: int):
         if kind not in runners or not enabled[kind]:
@@ -396,16 +526,35 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown merge request")
         ctx, keys = _ctx_for(snap, project_id, mr_iid)
 
-        on_success = None
-        if skills_by_name[kind].stores_result:
+        def on_success_for(name: str):
+            """What to do with a finished result of skill ``name`` for this MR."""
+            if not skills_by_name[name].stores_result:
+                return None
             csv = ",".join(keys)
 
             def on_success(job) -> None:
                 with Database(db_path) as db:
-                    db.save_test_plan(project_id, mr_iid, kind, csv, job.output)
+                    db.save_test_plan(project_id, mr_iid, name, csv, job.output)
 
-        stdin_provider = stdin_provider_for(kind, config, project_id, mr_iid, keys)
-        job = runners[kind].start(ctx, on_success=on_success, stdin_provider=stdin_provider)
+            return on_success
+
+        runner = runners[kind]
+        if isinstance(runner, PipelineRunner):
+            # Each step is handed what its own button would give it, and saves
+            # what its own button would save.
+            job = runner.start(
+                ctx,
+                on_success=on_success_for(kind),
+                provider_for=lambda step: stdin_provider_for(
+                    step, config, project_id, mr_iid, keys
+                ),
+                on_success_for=on_success_for,
+            )
+        else:
+            stdin_provider = stdin_provider_for(kind, config, project_id, mr_iid, keys)
+            job = runner.start(
+                ctx, on_success=on_success_for(kind), stdin_provider=stdin_provider
+            )
         return _panel(request, job)
 
     @app.get("/{kind}/status/{job_id}", response_class=HTMLResponse)

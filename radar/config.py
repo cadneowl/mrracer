@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -147,6 +147,9 @@ class SkillConfig:
     remote: str = "origin"
     env: tuple[tuple[str, str], ...] = ()  # NAME -> value, exported to the child
     env_unset: tuple[str, ...] = ()  # names the child must NOT inherit
+    # Stages of other skills' names, run in order; the steps of one stage run at
+    # once. Set means this entry has no command of its own — see ``pipeline``.
+    pipeline: tuple[tuple[str, ...], ...] = ()
 
 
 
@@ -418,7 +421,7 @@ _VALID_CHECKOUTS = {"none", "worktree"}
 # (/{name}/{project_id}/{mr_iid}), so it must be a URL-safe slug and must not
 # shadow a fixed sub-path used within a skill's own route namespace.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-_RESERVED_NAMES = frozenset({"status", "stream", "close", "stored"})
+_RESERVED_NAMES = frozenset({"status", "stream", "close", "stored", "health", "stop"})
 
 # Defaults carried by two well-known names. They are *not* skills in their own
 # right — nothing exists until `skills:` declares it — but a skill that claims
@@ -539,6 +542,83 @@ def _parse_env_unset(raw: object, ctx: str) -> tuple[str, ...]:
     return tuple(_env_name(x, f"{ctx}.env_unset") for x in raw)
 
 
+# Everything that says how one command is run. A pipeline runs no command of its
+# own — each step brings its own — so these are refused on one rather than read
+# and ignored.
+_STEP_ONLY_KEYS = (
+    "command", "working_dir", "include_context", "context", "source", "inputs",
+    "checkout", "remote", "env", "env_unset",
+)
+
+
+def _parse_stage(raw: object, ctx: str) -> tuple[str, ...]:
+    """One stage of a pipeline: ``name``, ``{skill: name}`` or ``{parallel: [...]}``."""
+    if isinstance(raw, str):
+        names: object = [raw]
+    elif isinstance(raw, dict) and list(raw) == ["skill"]:
+        names = [raw["skill"]]
+    elif isinstance(raw, dict) and list(raw) == ["parallel"]:
+        names = raw["parallel"]
+        if not isinstance(names, list) or not names:
+            raise ConfigError(f"{ctx}.parallel: expected a non-empty list of skill names")
+    else:
+        raise ConfigError(
+            f"{ctx}: expected a skill name, {{skill: <name>}} or {{parallel: [<name>, ...]}}"
+        )
+    out = []
+    for step in names:
+        if not isinstance(step, str) or not step.strip():
+            raise ConfigError(f"{ctx}: expected skill names, got {step!r}")
+        out.append(step.strip())
+    return tuple(out)
+
+
+def _parse_pipeline(
+    raw: dict, name: str, ctx: str, *, label: str, button: str, icon: str, stores_result: bool
+) -> SkillConfig:
+    """A skill that runs other skills (see ``pipeline``).
+
+    Names are only checked for shape here; whether they exist, and what the run
+    may cost, needs the whole list — see ``_check_pipelines``.
+    """
+    stray = [key for key in _STEP_ONLY_KEYS if key in raw]
+    if stray:
+        raise ConfigError(
+            f"{ctx}: a pipeline runs other skills and has no command of its own, so "
+            f"{', '.join(stray)} would do nothing here. Set "
+            f"{'it' if len(stray) == 1 else 'them'} on the skills it runs instead."
+        )
+    stages_raw = raw["pipeline"]
+    if not isinstance(stages_raw, list) or not stages_raw:
+        raise ConfigError(f"{ctx}.pipeline: expected a non-empty list of stages")
+    stages = tuple(_parse_stage(s, f"{ctx}.pipeline[{i}]") for i, s in enumerate(stages_raw))
+    seen: set[str] = set()
+    for step in (step for stage in stages for step in stage):
+        if step == name:
+            raise ConfigError(f"{ctx}.pipeline: {name!r} names itself as a step")
+        if step in seen:
+            # Every later step is told what each earlier one said, by name; two
+            # runs of one skill over the same merge request would be one answer
+            # given twice under a heading that cannot tell them apart.
+            raise ConfigError(f"{ctx}.pipeline: {step!r} is listed twice — a step runs once")
+        seen.add(step)
+
+    timeout = 0  # none given: derived from the steps in _check_pipelines
+    if "timeout_seconds" in raw:
+        try:
+            timeout = int(raw["timeout_seconds"])
+        except (TypeError, ValueError):
+            raise ConfigError(f"{ctx}.timeout_seconds: expected an integer") from None
+        if timeout < 1:
+            raise ConfigError(f"{ctx}.timeout_seconds: must be >= 1")
+
+    return SkillConfig(
+        name=name, label=label, button=button, icon=icon,
+        enabled=bool(raw.get("enabled", False)), timeout_seconds=timeout,
+        stores_result=stores_result, pipeline=stages,
+    )
+
+
 def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfig:
     if raw is None:
         raw = {}
@@ -549,6 +629,12 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
     label = str(raw.get("label", builtin.get("label", name)))
     button = str(raw.get("button", builtin.get("button", label)))
     icon = str(raw.get("icon", builtin.get("icon", "▶")))
+
+    if "pipeline" in raw:
+        return _parse_pipeline(
+            raw, name, ctx, label=label, button=button, icon=icon,
+            stores_result=bool(raw.get("stores_result", builtin.get("stores_result", False))),
+        )
 
     enabled = bool(raw.get("enabled", False))
     command = str(raw.get("command", "")).strip()
@@ -993,6 +1079,70 @@ def _check_analysis_wiring(jenkins: JenkinsConfig, skills: tuple[SkillConfig, ..
         )
 
 
+def _check_pipelines(
+    skills: tuple[SkillConfig, ...], jenkins: JenkinsConfig
+) -> tuple[SkillConfig, ...]:
+    """Resolve every pipeline against the skills it names, and set its budget.
+
+    Deferred from ``_parse_pipeline`` because a step may be declared after the
+    pipeline that runs it. The budget is derived rather than trusted: each step
+    stops on its own timeout and nothing stops it sooner, so the longest a run
+    can take is the slowest step of each stage, summed — and a smaller figure
+    would be a countdown that reaches zero while the review is still working.
+    """
+    by_name = {s.name: s for s in skills}
+    analyser = jenkins.analysis.skill if jenkins.analysis.enabled else ""
+    out: list[SkillConfig] = []
+    for skill in skills:
+        if not skill.pipeline:
+            out.append(skill)
+            continue
+        ctx = f"skills[{skill.name}]"
+        if skill.name == analyser:
+            raise ConfigError(
+                f"jenkins.analysis.skill names {skill.name!r}, which is a pipeline — the "
+                "analyse button runs one skill over one build. Name a skill with a command."
+            )
+        budget = 0
+        for stage in skill.pipeline:
+            slowest = 0
+            for step in stage:
+                target = by_name.get(step)
+                if target is None:
+                    available = ", ".join(s.name for s in skills if s is not skill)
+                    raise ConfigError(
+                        f"{ctx}.pipeline: no skill named {step!r} — the 'skills' list has "
+                        f"{available or 'nothing else'}"
+                    )
+                if target.pipeline:
+                    raise ConfigError(
+                        f"{ctx}.pipeline: {step!r} is itself a pipeline, and pipelines do "
+                        "not nest. List its stages here instead."
+                    )
+                if not target.command:
+                    raise ConfigError(
+                        f"{ctx}.pipeline: {step!r} has no command, so that step would have "
+                        "nothing to run"
+                    )
+                if step == analyser:
+                    raise ConfigError(
+                        f"{ctx}.pipeline: {step!r} is the skill jenkins.analysis.skill names. "
+                        "It analyses a build, and a pipeline runs for a merge request, so it "
+                        "would start with no build to read."
+                    )
+                slowest = max(slowest, target.timeout_seconds)
+            budget += slowest
+        if skill.timeout_seconds and skill.timeout_seconds < budget:
+            raise ConfigError(
+                f"{ctx}.timeout_seconds is {skill.timeout_seconds}, but its steps may take "
+                f"up to {budget}s (the slowest step of each stage, summed). Each step stops "
+                "on its own timeout, not the pipeline's — raise it to at least "
+                f"{budget}, or leave it out and radar uses {budget}."
+            )
+        out.append(replace(skill, timeout_seconds=max(skill.timeout_seconds, budget)))
+    return tuple(out)
+
+
 def load_config(path: str | Path) -> Config:
     """Load and validate config.yaml, raising ConfigError with context."""
     path = Path(path)
@@ -1040,6 +1190,7 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(gamification, dict):
         raise ConfigError("gamification: expected a mapping")
 
+    skills = _check_pipelines(skills, jenkins)
     _check_analysis_wiring(jenkins, skills)
 
     return Config(
