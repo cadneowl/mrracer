@@ -103,14 +103,22 @@ def _row_min_urgency(obligations: list[dict]) -> float:
 
 
 def _people_index(rows: list[dict]) -> list[dict]:
-    """Every reviewer with an open obligation, with how many are waiting on them."""
+    """Everyone with an open obligation or an open MR of their own, with how
+    many are waiting on them. Authors are listed too: a person's view shows the
+    MRs they opened, so someone who only authors still needs a pill to click."""
     people: dict[str, dict] = {}
+
+    def person(name: str) -> dict:
+        return people.setdefault(name, {"username": name, "waiting": 0, "total": 0, "authored": 0})
+
     for row in rows:
+        if row["author"]:
+            person(row["author"])["authored"] += 1
         for o in row["obligations"]:
             name = o["reviewer"]
             if not name:  # an unassigned MR whose author GitLab did not report
                 continue
-            p = people.setdefault(name, {"username": name, "waiting": 0, "total": 0})
+            p = person(name)
             p["total"] += 1
             if o["chip_state"] in _WAITING_STATES:
                 p["waiting"] += 1
@@ -149,7 +157,12 @@ def _parse_view(token: str | None, config: Config) -> tuple[str, object, str]:
                 )
                 return f"team_{mode}", team, label
         return "all", None, "All open MRs"  # unknown team/mode -> fall back
-    return "reviewer", token, f"MRs waiting on {token}"
+    return "reviewer", token, f"{token}'s MRs"
+
+
+def _section(title: str | None, heading: str, rows: list[dict], empty: str | None = None) -> dict:
+    rows.sort(key=lambda r: r["min_urgency"])
+    return {"title": title, "heading": heading, "rows": rows, "empty": empty}
 
 
 def build_dashboard(
@@ -207,9 +220,29 @@ def build_dashboard(
     people = _people_index(all_rows)
     kind, value, label = _parse_view(view, config)
 
+    heading = "Review obligations (most overdue first)"
     if kind == "reviewer":
-        # Personal view: MRs waiting on one person, narrowed to their obligation.
-        rows = _filter_obligations(all_rows, lambda o: o["reviewer"] == value)
+        # Personal view, in two lists: the MRs they opened (every chip on them —
+        # who they are waiting on) and the reviews asked of them (narrowed to
+        # their own chip — who is waiting on them). An MR they opened is listed
+        # only under authored, where their chip still shows, so no MR appears
+        # twice; that includes an unassigned one, whose assignment chip is theirs.
+        authored = [r for r in all_rows if r["author"] == value]
+        requested = _filter_obligations(
+            [r for r in all_rows if r["author"] != value],
+            lambda o: o["kind"] == KIND_REVIEW and o["reviewer"] == value,
+        )
+        sections = [
+            _section(
+                f"Authored by {value}", "Reviewers on it (most overdue first)",
+                authored, f"No open MRs authored by {value}.",
+            ),
+            _section(
+                f"Review requested from {value}", f"{value}'s review (most overdue first)",
+                requested, f"No reviews requested from {value}.",
+            ),
+        ]
+        rows = authored + requested
     elif kind == "team_review":
         # Requested reviewers only: an unassigned MR was never asked of anyone,
         # so it does not belong in a "review requested from team X" list even
@@ -224,15 +257,17 @@ def build_dashboard(
         rows = [r for r in all_rows if r["author"] in members]
     else:
         rows = all_rows
+    if kind != "reviewer":
+        sections = [_section(None, heading, rows)]
 
     summary = {chip: 0 for chip in _CHIP_ORDER}
     for row in rows:
         for o in row["obligations"]:
             summary[o["chip_state"]] = summary.get(o["chip_state"], 0) + 1
 
-    rows.sort(key=lambda r: r["min_urgency"])
     return {
         "rows": rows,
+        "sections": sections,
         "summary": summary,
         "breached": summary.get(CHIP_BREACHED, 0),
         "at_risk": summary.get(CHIP_AT_RISK, 0),

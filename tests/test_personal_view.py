@@ -32,7 +32,8 @@ def test_filter_to_one_reviewer(config, tmp_path):
 
     full = build_dashboard(db, config, now=ny(2026, 3, 2, 10))
     assert full["open_mrs"] == 2
-    assert {p["username"] for p in full["people"]} == {"dan", "maya"}
+    # aviva reviews nothing but opened both MRs, so she still gets a pill.
+    assert {p["username"] for p in full["people"]} == {"dan", "maya", "aviva"}
 
     dan_view = build_dashboard(db, config, now=ny(2026, 3, 2, 10), view="dan")
     assert dan_view["view"]["kind"] == "reviewer"
@@ -40,6 +41,53 @@ def test_filter_to_one_reviewer(config, tmp_path):
     assert dan_view["open_mrs"] == 1
     assert dan_view["rows"][0]["mr_iid"] == 1
     assert all(o["reviewer"] == "dan" for r in dan_view["rows"] for o in r["obligations"])
+    db.close()
+
+
+def test_person_view_lists_authored_and_review_requested_apart(config, tmp_path):
+    db = Database(tmp_path / "p.db")
+    _seed(db)
+    # MR 3: dan opened it and maya is reviewing it.
+    db.upsert_mr_snapshot(
+        project_id=1, mr_iid=3, title="MR 3", author="dan",
+        web_url="https://gl/mr/3", source_branch="g", target_branch="main",
+        description="", labels=[], draft=False, state="opened", reviewers=["maya"],
+        created_at="2026-03-02T09:00:00Z", updated_at="2026-03-02T09:00:00Z",
+    )
+    db.insert_events([ev(ET.REVIEW_REQUESTED, ny(2026, 3, 2, 9), reviewer="maya", mr_iid=3)])
+
+    data = build_dashboard(db, config, now=ny(2026, 3, 2, 10), view="dan")
+    authored, requested = data["sections"]
+    assert authored["title"] == "Authored by dan"
+    assert [r["mr_iid"] for r in authored["rows"]] == [3]
+    # Every chip on his own MR stays: it's who he is waiting on.
+    assert [o["reviewer"] for o in authored["rows"][0]["obligations"]] == ["maya"]
+    assert requested["title"] == "Review requested from dan"
+    assert [r["mr_iid"] for r in requested["rows"]] == [1]
+    assert data["open_mrs"] == 2
+
+    # maya's view is the mirror image: nothing authored, two reviews asked of her.
+    maya = build_dashboard(db, config, now=ny(2026, 3, 2, 10), view="maya")
+    assert maya["sections"][0]["rows"] == []
+    assert sorted(r["mr_iid"] for r in maya["sections"][1]["rows"]) == [2, 3]
+    db.close()
+
+
+def test_own_mr_is_not_listed_twice(config, tmp_path):
+    """Asked to review your own MR: it shows once, under authored, chip and all."""
+    db = Database(tmp_path / "p.db")
+    db.upsert_mr_snapshot(
+        project_id=1, mr_iid=1, title="Self", author="dan",
+        web_url="https://gl/mr/1", source_branch="f", target_branch="main",
+        description="", labels=[], draft=False, state="opened", reviewers=["dan"],
+        created_at="2026-03-02T09:00:00Z", updated_at="2026-03-02T09:00:00Z",
+    )
+    db.insert_events([ev(ET.REVIEW_REQUESTED, ny(2026, 3, 2, 9), reviewer="dan", mr_iid=1)])
+
+    data = build_dashboard(db, config, now=ny(2026, 3, 2, 10), view="dan")
+    authored, requested = data["sections"]
+    assert [r["mr_iid"] for r in authored["rows"]] == [1]
+    assert requested["rows"] == []
     db.close()
 
 
@@ -65,7 +113,9 @@ def test_cookie_roundtrip(config, tmp_path):
     # Picking a person sets the cookie and renders the personal view.
     resp = client.get("/?view=dan")
     assert resp.status_code == 200
-    assert "MRs waiting on" in resp.text
+    assert "Authored by dan" in resp.text
+    assert "Review requested from dan" in resp.text
+    assert "No open MRs authored by dan." in resp.text
     assert client.cookies.get(COOKIE_NAME) == "dan"
 
     # The polled partial honours the remembered cookie (personal view persists).

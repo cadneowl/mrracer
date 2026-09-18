@@ -93,6 +93,9 @@ def test_the_author_owes_it(tmp_path):
     # are waiting on him and both show in his personal view.
     data = build_dashboard(db, config, now=ny(2026, 3, 2, 12), view="dan")
     assert sorted(r["mr_iid"] for r in data["rows"]) == [1, 2]
+    authored, requested = data["sections"]
+    assert [r["mr_iid"] for r in authored["rows"]] == [2]  # his, owing a reviewer
+    assert [r["mr_iid"] for r in requested["rows"]] == [1]
     dan = next(p for p in data["people"] if p["username"] == "dan")
     assert dan["waiting"] == 2
 

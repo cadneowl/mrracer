@@ -13,7 +13,7 @@
   {% for p in people %}
   <a class="pill {% if view.kind == 'reviewer' and view.token == p.username %}pill-active{% endif %}"
      href="/?view={{ p.username }}"
-     title="{{ p.waiting }} waiting on {{ p.username }}, {{ p.total }} total">
+     title="{{ p.waiting }} waiting on {{ p.username }}, {{ p.total }} total · {{ p.authored }} authored">
     {{ p.username }}
     {% if p.waiting %}<span class="pill-count">{{ p.waiting }}</span>{% endif %}
   </a>
@@ -35,7 +35,13 @@
   <div class="stat stat-blue"><span class="num">{{ summary.WAIVED }}</span><span class="lbl">waived</span></div>
 </section>
 
-{% if rows %}
+{# One section per list: a person's view has two (authored / review requested),
+   every other view a single untitled one. #}
+{% for section in sections %}
+{% if section.title %}
+<h3 class="section-title">{{ section.title }} <span class="section-count">{{ section.rows|length }}</span></h3>
+{% endif %}
+{% if section.rows %}
 <table class="board">
   <thead>
     <tr>
@@ -43,11 +49,11 @@
       <th>Author</th>
       <th>Target</th>
       <th class="col-age">Age</th>
-      <th class="col-obl">Review obligations (most overdue first)</th>
+      <th class="col-obl">{{ section.heading }}</th>
     </tr>
   </thead>
   <tbody>
-    {% for row in rows %}
+    {% for row in section.rows %}
     <tr>
       <td class="col-mr">
         {% if row.web_url %}<a href="{{ row.web_url }}" target="_blank" rel="noopener">{{ row.title }}</a>
@@ -83,7 +89,10 @@
         {% endfor %}
         </span>
       </td>
-      <td class="muted">{{ row.author or "—" }}</td>
+      <td class="muted">
+        {% if row.author %}<a class="author-link" href="/?view={{ row.author }}" title="click for {{ row.author }}'s MRs">{{ row.author }}</a>
+        {% else %}—{% endif %}
+      </td>
       <td class="muted">{{ row.target_branch or "—" }}</td>
       <td class="col-age muted">{{ row.age }}</td>
       <td class="col-obl">
@@ -123,6 +132,8 @@
     {% endfor %}
   </tbody>
 </table>
+{% elif section.empty %}
+<div class="empty empty-section">{{ section.empty }}</div>
 {% else %}
 <div class="empty">
   {% if view.kind != 'all' %}
@@ -132,5 +143,6 @@
   {% endif %}
 </div>
 {% endif %}
+{% endfor %}
 
 <p class="gen">generated {{ generated_at.strftime("%Y-%m-%d %H:%M:%S UTC") }}</p>

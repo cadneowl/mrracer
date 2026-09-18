@@ -138,7 +138,17 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .board .col-age { white-space: nowrap; }
 .board a { color: var(--text); text-decoration: none; font-weight: 600; }
 .board a:hover { text-decoration: underline; }
+.board a.author-link { color: var(--muted); font-weight: 400; }
+.board a.author-link:hover { color: var(--text); }
 .mrid { color: var(--muted); margin-left: 6px; font-size: 12px; }
+
+/* A person's view splits into authored / review-requested lists. */
+.section-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--muted); margin: 26px 0 10px; display: flex; align-items: center; gap: 8px; }
+.summary + .section-title { margin-top: 0; }
+.section-count { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+  padding: 0 7px; font-size: 11px; color: var(--text); }
+.empty.empty-section { padding: 16px; }
 .muted { color: var(--muted); }
 
 .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 20px;

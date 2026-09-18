@@ -280,8 +280,13 @@ The **VIEW** bar filters the board. The chosen filter is remembered in a
 the 60s auto-refresh; **All MRs** clears it. There is **no login** — the board
 holds no private data, so the cookie stores a display preference, not identity.
 
-- **Personal** — click any reviewer (a name chip on the board or a pill) to see
-  *the MRs waiting on them* (`/?view=<username>`).
+- **Personal** — click any reviewer (a name chip on the board, an author name,
+  or a pill) to see two lists (`/?view=<username>`):
+  - **Authored by them** — MRs they opened, with every chip intact: who *they*
+    are waiting on. An MR they opened is listed only here, so it never appears
+    twice, and that includes an unassigned one (its assignment chip is theirs).
+  - **Review requested from them** — MRs where they are a requested reviewer,
+    narrowed to their own chip: who is waiting on *them*.
 - **Team** — define teams in config (`teams:`), and each gets two pills:
   - **`<team> · authored`** — MRs **opened by** a team member.
   - **`<team> · to review`** — MRs where a team member is a **requested
