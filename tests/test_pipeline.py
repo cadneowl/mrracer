@@ -495,20 +495,78 @@ def test_the_retried_step_is_handed_what_the_earlier_ones_said(tmp_path, step_sc
     assert "arch says hi" in job.steps["synth"].output or handed > 40
 
 
-def test_a_retry_is_refused_when_there_is_nothing_to_retry(tmp_path, step_script):
+def test_a_retry_is_refused_when_there_is_nothing_to_resume(tmp_path, step_script):
+    """Not "nothing went wrong" — a step that worked can be run again on
+    purpose. This is the list of things that genuinely cannot be resumed."""
     cfg = _config(tmp_path, (
-        _skill(step_script, "arch") + _skill(step_script, "dba")
+        _skill(step_script, "arch") + _skill(step_script, "dba", code=1)
+        + _skill(step_script, "synth")
         + "  - name: full\n    label: Full\n    enabled: true\n"
-        "    pipeline:\n      - parallel: [arch, dba]\n"
+        "    pipeline:\n      - parallel: [arch, dba]\n      - skill: synth\n"
     ))
     runners = build_runners(cfg.skills)
     runner = runners["full"]
     job = _wait(runner.start({"title": "Add widget", "subject": "!7"}))
 
     assert job.status == "done"
-    assert runner.retry_step(job.id, "arch") is False      # it did not fail
-    assert runner.retry_step(job.id, "nope") is False      # no such step
-    assert runner.retry_step("no-such-job", "arch") is False
+    assert runner.retry_step(job.id, "nope") is False        # no such step
+    assert runner.retry_step("no-such-job", "arch") is False  # no such job
+    job.status = "running"                                   # a run still going
+    assert runner.retry_step(job.id, "arch") is False
+    job.status = "done"
+    # A step this run never reached. Nothing to resume from: the answer it would
+    # be handed does not exist, and the button that starts one is the board's.
+    del job.steps["synth"]
+    assert runner.retry_step(job.id, "synth") is False
+    # A job from before radar kept what a retry needs.
+    job.retry_with = {}
+    assert runner.retry_step(job.id, "arch") is False
+
+
+def test_a_step_that_succeeded_can_be_run_again_over_what_is_there_now(
+    tmp_path, step_script
+):
+    """The case the failed-step-only rule got wrong.
+
+    One review of three fails, the synthesis merges the two that worked and
+    answers badly — a clean exit and a non-empty answer, which is a success by
+    every measure radar has. Re-running the review is half the remedy; the other
+    half is re-running the synthesis over what is there now, and *that* step did
+    not fail either. Both are the same operation, and neither was allowed.
+    """
+    cfg = _config(tmp_path, (
+        _skill(step_script, "arch")
+        + _skill(step_script, "dba", code=1)
+        + _skill(step_script, "qa")
+        + _skill(step_script, "synth")
+        + "  - name: full\n    label: Full\n    enabled: true\n"
+        "    pipeline:\n      - parallel: [arch, dba, qa]\n      - skill: synth\n"
+    ))
+    runner = build_runners(cfg.skills)["full"]
+    job = _wait(runner.start({"title": "Add widget", "subject": "!7"}))
+    assert job.status == "done", job.error
+
+    # The synthesis alone, over the outputs that are already there.
+    assert runner.retry_step(job.id, "synth") is True
+    _wait(job)
+    assert job.status == "done", job.error
+    handed = _handed(job.output)
+    assert "### ARCH review\n\narch says hi" in handed
+    assert "### QA review\n\nqa says hi" in handed
+    # Including the one that failed: a synthesis told only about the reviews
+    # that worked cannot say what went unreviewed.
+    assert "### DBA review (failed)" in handed and "dba broke" in handed
+
+    # And a review that worked, which also re-runs the synthesis after it,
+    # because its answer is the synthesis's input.
+    ran = [item["text"] for item in job.progress]
+    assert runner.retry_step(job.id, "arch") is True
+    _wait(job)
+    assert job.status == "done", job.error
+    after = [item["text"] for item in job.progress[len(ran):]]
+    assert any("[arch]" in line for line in after)
+    assert any("[synth]" in line for line in after)
+    assert not any("[qa]" in line for line in after), "qa is kept, not paid for twice"
 
 
 def test_the_panel_offers_a_retry_on_a_failed_step_and_it_works(tmp_path, step_script):
@@ -535,9 +593,12 @@ def test_the_panel_offers_a_retry_on_a_failed_step_and_it_works(tmp_path, step_s
             break
         time.sleep(0.05)
     assert "review-error" in html, "the pipeline should have failed"
-    # The failed step offers a retry; the one that succeeded does not.
+    # Both rows offer to run again, in the words their state calls for: the step
+    # that failed is a retry, the one that worked is a deliberate re-run.
     assert f'hx-post="/full/retry/{job_id}?step=synth"' in html
-    assert f'hx-post="/full/retry/{job_id}?step=arch"' not in html
+    assert f'hx-post="/full/retry/{job_id}?step=arch"' in html
+    assert "↻ retry" in html and "↻ run again" in html
+    assert "Its answer is replaced by the new one." in html, "said before it is"
     # And what the first stage produced is still on the panel.
     assert "arch says hi" in html
 
@@ -553,8 +614,7 @@ def test_the_panel_offers_a_retry_on_a_failed_step_and_it_works(tmp_path, step_s
     assert "synth says hi on the second try" in html
     assert "review-error" not in html            # and no longer carrying the old fault
 
-    # A retry of a step that did not fail, or of an unknown one, is refused.
-    assert client.post(f"/full/retry/{job_id}?step=arch").status_code == 409
+    # A step that is not a step of this pipeline is refused.
     assert client.post(f"/full/retry/{job_id}?step=nope").status_code == 404
 
 
@@ -753,6 +813,50 @@ def _priced_step(path, name, cost, seconds=0.0):
             f"    timeout_seconds: 30\n")
 
 
+def test_re_opening_a_saved_answer_finds_the_run_that_wrote_it(tmp_path, step_script):
+    """The ✓ badge on the board is how a review is read, and a closed panel is
+    the normal state of one.
+
+    Rebuilding the panel from the database alone made the step buttons last
+    exactly as long as the panel stayed open: close it, re-open the answer, and
+    the only way to run a step again was gone — while the job that could still
+    do it sat in memory two functions away.
+    """
+    cfg = _config(tmp_path, (
+        _skill(step_script, "arch")
+        + _skill(step_script, "synth")
+        + "  - name: full\n    label: Full review\n    enabled: true\n"
+        "    stores_result: true\n    pipeline: [arch, synth]\n"
+    ))
+    db_path = tmp_path / "reopen.db"
+    db = Database(db_path)
+    _seed(db)
+    db.close()
+    client = TestClient(create_app(cfg, str(db_path)))
+
+    job_id = re.search(r'data-job-id="([0-9a-f]+)"', client.post("/full/1/7").text).group(1)
+    for _ in range(400):
+        live = client.get(f"/full/status/{job_id}").text
+        if "review-output" in live and "review-loading" not in live:
+            break
+        time.sleep(0.05)
+
+    # Re-opened from the board, in the same radar that ran it.
+    reopened = client.get("/full/stored/1/7").text
+    assert "synth says hi" in reopened, "the saved answer is still the answer"
+    assert "saved " in reopened, "and it still says when it was saved"
+    assert f'hx-post="/full/retry/{job_id}?step=synth"' in reopened
+    assert "↻ run again" in reopened
+    # Which works from there, with no panel having stayed open in between.
+    assert client.post(f"/full/retry/{job_id}?step=synth").status_code == 200
+
+    # A radar restarted since has only the row, and says the same answer
+    # without offering what it cannot do.
+    later = TestClient(create_app(cfg, str(db_path)))
+    assert "synth says hi" in later.get("/full/stored/1/7").text
+    assert "↻" not in later.get("/full/stored/1/7").text
+
+
 def test_a_stored_pipeline_result_keeps_the_breakdown_not_just_the_total(
     tmp_path, step_script
 ):
@@ -799,12 +903,16 @@ def test_a_stored_pipeline_result_keeps_the_breakdown_not_just_the_total(
     assert stats_from_mapping(saved["steps"][0]["stats"]).cost_usd == 1.5
 
 
-    # And the re-opened panel shows it, the way the live one did.
-    stored = client.get("/full/stored/1/7").text
+    # And the re-opened panel shows it, the way the live one did. Read through
+    # a second app over the same database — which is what "re-opened next week"
+    # actually is: the job that ran is gone, and the row is the whole input.
+    later = TestClient(create_app(cfg, str(db_path)))
+    stored = later.get("/full/stored/1/7").text
     assert "ARCH" in stored and "SYNTH" in stored
     assert "✓ done in" in stored, "each step should say how long it took"
     assert "$1.5" in stored and "$0.5" in stored, "each step should say what it cost"
     assert "$2" in stored, "and the total should still be there"
-    # Nothing live survives into a stored result.
-    assert "■ stop" not in stored and "↻ retry" not in stored
+    # Nothing live survives into a stored result: no stop, no run-again, no
+    # polling. There is no job left to do any of it to.
+    assert "■ stop" not in stored and "↻" not in stored
     assert "hx-get=\"/full/health/" not in stored

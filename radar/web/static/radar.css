@@ -425,6 +425,11 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
   border-radius: 6px; font-size: 11px; padding: 2px 8px; cursor: pointer;
 }
 .health-retry:hover { color: var(--green); border-color: var(--green); }
+/* Running a step that already worked is the same button doing the same thing,
+   but it is the one click here that throws an answer away — so it does not sit
+   on the row looking like the fix for a failure. */
+.health-rerun { opacity: .7; }
+.health-rerun:hover { opacity: 1; }
 .health-retry:disabled { opacity: .5; cursor: wait; }
 .health-stop-all { align-self: flex-end; }
 .spinner {

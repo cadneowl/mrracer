@@ -891,23 +891,39 @@ that finished** — a synthesis that could not start is no reason to lose the
 three reviews it was going to merge, which on a slow model is half an hour of
 work. The error names what survived and the output carries it.
 
-**Retrying one step.** A failed step carries a **↻ retry** on its row. It runs
-that step again and finishes the pipeline from there, keeping every step that
-already succeeded *before* it — so a synthesis that died on a connection reset
+**Running one step again.** Every step that ran carries a button on its row:
+**↻ retry** on the one that failed, **↻ run again** on the one that didn't. It
+runs that step and finishes the pipeline from there, keeping every step that
+already finished *before* it — so a synthesis that died on a connection reset
 costs one step to put right instead of the whole review. The resumed step is
 handed the same `## Earlier steps` section the first run gave it, and a retry
 that works clears the error rather than leaving it beside a good answer.
 
-Every stage *after* the retried step runs again too, because their input is
-about to change, so the button confirms first and names what that re-runs. The
-pipeline's total keeps the failed attempt's tokens and money: the run was paid
-for, and a bill that fell when you retried something would be worth nothing.
-The attempt keeps its own row as well — *SYNTH (earlier attempt)*, with what it
-spent before it failed — because money in a total with no line to account for
-it is worse than no breakdown at all.
+A step that *succeeded* is worth running again for two reasons, and neither is
+a failure radar can detect. A review can finish cleanly and answer badly — a
+zero exit code and a non-empty answer is a success by every measure available
+here. And a synthesis of three reviews is a synthesis of something that no
+longer exists the moment one of those reviews is re-run, so re-running it over
+what is there *now* is the point of having steps at all. That case is one
+click: nothing comes after the synthesis, so only the synthesis runs, over
+whatever the reviews currently say — including a review that failed, which it
+is still told about, because a synthesis that only hears from the steps that
+worked cannot say what went unreviewed.
 
-The button needs the job that radar started, which lives in memory — after a
-restart, run the skill again from the board instead.
+Every stage *after* the step runs again too, because its input is about to
+change, so the button confirms first, names what that re-runs, and says when an
+answer is about to be replaced. The pipeline's total keeps the earlier attempt's
+tokens and money: it was paid for, and a bill that fell when you re-ran
+something would be worth nothing. The attempt keeps its own row as well —
+*SYNTH (earlier attempt)*, with what it spent — because money in a total with
+no line to account for it is worse than no breakdown at all.
+
+The buttons need the job radar started, which lives in memory for as long as
+`serve` runs — but not only for as long as the panel stays open: re-opening a
+saved answer from the board (**✓ Full review**) finds that job again and shows
+the panel that produced it, rows and all. After a restart there is only the
+saved row, which reads the same and offers nothing it cannot do; run the skill
+again from the board instead.
 
 **Budget.** `timeout_seconds` is worked out for you — the slowest step of each
 stage, summed. Each step is stopped by its own timeout and nothing stops it

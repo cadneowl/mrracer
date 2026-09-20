@@ -24,14 +24,17 @@
     {% if row.can_retry %}
     {# This step, and then every stage after it — those have to run again
        because their input is about to change. Anything that already finished
-       *before* it is kept. A retry spends real money on a job that has already
-       spent some, so it confirms first, like the stop button, and the
-       confirmation names the steps that will be paid for twice. #}
-    <button class="health-retry" type="button"
+       *before* it is kept. Offered on a step that succeeded as well as one that
+       failed: a review can finish cleanly and answer badly, and a synthesis of
+       three reviews is worth running again the moment one of them is. A retry
+       spends real money on a job that has already spent some, so it confirms
+       first, like the stop button; the confirmation names the steps that will be
+       paid for twice, and says when an answer is about to be replaced. #}
+    <button class="health-retry{% if row.state == 'done' %} health-rerun{% endif %}" type="button"
             hx-post="/{{ kind }}/retry/{{ job.id }}?step={{ row.step|urlencode }}"
             hx-target="#command-panel" hx-swap="innerHTML" hx-disabled-elt="this"
-            hx-confirm="Run {{ row.label }} again?{% if row.retry_again %} {{ row.retry_again }} will run again too, because {{ row.label }}'s answer is their input — that work is paid for twice. Everything before it is kept.{% else %} The steps that already finished are kept.{% endif %}"
-            title="Run {{ row.label }} again and finish the pipeline from there{% if row.retry_again %}, which also re-runs {{ row.retry_again }}{% else %}; the steps that already succeeded are kept{% endif %}">↻ retry</button>
+            hx-confirm="Run {{ row.label }} again?{% if row.state == 'done' %} Its answer is replaced by the new one.{% endif %}{% if row.retry_again %} {{ row.retry_again }} will run again too, because {{ row.label }}'s answer is their input — that work is paid for twice. Everything before it is kept.{% else %} The steps that already finished are kept.{% endif %}"
+            title="Run {{ row.label }} again and finish the pipeline from there{% if row.retry_again %}, which also re-runs {{ row.retry_again }}{% else %}; the steps that already succeeded are kept{% endif %}">{{ row.retry_text }}</button>
     {% endif %}
 
     {% if row.stats %}

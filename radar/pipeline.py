@@ -162,19 +162,29 @@ class PipelineRunner(CommandRunner):
         return True
 
     def retry_step(self, job_id: str, name: str) -> bool:
-        """Run one failed step again, then finish the pipeline from there.
+        """Run one step again, then finish the pipeline from there.
 
         For the case this exists for: three reviews took half an hour and the
         synthesis that merges them died on a connection reset. Re-running the
         whole pipeline would pay for the reviews twice; re-running the step
         alone would leave the pipeline still marked failed, with its answer
-        still the failure. So this resumes — the failed step, then every stage
-        after it, with the earlier results handed forward exactly as the first
-        run handed them.
+        still the failure. So this resumes — the step, then every stage after
+        it, with the earlier results handed forward exactly as the first run
+        handed them.
 
-        Refused when there is nothing to retry: an unknown job or step, a run
-        still going, a step that did not fail, or a job started before radar
-        kept what a retry needs.
+        A step that *succeeded* can be run again too, which is not the same
+        thing as undoing a failure. A review can finish cleanly and answer
+        badly, and radar cannot tell: a run whose exit code is zero and whose
+        output is not empty is a success by every measure available here. And
+        when one review of three is re-run, the synthesis that merged the first
+        three is a synthesis of something that no longer exists — re-running it
+        over what is there now is the whole point of having steps. Nothing is
+        lost either way: what an earlier attempt spent stays on the bill and
+        keeps its own row (see `_roll_up`).
+
+        Refused when there is nothing to resume: an unknown job or step, a run
+        still going, a step this run never reached, or a job started before
+        radar kept what a retry needs.
         """
         job = self.get(job_id)
         if job is None or job.status == "running" or not job.retry_with:
@@ -184,22 +194,27 @@ class PipelineRunner(CommandRunner):
         stages = self.config.pipeline
         stage_index = next((i for i, stage in enumerate(stages) if name in stage), None)
         child = job.steps.get(name)
-        if stage_index is None or child is None or child.status != "error":
+        if stage_index is None or child is None or child.status == "running":
             return False
+
+        def result_of(step: str) -> StepResult:
+            return StepResult(step, self.steps[step].config.label, job.steps[step].status,
+                              job.steps[step].output, job.steps[step].error)
 
         # What the earlier stages produced, in the order the first run had it —
         # this is what the resumed steps will be handed as "## Earlier steps".
         carried = [
-            StepResult(step, self.steps[step].config.label,
-                       job.steps[step].status, job.steps[step].output, job.steps[step].error)
+            result_of(step)
             for index, stage in enumerate(stages) for step in stage
             if index < stage_index and step in job.steps
         ]
+        # And this stage's other steps, failures included. A step that failed is
+        # part of the picture the next stage has to be given: a synthesis told
+        # only about the two reviews that worked cannot say what went
+        # unreviewed, and would read as a review of the whole change.
         carried += [
-            StepResult(step, self.steps[step].config.label,
-                       job.steps[step].status, job.steps[step].output, job.steps[step].error)
-            for step in stages[stage_index]
-            if step != name and step in job.steps and job.steps[step].status == "done"
+            result_of(step) for step in stages[stage_index]
+            if step != name and step in job.steps
         ]
 
         # Claimed under the lock, because everything above only *read* the job:

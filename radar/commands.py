@@ -1091,6 +1091,28 @@ class CommandRunner:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def finished_for(self, project_id: int, mr_iid: int) -> CommandJob | None:
+        """The most recent run of this skill for one merge request that worked.
+
+        For re-opening a saved answer: the row in the database is the answer,
+        but the job that produced it is the only thing that still knows which
+        step wrote what, and the only thing a step can be run again from. While
+        this process is alive, that job is right here — so a saved result can be
+        shown as the panel that produced it rather than as text with no history.
+
+        Newest first, and only a run that finished successfully: a later run
+        that failed did not replace what was saved, so its panel is not the
+        saved answer. Insertion order is age order (see ``_admit``), so the
+        scan runs backwards.
+        """
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in reversed(jobs):
+            if (job.project_id == project_id and job.mr_iid == mr_iid
+                    and job.status == "done"):
+                return job
+        return None
+
     def progress_since(self, job_id: str, after_rev: int) -> tuple[list[dict], str] | None:
         """Progress items changed since ``after_rev``, plus the job's status, or
         None if the job is unknown.

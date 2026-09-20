@@ -622,11 +622,18 @@ def _health_row(job: CommandJob, name: str, label: str, step: str | None, now: f
         # A session is resumed from the directory it ran in, or it isn't found.
         "resume": f"cd {job.cwd} && {resume}" if job.cwd else resume,
         "can_stop": status == "running",
-        # A failed step of a finished pipeline can be run again on its own;
-        # the route decides for certain, this only offers it. What that would
-        # cost beyond this step is filled in by `_health_rows`, which is the
-        # one that can see the stages either side of it.
-        "can_retry": status == "error" and step is not None,
+        # Any step of a finished pipeline that actually ran can be run again —
+        # the one that failed, and the one that succeeded and answered badly.
+        # A review that missed the point is not a failure radar can detect, and
+        # a synthesis of three reviews is worth re-running the moment one of
+        # them is re-run. The route decides for certain, this only offers it;
+        # `_health_rows` is what can see whether the pipeline is still going
+        # and what else a retry would pay for.
+        "can_retry": status in ("done", "error") and step is not None,
+        # "retry" for a step that failed, "run again" for one that did not:
+        # the same button, but ↻ retry on a green row reads as if radar thought
+        # something had gone wrong.
+        "retry_text": "↻ retry" if status == "error" else "↻ run again",
         "retry_again": "",
         # What this step has spent so far. Here rather than only on the finished
         # panel because this fragment is the one that refreshes itself: the
@@ -673,6 +680,10 @@ def _health_rows(runner, job: CommandJob, now: float | None = None) -> list[dict
     for record in job.retried_spend:
         if isinstance(record, dict) and record.get("name"):
             earlier.setdefault(str(record["name"]), []).append(record)
+    # A retry resumes the run from the step it is given, so it can only be
+    # offered once the run it would resume has ended. While the pipeline works,
+    # a step that has already finished is part of a run still in flight.
+    running = job.status == "running"
     for index, stage in enumerate(runner.config.pipeline):
         for name in stage:
             label = runner.steps[name].config.label
@@ -680,6 +691,7 @@ def _health_rows(runner, job: CommandJob, now: float | None = None) -> list[dict
             rows.extend(_spent_row(record) for record in earlier.get(name, ()))
             if child is not None:
                 row = _health_row(child, name, label, name, now)
+                row["can_retry"] = row["can_retry"] and not running
                 if row["can_retry"]:
                     row["retry_again"] = _retry_again(runner, job, index)
                 rows.append(row)
@@ -687,9 +699,9 @@ def _health_rows(runner, job: CommandJob, now: float | None = None) -> list[dict
             rows.append({
                 "name": name, "label": label or name, "step": name, "state": "pending",
                 "state_text": "pending",
-                "note": "" if job.status == "running" else "did not run",
+                "note": "" if running else "did not run",
                 "stalled": False, "session_id": "", "resume": "", "can_stop": False,
-                "can_retry": False, "retry_again": "", "stats": None,
+                "can_retry": False, "retry_text": "", "retry_again": "", "stats": None,
             })
     return rows
 
@@ -735,6 +747,7 @@ def _spent_row(record: dict) -> dict:
         "resume": f"claude --resume {session}",
         "can_stop": False,
         "can_retry": False,
+        "retry_text": "",
         "retry_again": "",
         "stats": _stats_view(numbers),
     }
@@ -1167,8 +1180,8 @@ def create_app(
         if not runner.retry_step(job_id, step):
             raise HTTPException(
                 status_code=409,
-                detail=f"{step} cannot be retried: it has to be a failed step of a "
-                "finished run that this radar started",
+                detail=f"{step} cannot be run again: it has to be a step that ran, in "
+                "a finished run that this radar started",
             )
         return _panel(request, job)
 
@@ -1305,6 +1318,17 @@ def create_app(
             plan = db.get_test_plan(project_id, mr_iid, kind)
         if plan is None:
             raise HTTPException(status_code=404, detail="no stored result")
+        # If the run that wrote it is still in this process's memory, show that
+        # job instead. The answer is the same text — it is what was saved — but
+        # the job knows which step wrote what, and a step can be run again from
+        # it. Without this the buttons last only as long as the panel stays
+        # open: closing it and re-opening the saved answer from the board is the
+        # ordinary way to read a review, and it would quietly take away the only
+        # way to re-run a step of it.
+        runner = runners.get(kind)
+        live = runner.finished_for(project_id, mr_iid) if runner is not None else None
+        if live is not None:
+            return _panel(request, live, generated_at=plan["generated_at"])
         job = CommandJob(
             id="stored", kind=kind, project_id=project_id, mr_iid=mr_iid,
             subject=f"!{mr_iid}", title=f"{plan['jira_keys']}",
