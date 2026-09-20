@@ -87,6 +87,33 @@ CREATE TABLE IF NOT EXISTS build_analyses (
     PRIMARY KEY (job_name, build_number, kind)
 );
 
+-- Polished versions of a run's answer: the same finding, rewritten to be sent
+-- to a person. Kept apart from the answer it was made from rather than
+-- replacing it, because the two are for different readers — the original is
+-- the evidence, the polished one is the message — and a skill that rewrites
+-- text is exactly the kind that can drop a detail.
+--
+-- Keyed by the run it polished: `source_kind` is 'mr' or 'build', and the two
+-- id columns are (project_id, mr_iid) or (jenkins job name, build number).
+-- `kind` is the skill whose answer this is, so one merge request can carry a
+-- polished review and a polished QA plan at once.
+--
+-- `source_digest` is a fingerprint of the exact text it was made from. A run
+-- can be started again over the same merge request, and a polished version of
+-- the answer it replaced is not a polished version of the new one — shown as
+-- such, not silently as current (see web.app._deslop_view).
+CREATE TABLE IF NOT EXISTS deslopified (
+    source_kind   TEXT NOT NULL,
+    source_a      TEXT NOT NULL,
+    source_b      TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    source_digest TEXT NOT NULL DEFAULT '',
+    generated_at  TEXT NOT NULL,
+    stats         TEXT NOT NULL DEFAULT '',   -- as in test_plans
+    PRIMARY KEY (source_kind, source_a, source_b, kind)
+);
+
 -- Discussion threads, as GitLab currently has them. A cache like mr_snapshots,
 -- not truth: `resolved` is mutable state radar cannot derive, so each poll
 -- replaces an MR's rows outright rather than appending.
@@ -486,6 +513,64 @@ class Database:
             (r["job_name"], r["build_number"], r["kind"])
             for r in self.conn.execute(
                 "SELECT job_name, build_number, kind FROM build_analyses"
+            )
+        }
+
+    # --- polished answers --------------------------------------------------
+
+    def save_deslopified(
+        self,
+        source_kind: str,
+        source_a: str,
+        source_b: str,
+        kind: str,
+        content: str,
+        source_digest: str,
+        stats: str = "",
+    ) -> None:
+        """Store the polished version of one run's answer.
+
+        One row per (run, skill): polishing again replaces what was there. The
+        answer it was made from is untouched — this table never writes to the
+        stores the original lives in.
+        """
+        self.conn.execute(
+            """
+            INSERT INTO deslopified
+                (source_kind, source_a, source_b, kind, content, source_digest,
+                 generated_at, stats)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_kind, source_a, source_b, kind) DO UPDATE SET
+                content=excluded.content, source_digest=excluded.source_digest,
+                generated_at=excluded.generated_at, stats=excluded.stats
+            """,
+            (
+                source_kind, str(source_a), str(source_b), kind,
+                content, source_digest, _now_utc_iso(), stats,
+            ),
+        )
+        self.conn.commit()
+
+    def get_deslopified(
+        self, source_kind: str, source_a: str, source_b: str, kind: str
+    ) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM deslopified WHERE source_kind=? AND source_a=? "
+            "AND source_b=? AND kind=?",
+            (source_kind, str(source_a), str(source_b), kind),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def polished_runs(self) -> set[tuple[str, str, str, str]]:
+        """Every run that has a polished answer, for the board's badges.
+
+        One read for the whole board, like ``analysed_builds``: the table holds
+        one short row per answer anyone has ever polished.
+        """
+        return {
+            (r["source_kind"], r["source_a"], r["source_b"], r["kind"])
+            for r in self.conn.execute(
+                "SELECT source_kind, source_a, source_b, kind FROM deslopified"
             )
         }
 

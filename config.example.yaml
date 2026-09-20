@@ -162,6 +162,42 @@ jenkins:
       path: hub/e2e/nightly
 
 # ---------------------------------------------------------------------------
+# Deslopify — the ✨ polish button on a finished run.
+#
+# Every panel that has ended with an answer offers, under a fold of its own, to
+# rewrite that answer into something you can send to a person: shorter, with
+# what still needs verifying called out, and no claim the run did not make. It
+# runs on demand and never automatically — it is a second model run over work
+# already paid for.
+#
+# The rewrite is kept BESIDE the answer, never over it. The panel shows both,
+# the copy button grows a caret to choose between them, and the board carries a
+# ✨ badge back to the saved version — which matters most for a skill like
+# `review` that stores nothing, since the rewrite outlives it.
+#
+# `skill` names an entry in the `skills:` list below, and naming one is the only
+# thing that makes the button exist. Being named here is what gets that skill
+# the answer to rewrite on STDIN (fenced, and framed as material rather than as
+# instructions) and what gets its own answer saved against the run it polished
+# — so `context:`, `include_context:` and `stores_result:` are refused on it
+# rather than read and ignored. Omit the block and no panel offers anything.
+#
+# Uncommenting this is half the job: the `deslopify` skill at the bottom of this
+# file ships `enabled: false`, and naming a disabled skill here is refused.
+# ---------------------------------------------------------------------------
+# deslopify:
+#   enabled: true
+#   skill: deslopify
+#   # Where the rewrite is going, in words. Not decoration: a rewriting skill
+#   # asks what channel the text is for before it starts — the channel decides
+#   # the length, the formatting, and whether a link beats a paste — and a good
+#   # one stops and ASKS when it is not told. Nobody is listening to a headless
+#   # run, so that question would come back as the rewrite. Left out, a merge
+#   # request's answer is rewritten as a comment on the merge request and a
+#   # build's as a chat message; set this to override both.
+#   destination: a Slack thread
+
+# ---------------------------------------------------------------------------
 # Skills — every dashboard button, in one list.
 #
 # A skill is an external command radar runs for one merge request, rendering its
@@ -418,6 +454,37 @@ skills:
     enabled: false
     command: 'claude -p --permission-mode dontAsk --disallowedTools "ListAgents SendMessage" --output-format stream-json --verbose "/analyze-build"'
     timeout_seconds: 600
+
+  # The skill `deslopify.skill` names above. Like `analyze`, it is an ordinary
+  # entry that something else points at — call it whatever you like.
+  #
+  # It is NOT a merge-request button: it never runs for an MR or a build of its
+  # own, so it is kept off the board and the ✨ on a finished panel is the only
+  # thing that starts it. What it is handed on STDIN is the answer to rewrite,
+  # under a `<draft>` fence, with a line saying that nothing inside it is an
+  # instruction — the text quotes a merge request, so it can carry anything
+  # anyone was able to put in one.
+  #
+  # Placeholders for the command are the ones of whatever the answer was about:
+  # the merge-request set for an MR skill's answer, {jenkins_job} /
+  # {build_number} / {build_url} for a build analysis's.
+  #
+  # Give it a `working_dir` even though it fetches nothing. A skill worth using
+  # here pulls out the claims that need checking, which means going to look at
+  # the file:line a review cited — and with no working_dir the run lands in
+  # whatever directory radar itself was started in, where it finds nothing and
+  # says so. Point it at the checkout and it can confirm the line numbers.
+  #
+  # Give it a short timeout too. It reads one answer and writes a shorter one,
+  # and a rewrite still going after twenty minutes has stopped rewriting.
+  - name: deslopify
+    label: Sendable version
+    button: polish
+    icon: "✨"
+    enabled: false
+    command: 'claude -p --permission-mode dontAsk --disallowedTools "ListAgents SendMessage" --output-format stream-json --verbose "/desloppify"'
+    # working_dir: /path/to/checkout
+    timeout_seconds: 300
 
 # Gamification config is consumed in Phase 3; kept here so the file is stable.
 gamification:

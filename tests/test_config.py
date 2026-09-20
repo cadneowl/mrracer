@@ -51,7 +51,7 @@ def test_example_config_is_loadable_and_current():
     # Every skill lives in `skills:`, including the two whose names carry
     # built-in capabilities. Nothing appears that the file did not declare.
     assert [s.name for s in cfg.skills] == [
-        "review", "qa", "dba", "full-review", "synthesize", "analyze",
+        "review", "qa", "dba", "full-review", "synthesize", "analyze", "deslopify",
     ]
     assert all(not s.enabled for s in cfg.skills)  # opt in deliberately
     # The pipeline's steps resolve, and its budget is the one they allow:

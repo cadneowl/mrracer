@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -35,7 +37,11 @@ from ..commands import (
     stats_to_json,
 )
 from ..config import Config
-from ..context import jenkins_stdin_provider_for, stdin_provider_for
+from ..context import (
+    deslop_stdin_provider_for,
+    jenkins_stdin_provider_for,
+    stdin_provider_for,
+)
 from ..db import Database
 from ..jenkins import JenkinsMonitor, analysable_build, strip_view
 from ..jira import extract_keys
@@ -100,6 +106,121 @@ _CI_TICK_S = 15
 # the health rows above it: this is five charts and a page of numbers, and a
 # trajectory does not change meaningfully between one second and the next.
 _AI_TICK_S = 5
+
+# How often the polish section re-reads a polish run of its own. Faster than the
+# AI stats below it: this is a handful of lines and a spinner, and the thing it
+# is watching for is the moment the answer arrives.
+_DESLOP_TICK_S = 2
+
+# Where a polished answer is filed: 'mr' for a merge request, 'build' for a
+# Jenkins build. The two carry different coordinates, so the kind travels with
+# them everywhere rather than being guessed from what is or is not set.
+_MR, _BUILD = "mr", "build"
+
+
+# A rewriting skill worth the name does not answer with a message: it answers
+# with the message, the claims that still need checking, and what it cut. All
+# three belong on the panel — but only the first belongs on the clipboard, and
+# pasting the checklist into the merge request is exactly the thing the whole
+# feature exists to stop. So radar finds the sendable part.
+#
+# Matched on the heading the output format asks for ("Ready to send"), in the
+# shapes it actually comes back as: a markdown heading, a bold run-in, numbered
+# or not, with or without a colon.
+_SENDABLE_RE = re.compile(
+    r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*|__)?[ \t]*(?:\d[.)][ \t]*)?"
+    r"ready to send\b[ \t]*[:.]?[ \t]*(?:\*\*|__)?[ \t]*:?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Where it ends. Named sections only, and only when the name is the whole line:
+# an earlier version ended the message at any markdown heading and at any line
+# beginning "notes", which quietly cut a message at its own "### Blocking"
+# sub-heading and at the sentence "Notes on the second finding: …". It took the
+# disclosure line and half the findings with it, and produced a confident
+# partial comment that neither the sender nor the reader could tell was partial.
+#
+# So the bias here is deliberate and one-way: a boundary this fails to find
+# means the checklist is offered *with* the message, which is untidy and
+# obvious. A boundary it finds too early means a finding silently disappears.
+_AFTER_SENDABLE_RE = re.compile(
+    r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*|__)?[ \t]*(?:\d[.)][ \t]*)?"
+    r"(?:check before sending|checks? before sending|notes)\b"
+    r"[ \t]*[:.]?[ \t]*(?:\*\*|__)?[ \t]*:?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _unwrap(text: str) -> str:
+    """Strip the fence or the quote marks a message was handed over in.
+
+    The skill is told to put the message in a code block or a blockquote "so it
+    can be copied cleanly" — which it is, right up until the backticks go into
+    the merge request with it.
+
+    Only a message that is *one* fenced block is unfenced. Comparing the first
+    line with the last was enough to strip the opening fence of the first block
+    and the closing fence of the last, leaving every fence in between — so a
+    rewrite that quoted two snippets pasted stray backticks into the comment,
+    which is the one thing this function exists to prevent.
+    """
+    lines = text.strip().splitlines()
+    fences = [line for line in lines if line.lstrip().startswith("```")]
+    if (
+        len(fences) == 2
+        and len(lines) >= 2
+        and lines[0].lstrip().startswith("```")
+        and lines[-1].strip() == "```"
+    ):
+        return "\n".join(lines[1:-1]).strip()
+    body = [line for line in lines if line.strip()]
+    if body and all(line.lstrip().startswith(">") for line in body):
+        return "\n".join(
+            line.lstrip()[1:].removeprefix(" ") if line.strip() else ""
+            for line in lines
+        ).strip()
+    return text.strip()
+
+
+def _sendable_part(text: str) -> str:
+    """The message inside a rewrite, or "" if there is no telling which it is.
+
+    Empty rather than a guess: copying the wrong half of an answer into a merge
+    request is worse than copying all of it, because the reader cannot tell that
+    anything is missing. When this finds nothing the panel simply offers the
+    whole rewrite, which is what it would have offered anyway.
+    """
+    start = _SENDABLE_RE.search(text)
+    if start is None:
+        return ""
+    rest = text[start.end():]
+    end = _AFTER_SENDABLE_RE.search(rest)
+    if end is None:
+        # Both edges or nothing. Without the section that follows it there is no
+        # telling where the message stops, and the honest answer is to offer the
+        # whole rewrite — which, for an answer that is only a message, is the
+        # message. Guessing the other way is what drops a finding.
+        return ""
+    message = _unwrap(rest[: end.start()])
+    if not message:
+        return ""   # a heading with nothing under it is not a message
+    # Last line of defence against the failure this function must not have. If
+    # what came out still reads like it contains the start of a later section,
+    # the boundary was not found where it looked — so say nothing and let the
+    # panel offer the whole rewrite, which is what it would have offered anyway.
+    if _AFTER_SENDABLE_RE.search(message):
+        return ""
+    return message
+
+
+def _digest(text: str) -> str:
+    """A fingerprint of the exact text a polished answer was made from.
+
+    Short on purpose: it is compared for equality and shown to nobody. Its only
+    job is to notice that the run has since been run again, so a polished
+    version of the answer it replaced is not offered as if it were current.
+    """
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
 
 # What one click of "+ more time" is worth. Ten minutes rather than the budget
 # again: a review whose budget is forty minutes does not need another forty to
@@ -873,14 +994,41 @@ def create_app(
             _skill_view(s)
             for s in config.skills
             if s.enabled and s is not config.analysis_skill
+            and s is not config.deslopify_skill
         ]
         data["storing_skills"] = storing_skills
+        # The badge that re-opens a saved sendable version, and the names to put
+        # on it. Every declared skill, not only the enabled ones: a polished
+        # answer for a skill since switched off is still a saved answer, and a
+        # badge with no label would be a button with no meaning.
+        data["polish"] = _skill_view(config.deslopify_skill) if config.deslopify_skill else None
+        data["skill_labels"] = {s.name: _skill_view(s) for s in config.skills}
         return data
 
     # Named in `jenkins.analysis.skill`, resolved once at load. Nothing here
     # infers it from a skill's name or contexts: which button exists is a fact
     # about the configuration, and the config says it in one place.
     build_skill = config.analysis_skill
+
+    # Named in `deslopify.skill`, resolved the same way and for the same reason.
+    # It is not a board skill: it never runs for a merge request of its own, so
+    # it is kept out of `enabled_skills` above and refused by `start_command`.
+    deslop_skill = config.deslopify_skill
+
+    # The polish run most recently started for one answer, keyed by the
+    # coordinates that answer is filed under, with the fingerprint of the text
+    # it was handed. Per process and deliberately small: once a polish run has
+    # finished its answer is in the database, and this is only what lets the
+    # section show a run that is still going — and tell a finished one's numbers
+    # apart from the saved row's.
+    polished_by: dict[tuple[str, str, str, str], tuple[str, str]] = {}
+    # Claimed under this before a polish starts, so two clicks on one answer
+    # cannot become two runs — the same rule `pipeline.retry_step` applies to a
+    # retry, and for the same reason: the second click is a second bill. The
+    # button disables itself, which covers the double-click and nothing else;
+    # two tabs, or two people looking at the same merge request, are the case
+    # this is here for.
+    polish_lock = threading.Lock()
 
     def _ci_view() -> dict | None:
         """The CI strip from cache — no I/O beyond the stored-analysis lookup."""
@@ -910,6 +1058,129 @@ def create_app(
         if job is None:
             raise HTTPException(status_code=404, detail=f"no Jenkins job named {job_name!r}")
         return job
+
+    def _polish_source(job: CommandJob, skill) -> tuple[str, str, str] | None:
+        """Where a polish of this panel's answer would be filed, or None.
+
+        None for a run radar cannot key. A polished answer is kept against the
+        run it was made from, and a button that could not save what it produced
+        is worse than no button.
+        """
+        if build_skill is not None and skill is build_skill:
+            if not job.title or job.build_number is None:
+                return None
+            return (_BUILD, job.title, str(job.build_number))
+        if job.project_id is not None and job.mr_iid is not None:
+            return (_MR, str(job.project_id), str(job.mr_iid))
+        return None
+
+    def _deslop_url(source: tuple[str, str, str], kind: str, job_id: str) -> str:
+        """The polish section's URL for one answer.
+
+        It carries the job id while the panel is showing a live run, so a polish
+        rewrites exactly the text on screen rather than whatever the database
+        holds. The two differ more often than it sounds: a skill that stores
+        nothing has no row at all, and a run killed by the timeout keeps a
+        partial answer that was never saved.
+        """
+        path = "/".join(quote(part, safe="") for part in (*source, kind))
+        query = f"?job={quote(job_id, safe='')}" if job_id and job_id != "stored" else ""
+        return f"/deslop/{path}{query}"
+
+    def _deslop_view(source: tuple[str, str, str], kind: str, url: str, output: str) -> dict:
+        """The polish section for one answer: what exists, and what is running.
+
+        Precedence is the order a reader would want: a run happening now, then
+        the answer it is about to replace. A polish that failed puts its message
+        above whichever of those is shown — a failed retry must not quietly look
+        like the saved version was never there.
+        """
+        digest = _digest(output)
+        runner = runners[deslop_skill.name]
+        record = polished_by.get((*source, kind))
+        live = runner.get(record[0]) if record else None
+        view = {
+            "url": url,
+            "kind": deslop_skill.name,
+            "label": deslop_skill.label or deslop_skill.name,
+            "button": deslop_skill.button or "polish",
+            "icon": deslop_skill.icon,
+            "tick_s": _DESLOP_TICK_S,
+            "state": "none",
+            "job": live,
+            "rows": [],
+            "remaining_s": None,
+            "clock_text": "",
+            "content": "",
+            "content_html": None,
+            "generated_at": "",
+            "stale": False,
+            "stats": None,
+            "sendable": "",
+            "error": live.error if live is not None and live.status == "error" else "",
+            "persist_error": "",
+        }
+        if live is not None and live.status == "running":
+            view["state"] = "running"
+            view["rows"] = _health_rows(runner, live)
+            view["remaining_s"] = _remaining_s(live)
+            view["clock_text"] = _clock_text(view["remaining_s"])
+            return view
+
+        with Database(db_path) as db:
+            stored = db.get_deslopified(*source, kind)
+
+        if live is not None and live.status == "done":
+            # The run that just finished. Its text is what was saved a moment
+            # ago — read from the job rather than from the row so a save that
+            # failed still shows the answer it produced, with the warning.
+            view.update(
+                state="done",
+                content=live.output,
+                stats=_stats_view(live.stats),
+                stale=record[1] != digest,
+                persist_error=live.persist_error,
+                generated_at=stored["generated_at"] if stored else "",
+            )
+        elif stored is not None:
+            view.update(
+                state="done",
+                content=stored["content"],
+                stats=_stats_view(stats_from_json(stored.get("stats"))),
+                stale=stored.get("source_digest", "") != digest,
+                generated_at=stored["generated_at"],
+            )
+        elif view["error"]:
+            # Nothing saved and the run failed: whatever it wrote before it did
+            # is still worth showing, exactly as a failed review's is.
+            view.update(state="error", content=live.output)
+
+        view["content_html"] = (
+            _render_markdown(view["content"]) if view["content"].strip() else None
+        )
+        # The part of the rewrite that is actually the message. Everything is
+        # shown — the checks and the notes are the half that makes the rewrite
+        # trustworthy — but this is what the copy button puts on the clipboard.
+        view["sendable"] = _sendable_part(view["content"])
+        return view
+
+    def _deslop_for(job: CommandJob, skill, status: str, output: str) -> dict | None:
+        """The polish section for a panel, or None when it has nothing to offer.
+
+        Nothing while the run is still going: the answer is still being written,
+        and rewriting half of one is paying to polish a draft about to change.
+        Nothing on the polish skill's own panel either — a polish of a polish is
+        a second rewrite of the same text, and the button that made this one is
+        already on the section it came from.
+        """
+        if deslop_skill is None or skill is deslop_skill or not output.strip():
+            return None
+        if status == "running":
+            return None
+        source = _polish_source(job, skill)
+        if source is None:
+            return None
+        return _deslop_view(source, job.kind, _deslop_url(source, job.kind, job.id), output)
 
     def _panel(request: Request, job, generated_at: str | None = None) -> HTMLResponse:
         skill = skills_by_name.get(job.kind)
@@ -1001,6 +1272,10 @@ def create_app(
                 # textarea, so Jinja's escaping is what keeps skill output —
                 # which is untrusted — from breaking out of it.
                 "output": output if output.strip() else "",
+                # The polish section: a rewrite of this answer fit to send, on
+                # demand, kept beside the answer rather than replacing it. None
+                # when this panel has nothing to offer one (see `_deslop_for`).
+                "deslop": _deslop_for(job, skill, status, output),
             },
         )
 
@@ -1102,6 +1377,7 @@ def create_app(
         job_record = CommandJob(
             id="stored",
             kind=build_skill.name,
+            build_number=build,
             subject=f"#{build}",
             title=job.name,
             status="done",
@@ -1111,6 +1387,249 @@ def create_app(
             stats=stats_from_json(stored.get("stats")),
         )
         return _panel(request, job_record, generated_at=stored["generated_at"])
+
+    # Declared here, with /jenkins and /threads, so they sit ahead of the
+    # /{kind}/... routes: those match on segment count alone until validation,
+    # and a five-segment path must not be read as a skill's own namespace.
+    def _polish_key(source_kind: str, a: str, b: str) -> tuple[str, str, str]:
+        """Validate the coordinates a polish is filed under, from a URL.
+
+        Checked rather than trusted: every one of these ends up as an int() or
+        as a database key, and a path someone typed is not the place to find out
+        which.
+        """
+        if source_kind not in (_MR, _BUILD):
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown source {source_kind!r} (expected {_MR} or {_BUILD})",
+            )
+        # ASCII digits, not `str.isdigit()`: that is true of '\u00b2' and of the
+        # Arabic-Indic digits, and int() accepts the second and raises on the
+        # first — so the check would pass a value that crashes the lookup two
+        # lines later, turning a bad URL into a 500.
+        def numeric(value: str) -> bool:
+            return value.isascii() and value.isdigit()
+
+        if not (numeric(b) and (source_kind == _BUILD or numeric(a))):
+            raise HTTPException(status_code=404, detail="bad coordinates for that source")
+        return (source_kind, a, b)
+
+    def _polish_target(
+        source: tuple[str, str, str], kind: str, job_id: str | None
+    ) -> tuple[str, str, str]:
+        """The run a polish is about: its subject, its heading, and the exact
+        text to rewrite.
+
+        Resolved here rather than posted by the browser. The text is what an
+        agent is handed and what gets stored against this run, and a request is
+        not where either should come from. A job id names a run this process
+        still holds, which is the only way to reach the answer of a skill that
+        stores nothing, or the half a run wrote before it failed; without one,
+        the saved answer is the answer.
+        """
+        skill = skills_by_name.get(kind)
+        if skill is None:
+            raise HTTPException(status_code=404, detail=f"no skill named {kind!r}")
+        if skill is deslop_skill:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{kind} is the polish skill — its own answer is not polished again",
+            )
+        heading = skill.label or kind
+        source_kind, a, b = source
+        if job_id:
+            runner = runners.get(kind)
+            job = runner.get(job_id) if runner is not None else None
+            if job is None:
+                raise HTTPException(status_code=404, detail="unknown job")
+            # The id came out of a URL, so it is checked against the coordinates
+            # beside it: without this, one merge request's answer could be filed
+            # against another's row.
+            if job.status == "running" or _polish_source(job, skill) != source:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"that {heading} run is not a finished answer for this one",
+                )
+            if not job.output.strip():
+                raise HTTPException(
+                    status_code=409, detail=f"that {heading} run wrote nothing to polish"
+                )
+            # Named, not numbered: a rewrite is asked what question it serves,
+            # and "!7" is not one. The title is what says what the change is
+            # about, and the job has been carrying it all along.
+            return f"{job.subject} {job.title}".strip(), heading, job.output
+
+        with Database(db_path) as db:
+            if source_kind == _BUILD:
+                stored = db.get_build_analysis(a, int(b), kind)
+                subject = f"{a} #{b}"
+            else:
+                stored = db.get_test_plan(int(a), int(b), kind)
+                snap = db.get_snapshot(int(a), int(b))
+                subject = f"!{b} {snap['title']}".strip() if snap else f"!{b}"
+        if stored is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"there is no saved {heading} answer for {subject} to polish — "
+                "radar no longer holds the run that produced this one",
+            )
+        # Same refusal as the live branch above, for the same reason: a paid
+        # model run over an empty draft answers with something, and that
+        # something gets filed as the sendable version of this answer.
+        if not stored["content"].strip():
+            raise HTTPException(
+                status_code=409,
+                detail=f"the saved {heading} answer for {subject} is empty, so there is "
+                "nothing to rewrite",
+            )
+        return subject, heading, stored["content"]
+
+    def _polish_ctx(source: tuple[str, str, str], subject: str) -> dict:
+        """What the polish command's template is filled from.
+
+        The same placeholders its subject's own skill would get, so a polish
+        command can name `{web_url}` or `{build_url}` and mean it. A field radar
+        cannot resolve — a Jenkins job dropped from the config since the answer
+        was saved — substitutes to empty, which is what an absent placeholder
+        has always done.
+        """
+        source_kind, a, b = source
+        if source_kind == _BUILD:
+            job = next((j for j in config.jenkins.jobs if j.name == a), None)
+            return {
+                "jenkins_job": a,
+                "build_number": int(b),
+                "build_url": f"{job.url}/{b}/" if job else "",
+                "title": a,
+                "subject": subject,
+            }
+        with Database(db_path) as db:
+            snap = db.get_snapshot(int(a), int(b))
+        if snap is None:
+            return {"project_id": int(a), "mr_iid": int(b), "subject": subject}
+        return _ctx_for(snap, int(a), int(b))[0]
+
+    @app.post("/deslop/{source_kind}/{source_a}/{source_b}/{kind}", response_class=HTMLResponse)
+    def start_deslop(
+        request: Request, source_kind: str, source_a: str, source_b: str, kind: str,
+        job: str | None = None,
+    ):
+        """Rewrite one finished answer into something fit to send.
+
+        On demand, never automatically: it is another model run over work that
+        has already been paid for, and the original answer is the one radar
+        keeps. What it produces is stored beside that answer, not over it.
+        """
+        if deslop_skill is None:
+            raise HTTPException(status_code=404, detail="no polish skill is configured")
+        source = _polish_key(source_kind, source_a, source_b)
+        subject, heading, text = _polish_target(source, kind, job)
+        digest = _digest(text)
+        url = _deslop_url(source, kind, job or "")
+
+        def on_success(finished: CommandJob) -> None:
+            with Database(db_path) as db:
+                db.save_deslopified(
+                    *source, kind, finished.output, digest, stats_to_json(finished.stats)
+                )
+
+        provider = deslop_stdin_provider_for(
+            deslop_skill.name, config, heading, subject, text,
+            config.deslopify.destination_for(source[0]),
+        )
+        runner = runners[deslop_skill.name]
+        key = (*source, kind)
+        # Checked and claimed without letting go, because everything before this
+        # only *read*: two clicks, or two tabs, would otherwise both find
+        # nothing running and both start a run — and a run is a bill. The loser
+        # is answered with the section, not an error: it wants to see the
+        # rewrite, and one is already on its way.
+        #
+        # `start` is admitted, resolved and handed to a thread; it does no I/O
+        # worth holding a lock across, and nothing it takes is held by anything
+        # that wants this one.
+        with polish_lock:
+            previous = polished_by.get(key)
+            running = runner.get(previous[0]) if previous else None
+            if running is None or running.status != "running":
+                started = runner.start(
+                    _polish_ctx(source, subject),
+                    on_success=on_success,
+                    stdin_provider=provider,
+                )
+                # Claimed before the fragment is drawn, so the section this
+                # answers with is already the one following the new run.
+                polished_by[key] = (started.id, digest)
+        return templates.TemplateResponse(
+            request,
+            "_deslop.html",
+            {"deslop": _deslop_view(source, kind, url, text), "oob": True},
+        )
+
+    @app.get(
+        "/deslop/{source_kind}/{source_a}/{source_b}/{kind}/saved",
+        response_class=HTMLResponse,
+    )
+    def saved_deslop(
+        request: Request, source_kind: str, source_a: str, source_b: str, kind: str
+    ):
+        """Re-open a saved sendable version on its own.
+
+        Its own door, because a polished answer can outlive the answer it was
+        made from: a review skill stores nothing, so once radar has been
+        restarted the panel that offered the rewrite is gone and the rewrite is
+        not. Shown through the ordinary panel — it is a saved answer like any
+        other, with the same copy button and the same ✕.
+        """
+        if deslop_skill is None:
+            raise HTTPException(status_code=404, detail="no polish skill is configured")
+        source = _polish_key(source_kind, source_a, source_b)
+        with Database(db_path) as db:
+            row = db.get_deslopified(*source, kind)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no saved sendable version")
+        skill = skills_by_name.get(kind)
+        heading = skill.label if skill else kind
+        job = CommandJob(
+            id="stored",
+            kind=deslop_skill.name,
+            status="done",
+            output=row["content"],
+            stats=stats_from_json(row.get("stats")),
+        )
+        # The panel is headed with the polish skill's own name, so `title` is
+        # where it says what this is a rewrite *of* — which is the first thing
+        # the reader needs, and the one thing "sendable version" does not say.
+        if source[0] == _BUILD:
+            job.build_number = int(source[2])
+            job.subject = f"#{source[2]}"
+            job.title = f"{source[1]} · {heading}"
+        else:
+            job.project_id, job.mr_iid = int(source[1]), int(source[2])
+            job.subject = f"!{source[2]}"
+            job.title = heading
+        return _panel(request, job, generated_at=row["generated_at"])
+
+    @app.get("/deslop/{source_kind}/{source_a}/{source_b}/{kind}", response_class=HTMLResponse)
+    def deslop_section(
+        request: Request, source_kind: str, source_a: str, source_b: str, kind: str,
+        job: str | None = None,
+    ):
+        """The polish section on its own — what a run of it refreshes into."""
+        if deslop_skill is None:
+            raise HTTPException(status_code=404, detail="no polish skill is configured")
+        source = _polish_key(source_kind, source_a, source_b)
+        _, _, text = _polish_target(source, kind, job)
+        return templates.TemplateResponse(
+            request,
+            "_deslop.html",
+            {
+                "deslop": _deslop_view(
+                    source, kind, _deslop_url(source, kind, job or ""), text
+                ),
+                "oob": True,
+            },
+        )
 
     @app.post("/refresh", response_class=HTMLResponse)
     def refresh(request: Request):
@@ -1286,6 +1805,16 @@ def create_app(
     def start_command(request: Request, kind: str, project_id: int, mr_iid: int):
         if kind not in runners or not enabled[kind]:
             raise HTTPException(status_code=404, detail=f"{kind} is not enabled")
+        if skills_by_name[kind] is deslop_skill:
+            # It rewrites an answer that already exists, and this route has
+            # only a merge request: it would run with an empty draft and file
+            # its result nowhere. The board never offers it, but the URL is
+            # guessable and the refusal belongs here rather than in the template.
+            raise HTTPException(
+                status_code=404,
+                detail=f"{kind} polishes an answer another run produced, not a merge "
+                "request — it is offered on the panel of a run that has finished",
+            )
         if skills_by_name[kind] is config.analysis_skill:
             # It is about a build, and this route is about a merge request: it
             # would run with no context at all and file the result where nothing

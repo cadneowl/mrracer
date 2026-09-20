@@ -490,3 +490,64 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .breach-list a { color: var(--text); text-decoration: none; font-weight: 600; }
 .breach-list a:hover { text-decoration: underline; }
 .breach-list .overdue { color: var(--red); font-weight: 600; margin-left: 6px; }
+
+/* --- Copy: one button, and a choice of what it copies --------------------- */
+/* The caret's menu is absolutely positioned against this, so the group is the
+   thing that has to be the anchor rather than the header row around it. */
+.copy-group { position: relative; display: inline-flex; align-items: center; gap: 4px; }
+.copy-more { padding: 3px 7px; }
+.copy-more[aria-expanded="true"] { color: var(--text); border-color: var(--green); }
+.copy-menu {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 60; min-width: 250px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 4px; display: flex; flex-direction: column;
+  box-shadow: 0 12px 30px rgba(0,0,0,.45);
+}
+.copy-menu-item {
+  background: transparent; border: 0; border-radius: 6px; cursor: pointer;
+  color: var(--text); font-size: 12.5px; text-align: left; padding: 7px 10px;
+}
+.copy-menu-item:hover { background: var(--panel); }
+/* Not a thing to copy — a note about where the other one comes from. It still
+   does something (it opens the section that makes one), so it is not disabled. */
+.copy-menu-hint { color: var(--muted); }
+
+/* --- The polished version of an answer (_deslop.html) --------------------- */
+.deslop { margin: 4px 0 14px; border-top: 1px solid var(--line); padding-top: 8px; }
+.deslop > summary {
+  cursor: pointer; color: var(--muted); font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .5px; padding: 2px 0; list-style: none;
+}
+.deslop > summary::before { content: "▸ "; }
+.deslop[open] > summary::before { content: "▾ "; }
+.deslop > summary::-webkit-details-marker { display: none; }
+.deslop > summary:hover { color: var(--text); }
+.deslop-tag {
+  margin-left: 8px; font-weight: 600; letter-spacing: 0; text-transform: none;
+  border: 1px solid var(--line); border-radius: 10px; padding: 1px 7px; font-size: 10.5px;
+}
+.deslop-tag-ready { color: var(--green); border-color: var(--green); }
+.deslop-tag-stale { color: var(--amber); border-color: var(--amber); }
+.deslop-body { padding: 8px 0 2px; }
+.deslop-none { color: var(--muted); font-size: 13px; margin: 4px 0 10px; }
+/* Made from an answer the run has since replaced. Amber, not red: it is still
+   a readable message, it is simply not a rewrite of what is on screen. */
+.deslop-stale {
+  color: var(--amber); border: 1px solid var(--amber); border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 10px; font-size: 12.5px;
+}
+.deslop-failed { margin-bottom: 10px; }
+/* Set apart from the original above it, so it is never mistaken for a
+   continuation of the answer it was made from. */
+.deslop-output {
+  background: var(--bg); border: 1px solid var(--line); border-left: 3px solid var(--green);
+  border-radius: 8px; padding: 2px 14px 14px; margin: 0 0 10px;
+}
+.deslop-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.deslop-actions .stamp { color: var(--muted); font-size: 11px; }
+.deslop-run:hover { border-color: var(--blue); color: var(--text); }
+.deslop-run:disabled { opacity: .5; cursor: wait; }
+.deslop-body > .run-stats { margin-top: 10px; }
+/* A saved sendable version, beside the saved answers. Blue rather than green:
+   it is a second thing about the same merge request, not a second answer. */
+.plan-badge-polished { border-color: var(--blue); color: var(--blue); background: rgba(59,130,246,.12); }

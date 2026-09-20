@@ -2,7 +2,7 @@
    the polled board), so the 60s board refresh never wipes it. While running it
    re-fetches itself every 2s; the 'done'/'error' fragments omit the trigger,
    which stops polling. #}
-<div class="modal-overlay">
+<div class="modal-overlay" id="panel-{{ job.id }}">
   <div class="modal">
     <div class="modal-head">
       <span class="modal-title">
@@ -24,9 +24,25 @@
         {% if output and status != 'running' %}
         {# The markdown the skill wrote, not the rendered HTML: what this is for
            is pasting the finding into a ticket, a chat, or a commit message,
-           and all three want the source. #}
-        <button class="copy-btn" id="copy-{{ job.id }}" type="button"
-                title="Copy this output as markdown">⧉ copy</button>
+           and all three want the source.
+
+           The button keeps doing what it always did — one click copies the
+           answer on screen. The caret beside it appears only where there is a
+           second thing to copy: the polished version below, which is a
+           different message for a different reader and which nobody should have
+           to scroll to find (see _deslop.html). Its menu is built from what is
+           actually in the panel when it opens, so a version polished while this
+           panel is up is in it without the panel being re-rendered. #}
+        <span class="copy-group">
+          <button class="copy-btn" id="copy-{{ job.id }}" type="button"
+                  data-copy-src="copy-src-{{ job.id }}"
+                  title="Copy this output as markdown">⧉ copy</button>
+          {% if deslop %}
+          <button class="copy-btn copy-more" type="button" data-copy-menu
+                  aria-haspopup="true" aria-expanded="false"
+                  title="Choose what to copy: this answer, or the polished version">▾</button>
+          {% endif %}
+        </span>
         {# Off-screen rather than `hidden`: the execCommand fallback below has to
            be able to select it. The newline straight after the tag is deliberate
            — HTML parsing eats one, so without it an output starting with a blank
@@ -36,7 +52,8 @@
            browser refuses, and the reader loses the thing the button is
            talking about. tabindex keeps it out of the tab order instead. #}
         <textarea class="copy-source" id="copy-src-{{ job.id }}"
-                  tabindex="-1" readonly>
+                  tabindex="-1" readonly
+                  data-copy-label="⧉ original — exactly what the run wrote">
 {{ output }}</textarea>
         {% endif %}
         <a class="modal-close" href="#" hx-get="/{{ kind }}/close" hx-target="#command-panel" hx-swap="innerHTML">✕</a>
@@ -45,26 +62,31 @@
     {% if output and status != 'running' %}
     <script>
     (function () {
-      var btn = document.getElementById("copy-{{ job.id }}");
-      var src = document.getElementById("copy-src-{{ job.id }}");
-      if (!btn || !src) return;
+      // Scoped to this panel, and delegated from it: everything copyable in the
+      // modal is reached through one listener, including the polished version,
+      // which htmx swaps in later and which no listener bound at render time
+      // would ever see. The overlay is replaced wholesale on every re-render,
+      // so the listener goes with it rather than accumulating on the document.
+      var root = document.getElementById("panel-{{ job.id }}");
+      if (!root) return;
+      var main = document.getElementById("copy-{{ job.id }}");
 
-      var resetTimer = null;
-
-      function say(text, ok) {
-        // Cleared first: a second copy at ~1.5s would otherwise be wiped by the
-        // first one's timer 100ms later, reading as if the click did nothing.
-        clearTimeout(resetTimer);
+      function say(btn, text, ok) {
+        // The timer lives on the button: a second copy at ~1.5s would otherwise
+        // be wiped by the first one's timer 100ms later, reading as if the
+        // click did nothing — and there is more than one button here now.
+        clearTimeout(btn._copyTimer);
+        if (btn._copyLabel === undefined) btn._copyLabel = btn.textContent;
         btn.textContent = text;
         btn.classList.toggle("is-done", ok === true);
         btn.classList.toggle("is-failed", ok === false);
-        resetTimer = setTimeout(function () {
-          btn.textContent = "⧉ copy";
+        btn._copyTimer = setTimeout(function () {
+          btn.textContent = btn._copyLabel;
           btn.classList.remove("is-done", "is-failed");
         }, 1600);
       }
 
-      function legacy() {
+      function legacy(btn, src) {
         // navigator.clipboard exists only in a secure context: localhost counts,
         // plain http to a hostname does not — and that is how a radar someone
         // shares on the network gets opened.
@@ -74,22 +96,91 @@
         if (ok) {
           window.getSelection().removeAllRanges();
           btn.focus();
-          say("✓ copied", true);
+          say(btn, "✓ copied", true);
           return;
         }
         // Left selected on purpose. Clearing it and then saying "press Ctrl+C"
         // — which is what this did — instructs the reader to copy nothing, and
         // this is the path a browser that refuses both APIs actually takes.
-        say("press Ctrl+C", false);
+        say(btn, "press Ctrl+C", false);
       }
 
-      btn.addEventListener("click", function () {
+      function copy(btn, src) {
+        if (!src) { say(btn, "nothing to copy", false); return; }
         if (navigator.clipboard && window.isSecureContext) {
           navigator.clipboard.writeText(src.value).then(
-            function () { say("✓ copied", true); }, legacy);
+            function () { say(btn, "✓ copied", true); },
+            function () { legacy(btn, src); });
         } else {
-          legacy();
+          legacy(btn, src);
         }
+      }
+
+      function closeMenu() {
+        var open = root.querySelector(".copy-menu");
+        if (open) open.remove();
+        var caret = root.querySelector("[data-copy-menu]");
+        if (caret) caret.setAttribute("aria-expanded", "false");
+      }
+
+      function openMenu(caret) {
+        closeMenu();
+        var menu = document.createElement("div");
+        menu.className = "copy-menu";
+        // Built from the panel as it stands, not from what the server knew when
+        // it rendered it: polishing an answer adds a source to this menu
+        // without the panel around it being re-drawn.
+        var sources = root.querySelectorAll(".copy-source[data-copy-label]");
+        for (var i = 0; i < sources.length; i++) {
+          var item = document.createElement("button");
+          item.type = "button";
+          item.className = "copy-menu-item";
+          item.setAttribute("data-copy-src", sources[i].id);
+          item.textContent = sources[i].getAttribute("data-copy-label");
+          menu.appendChild(item);
+        }
+        if (!document.getElementById("deslop-copy-src")) {
+          // Named rather than left out. Someone opening this menu is looking
+          // for the polished version; an answer of "there is only one thing
+          // here" tells them nothing about where the other one comes from.
+          var hint = document.createElement("button");
+          hint.type = "button";
+          hint.className = "copy-menu-item copy-menu-hint";
+          hint.setAttribute("data-copy-open", "1");
+          hint.textContent = "✨ polished — none yet, make one";
+          menu.appendChild(hint);
+        }
+        caret.parentNode.appendChild(menu);
+        caret.setAttribute("aria-expanded", "true");
+      }
+
+      root.addEventListener("click", function (e) {
+        if (!e.target || !e.target.closest) return;
+        var caret = e.target.closest("[data-copy-menu]");
+        if (caret) {
+          if (root.querySelector(".copy-menu")) { closeMenu(); } else { openMenu(caret); }
+          return;
+        }
+        if (e.target.closest("[data-copy-open]")) {
+          closeMenu();
+          var box = document.getElementById("deslop");
+          if (box) {
+            box.open = true;
+            box.scrollIntoView({ block: "nearest" });
+          }
+          return;
+        }
+        var btn = e.target.closest("[data-copy-src]");
+        if (btn) {
+          var src = document.getElementById(btn.getAttribute("data-copy-src"));
+          // A menu item is about to be removed with the menu, so the answer
+          // shows on the button that opened it.
+          var target = btn.classList.contains("copy-menu-item") ? (main || btn) : btn;
+          closeMenu();
+          copy(target, src);
+          return;
+        }
+        closeMenu();  // a click anywhere else in the panel dismisses it
       });
     })();
     </script>
@@ -125,6 +216,21 @@
         });
       })();
       </script>
+      {% endif %}
+      {% if deslop %}
+      {# The same answer, rewritten to be sent to a person — on demand, never
+         automatically, and never over the original. The <details> is rendered
+         once and its body refreshes inside it (see _deslop.html), so the
+         section keeps its place while a rewrite runs. Open when there is
+         something in it: a fold nobody opens is the same as no feature, and a
+         fold hiding nothing is a line of noise above the answer. #}
+      <details class="deslop" id="deslop"{% if deslop.state != 'none' %} open{% endif %}>
+        <summary>
+          {{ deslop.icon }} {{ deslop.label }}
+          <span id="deslop-state">{% include "_deslop_tag.html" %}</span>
+        </summary>
+        {% include "_deslop.html" %}
+      </details>
       {% endif %}
       {# `status`/`error`, not `job.*`: one read of the job's state per render — see _panel. #}
       {% if status == "running" %}
