@@ -66,6 +66,10 @@ CREATE TABLE IF NOT EXISTS test_plans (
     jira_keys    TEXT NOT NULL DEFAULT '',
     content      TEXT NOT NULL,
     generated_at TEXT NOT NULL,
+    -- What the run that wrote it spent (a `RunStats` as JSON; see commands.py).
+    -- Empty for a result stored before radar measured runs, and for one whose
+    -- command reported no usage at all — the panel then shows no numbers.
+    stats        TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (project_id, mr_iid, kind)
 );
 
@@ -79,6 +83,7 @@ CREATE TABLE IF NOT EXISTS build_analyses (
     kind         TEXT NOT NULL,
     content      TEXT NOT NULL,
     generated_at TEXT NOT NULL,
+    stats        TEXT NOT NULL DEFAULT '',   -- as in test_plans
     PRIMARY KEY (job_name, build_number, kind)
 );
 
@@ -212,6 +217,16 @@ class Database:
                 DROP TABLE test_plans_old;
                 """
             )
+
+        # Both stores gained `stats`: what the run that produced the result
+        # spent. Added rather than rebuilt, so results stored before radar
+        # measured anything keep their content and simply carry no numbers.
+        for table in ("test_plans", "build_analyses"):
+            cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if cols and "stats" not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN stats TEXT NOT NULL DEFAULT ''"
+                )
 
     def close(self) -> None:
         self.conn.close()
@@ -409,33 +424,48 @@ class Database:
     # --- stored skill results (QA test plans, etc.) ------------------------
 
     def save_test_plan(
-        self, project_id: int, mr_iid: int, kind: str, jira_keys: str, content: str
+        self,
+        project_id: int,
+        mr_iid: int,
+        kind: str,
+        jira_keys: str,
+        content: str,
+        stats: str = "",
     ) -> None:
+        """Store a skill's result, and what the run that produced it spent.
+
+        ``stats`` is a ``RunStats`` as JSON (see ``commands.stats_to_json``);
+        a run that reported no usage stores the empty string it defaults to.
+        """
         self.conn.execute(
             """
-            INSERT INTO test_plans (project_id, mr_iid, kind, jira_keys, content, generated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO test_plans
+                (project_id, mr_iid, kind, jira_keys, content, generated_at, stats)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, mr_iid, kind) DO UPDATE SET
                 jira_keys=excluded.jira_keys, content=excluded.content,
-                generated_at=excluded.generated_at
+                generated_at=excluded.generated_at, stats=excluded.stats
             """,
-            (project_id, mr_iid, kind, jira_keys, content, _now_utc_iso()),
+            (project_id, mr_iid, kind, jira_keys, content, _now_utc_iso(), stats),
         )
         self.conn.commit()
 
     # --- build analyses ----------------------------------------------------
 
     def save_build_analysis(
-        self, job_name: str, build_number: int, kind: str, content: str
+        self, job_name: str, build_number: int, kind: str, content: str, stats: str = ""
     ) -> None:
+        """As ``save_test_plan``, for the analysis of one build."""
         self.conn.execute(
             """
-            INSERT INTO build_analyses (job_name, build_number, kind, content, generated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO build_analyses
+                (job_name, build_number, kind, content, generated_at, stats)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_name, build_number, kind) DO UPDATE SET
-                content=excluded.content, generated_at=excluded.generated_at
+                content=excluded.content, generated_at=excluded.generated_at,
+                stats=excluded.stats
             """,
-            (job_name, build_number, kind, content, _now_utc_iso()),
+            (job_name, build_number, kind, content, _now_utc_iso(), stats),
         )
         self.conn.commit()
 

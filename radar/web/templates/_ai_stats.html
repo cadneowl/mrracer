@@ -1,0 +1,54 @@
+{# What the AI actually did: the run's shape as charts, and every measurement
+   it reported, grouped. Lives inside the panel's <details class="ai-stats">,
+   which is rendered once and never swapped — this fragment replaces itself
+   every few seconds while the run works (hx-swap="outerHTML" on the element
+   that carries the trigger), so the charts move while the section stays open.
+   The finished fragment omits the trigger, which stops the polling.
+
+   The trigger's filter skips the tick while the section is folded away — five
+   charts and a page of numbers, drawn server-side for nobody. htmx keeps the
+   timer running either way, so opening the section picks the refresh back up
+   without a reload. `!== false` rather than `.open`, so a missing <details>
+   (this fragment somewhere else one day) polls rather than silently stops. #}
+<div class="ai-stats-body"
+     {% if live %}hx-get="/{{ kind }}/stats/{{ job.id }}"
+     hx-trigger="every {{ tick_s }}s [this.closest('details')?.open !== false]"
+     hx-swap="outerHTML"{% endif %}>
+
+  {% if live and ai.pills %}
+  {# Only while the run is going. The panel prints this strip itself once the
+     run has ended, and the section opens directly under it — printing it twice
+     reads as a mistake rather than as a summary. #}
+  {% with stats = ai %}{% include "_run_stats.html" %}{% endwith %}
+  {% endif %}
+
+  {% if ai.charts %}
+  <div class="chart-grid-2">
+    {% for one in ai.charts %}{{ one }}{% endfor %}
+  </div>
+  {% elif live %}
+  <p class="ai-stats-wait">No requests have come back yet — the charts start
+    with the first answer.</p>
+  {% endif %}
+
+  {% if ai.capture %}
+  <p class="ai-stats-capture">This run's raw event stream is being kept:
+    <code>radar diagnose-stream {{ ai.capture }}</code></p>
+  {% endif %}
+
+  {% if ai.groups %}
+  <div class="run-groups">
+    {% for group in ai.groups %}
+    <section class="run-group">
+      <h4>{{ group.title }}</h4>
+      <dl>
+        {% for row in group.rows %}
+        <dt>{{ row.label }}</dt>
+        <dd>{{ row.value }}{% if row.note %} <span class="run-note">{{ row.note }}</span>{% endif %}</dd>
+        {% endfor %}
+      </dl>
+    </section>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>

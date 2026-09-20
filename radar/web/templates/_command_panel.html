@@ -95,9 +95,37 @@
     </script>
     {% endif %}
     <div class="modal-body">
+      {# What the run spent, once it has ended — including a re-opened result,
+         which carries the numbers of the run that wrote it. While it is still
+         running the figures live on the health rows below, which refresh
+         themselves; this strip would be a snapshot of zeros. #}
+      {% if stats %}{% include "_run_stats.html" %}{% endif %}
       {# A row per pipeline step, or one for a running skill: working or only
          waiting, and a way to stop it. Absent from a re-opened stored result. #}
       {% if rows %}{% include "_job_health.html" %}{% endif %}
+      {% if ai %}
+      {# Everything the run reported, and the shape of it. The <details> is
+         rendered once and its contents refresh inside it, so the section stays
+         open while the charts move — and stays open across the re-render that
+         happens when the run ends (see the script below). #}
+      <details class="ai-stats" id="ai-stats">
+        <summary>AI stats</summary>
+        {% include "_ai_stats.html" %}
+      </details>
+      <script>
+      (function () {
+        // Remembered per browser, not per job: someone who opens this to watch
+        // one review is watching the next one too, and the panel is re-rendered
+        // from scratch when a run finishes.
+        var box = document.getElementById("ai-stats");
+        if (!box) return;
+        try { box.open = localStorage.getItem("radar-ai-stats") === "1"; } catch (e) {}
+        box.addEventListener("toggle", function () {
+          try { localStorage.setItem("radar-ai-stats", box.open ? "1" : "0"); } catch (e) {}
+        });
+      })();
+      </script>
+      {% endif %}
       {# `status`/`error`, not `job.*`: one read of the job's state per render — see _panel. #}
       {% if status == "running" %}
       <div class="review-loading">

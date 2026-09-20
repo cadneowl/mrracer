@@ -1,0 +1,15 @@
+{# What one run spent, as a row of small labelled figures: tokens in, cached,
+   out, thinking, how many requests it made and how long each took the model.
+   The context key is `stats` (built by `web.app._stats_view`), so a caller with
+   the numbers under another name passes them in with `{% with %}` — the health
+   rows do that per step. Rendered by whoever has numbers to show; a run that
+   reported none gets no strip at all. Every figure's tooltip says what it is
+   and whether it is billed or still radar's own live count. #}
+<div class="run-stats">
+  {% if stats.model %}
+  <span class="run-model" title="the model that answered">{{ stats.model }}</span>
+  {% endif %}
+  {% for pill in stats.pills %}
+  <span class="run-stat" title="{{ pill.title }}"><span class="run-lbl">{{ pill.label }}</span>{{ pill.value }}</span>
+  {% endfor %}
+</div>

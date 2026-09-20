@@ -306,10 +306,103 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .progress-log li.plog-text { color: #9fb4d8; }
 .progress-log li:last-child { border-bottom: none; }
 
+/* What a run spent (_run_stats.html): tokens in / cached / out / thinking, the
+   requests it made, and how long each took the model. Wraps rather than
+   overflows, and inside a health row it takes a line of its own. */
+.run-stats {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--muted);
+}
+.modal-body > .run-stats { margin: 0 0 12px; }
+.run-model { color: var(--text); opacity: .75; }
+.run-stat { white-space: nowrap; cursor: help; color: var(--text); }
+.run-lbl {
+  color: var(--muted); opacity: .8; text-transform: uppercase;
+  letter-spacing: .5px; font-size: 10px; margin-right: 3px;
+}
+/* A whole line of its own under the step: sharing the line costs the note,
+   which is what says where the step has got to. */
+.health-row .run-stats { flex: 1 0 100%; }
+/* The AI stats section (_ai_stats.html): everything the run reported, and the
+   shape of it, folded away under the panel. The <details> stays put while its
+   contents refresh inside it, so an open section keeps its place. */
+.ai-stats { margin: 4px 0 14px; border-top: 1px solid var(--line); padding-top: 8px; }
+.ai-stats > summary {
+  cursor: pointer; color: var(--muted); font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .5px; padding: 2px 0; list-style: none;
+}
+.ai-stats > summary::before { content: "▸ "; }
+.ai-stats[open] > summary::before { content: "▾ "; }
+.ai-stats > summary::-webkit-details-marker { display: none; }
+.ai-stats > summary:hover { color: var(--text); }
+.ai-stats-body { padding: 6px 0 2px; }
+.ai-stats-body > .run-stats { margin-bottom: 10px; }
+.ai-stats-wait { color: var(--muted); font-size: 12px; margin: 6px 0 10px; }
+.ai-stats-capture { color: var(--muted); font-size: 11.5px; margin: 0 0 10px; }
+.ai-stats-capture code {
+  color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 4px; padding: 1px 6px; user-select: all;
+}
+
+/* The charts. Two to a row where there is room, one where there is not. */
+.chart-grid-2 {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px 18px; margin: 4px 0 14px;
+}
+.chart-box { margin: 0; }
+.chart-title {
+  font-size: 11px; color: var(--text); font-weight: 600;
+  display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px;
+}
+.chart-title span { font-weight: 400; color: var(--muted); font-size: 10.5px; }
+/* The box keeps the viewBox's own proportions (620×150, see charts.py), so the
+   drawing is scaled and never stretched — text stays legible and a dot stays
+   round at any panel width. The floor is for a narrow screen, where letter-
+   boxing a little empty space beats squashing the labels. */
+.chart {
+  width: 100%; height: auto; aspect-ratio: 620 / 150; min-height: 92px;
+  display: block; overflow: visible;
+}
+
+.chart-grid { stroke: var(--line); stroke-width: 1; }
+.chart-axis { fill: var(--muted); font-size: 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.chart-ref { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; opacity: .8; }
+.chart-ref-label { opacity: .9; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px;
+  font-size: 10.5px; color: var(--muted); }
+.chart-key { display: inline-flex; align-items: center; gap: 5px; }
+.chart-key i { width: 9px; height: 3px; border-radius: 2px; display: inline-block; }
+
+.run-groups {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px 22px; margin: 8px 0 4px;
+}
+.run-group h4 {
+  margin: 0 0 4px; font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .5px; font-weight: 700;
+}
+.run-group dl {
+  margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px;
+}
+.run-group dt { color: var(--muted); white-space: nowrap; }
+.run-group dd {
+  margin: 0; color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+}
+.run-note { color: var(--muted); font-family: inherit; opacity: .85; }
+
+/* A pipeline's own line, under its steps'. */
+.run-total { display: flex; align-items: baseline; gap: 8px; padding: 2px 8px; }
+.run-total-label {
+  color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
+}
+
 /* Who is doing what inside a job (_job_health.html). */
 .job-health { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 12px; }
 .health-row {
-  display: flex; align-items: center; gap: 10px; font-size: 12px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 12px;
   padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px;
 }
 .health-name { font-weight: 600; min-width: 90px; }
@@ -327,6 +420,12 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
   border-radius: 6px; font-size: 11px; padding: 2px 8px; cursor: pointer;
 }
 .health-stop:hover { color: var(--red); border-color: var(--red); }
+.health-retry {
+  background: transparent; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 6px; font-size: 11px; padding: 2px 8px; cursor: pointer;
+}
+.health-retry:hover { color: var(--green); border-color: var(--green); }
+.health-retry:disabled { opacity: .5; cursor: wait; }
 .health-stop-all { align-self: flex-end; }
 .spinner {
   width: 16px; height: 16px; border-radius: 50%;

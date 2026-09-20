@@ -21,8 +21,37 @@
             hx-target="closest .job-health" hx-swap="outerHTML"
             hx-confirm="Stop {{ row.label }}?{% if row.step %} The pipeline carries on without it.{% endif %}">■ stop</button>
     {% endif %}
+    {% if row.can_retry %}
+    {# This step, and then every stage after it — those have to run again
+       because their input is about to change. Anything that already finished
+       *before* it is kept. A retry spends real money on a job that has already
+       spent some, so it confirms first, like the stop button, and the
+       confirmation names the steps that will be paid for twice. #}
+    <button class="health-retry" type="button"
+            hx-post="/{{ kind }}/retry/{{ job.id }}?step={{ row.step|urlencode }}"
+            hx-target="#command-panel" hx-swap="innerHTML" hx-disabled-elt="this"
+            hx-confirm="Run {{ row.label }} again?{% if row.retry_again %} {{ row.retry_again }} will run again too, because {{ row.label }}'s answer is their input — that work is paid for twice. Everything before it is kept.{% else %} The steps that already finished are kept.{% endif %}"
+            title="Run {{ row.label }} again and finish the pipeline from there{% if row.retry_again %}, which also re-runs {{ row.retry_again }}{% else %}; the steps that already succeeded are kept{% endif %}">↻ retry</button>
+    {% endif %}
+
+    {% if row.stats %}
+    {# What this step has spent, on a line of its own under it: on the same line
+       it would push out the note, which is the half that says what the step is
+       doing right now. Last in the row so the stop button stays beside the
+       state it belongs to. #}
+    {% with stats = row.stats %}{% include "_run_stats.html" %}{% endwith %}
+    {% endif %}
   </div>
   {% endfor %}
+  {% if total %}
+  {# The whole pipeline's bill, added up from the steps above. Lives in this
+     fragment because this is the one that refreshes itself while the run
+     works — the panel around it is rendered once. #}
+  <div class="run-total">
+    <span class="run-total-label">total</span>
+    {% with stats = total %}{% include "_run_stats.html" %}{% endwith %}
+  </div>
+  {% endif %}
   {% if stop_all %}
   <button class="health-stop health-stop-all" type="button"
           hx-post="/{{ kind }}/stop/{{ job.id }}"

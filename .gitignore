@@ -11,6 +11,7 @@ venv/
 uv.lock
 
 # radar runtime
+radar-streams/
 *.db
 *.db-wal
 *.db-shm
