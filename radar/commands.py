@@ -810,6 +810,11 @@ class CommandJob:
     # the coordinates of the other one are absent rather than zero.
     project_id: int | None = None
     mr_iid: int | None = None
+    # The build this job is about, for a Jenkins analysis; the job's name is in
+    # `title`. Kept as a number rather than read back out of `subject`, because
+    # anything that has to file a result against this run (see
+    # `web.app._polish_source`) needs the build, not the string that displays it.
+    build_number: int | None = None
     subject: str = ""  # "!123" or "backend-ci #128" — what the panel heads with
     title: str = ""
     status: str = "running"  # running / done / error
@@ -1056,11 +1061,13 @@ class CommandRunner:
         """A new running job for this context, registered so the panel finds it."""
         project_id = ctx.get("project_id")
         mr_iid = ctx.get("mr_iid")
+        build = ctx.get("build_number")
         job = CommandJob(
             id=uuid.uuid4().hex[:12],
             kind=self.kind,
             project_id=int(project_id) if project_id not in (None, "") else None,
             mr_iid=int(mr_iid) if mr_iid not in (None, "") else None,
+            build_number=int(build) if build not in (None, "") else None,
             subject=str(ctx.get("subject", "")),
             title=str(ctx.get("title", "")),
             started_mono=time.monotonic(),

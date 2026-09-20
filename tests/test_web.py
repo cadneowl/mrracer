@@ -184,10 +184,20 @@ def test_a_finished_panel_offers_the_markdown_for_copying(tmp_path):
 
     assert 'class="copy-btn"' in html
     # The markdown itself — headings and fences intact, not <h2> and <pre>.
-    carried = html.split('readonly>')[1].split("</textarea>")[0]
+    carried = _copy_field(html, "copy-src-")
     assert "## Cause" in carried and "```python" in carried
     # And the rendered article is still there, so the panel reads as before.
     assert "<h2>Cause</h2>" in html
+
+
+def _copy_field(html: str, id_prefix: str) -> str:
+    """What a copy textarea carries, found by its id rather than by its
+    attribute order — which is a detail of the markup, not of the feature."""
+    match = re.search(
+        rf'<textarea[^>]*id="{id_prefix}[^"]*"[^>]*>(.*?)</textarea>', html, re.S
+    )
+    assert match, f"no copy field with an id starting {id_prefix!r}"
+    return match.group(1)
 
 
 def _render_panel(**overrides) -> str:
@@ -227,7 +237,7 @@ def test_output_kept_from_a_failed_run_is_copyable_too():
     html = _render_panel(status="error", error="timed out", output="## Partial")
 
     assert 'class="copy-btn"' in html
-    assert "## Partial" in html.split("readonly>")[1].split("</textarea>")[0]
+    assert "## Partial" in _copy_field(html, "copy-src-")
 
 
 def test_skill_output_cannot_break_out_of_the_copy_field():

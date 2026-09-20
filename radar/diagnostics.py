@@ -295,6 +295,10 @@ def _check_commands(config: Config) -> list[Check]:
                 # reading those fields here would report that radar fetches
                 # nothing for the one skill it always fetches for.
                 fetched = "the build's commits and console log"
+            elif skill is config.deslopify_skill:
+                # Likewise: what it is handed is another run's answer, and the
+                # wiring is what gets it that.
+                fetched = "the answer of the run it is asked to rewrite"
             else:
                 fetched = ", ".join(skill.contexts) if skill.include_context else ""
             ctx = f" · fetches {fetched}" if fetched else ""
@@ -302,6 +306,37 @@ def _check_commands(config: Config) -> list[Check]:
         else:
             out.append(Check(f"{name}.command", "warn", f"'{exe}' not found on PATH"))
     return out
+
+
+def _check_deslopify(config: Config) -> Check:
+    """Which skill the polish button runs, said out loud.
+
+    Same reason as the analyse button: it is configured in one place and visible
+    in none, and "why is there no polish button" is exactly the question this
+    command should answer without anyone reading the source.
+    """
+    wiring = config.deslopify
+    if config.deslopify_skill is not None:
+        return Check(
+            "deslopify",
+            "ok",
+            f"a finished run can be rewritten for sending by the "
+            f"{config.deslopify_skill.name!r} skill",
+        )
+    if wiring.skill:
+        # Wired, deliberately off. Telling someone to set the key they have
+        # already set correctly is the advice that wastes an afternoon.
+        return Check(
+            "deslopify",
+            "skip",
+            f"no polish button — {wiring.skill!r} is wired but deslopify.enabled is false",
+        )
+    return Check(
+        "deslopify",
+        "skip",
+        "no polish button — set deslopify.skill to the name of a skill that rewrites "
+        "an answer for sending",
+    )
 
 
 def _check_skill_context(config: Config) -> list[Check]:
@@ -449,6 +484,7 @@ def run_checks(config: Config, config_path: str | Path | None = None) -> list[Ch
     checks.append(_check_jira(config))
     checks.extend(_check_jenkins(config))
     checks.extend(_check_commands(config))
+    checks.append(_check_deslopify(config))
     checks.extend(_check_skill_context(config))
     note = _check_note_parsing(config)
     if note is not None:

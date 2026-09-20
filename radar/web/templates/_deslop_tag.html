@@ -1,0 +1,14 @@
+{# What the fold says about itself when it is closed. Shared by the panel's
+   <summary> and by the out-of-band copy the section sends when it refreshes, so
+   a rewrite that finishes while the panel is open updates the line above it
+   rather than leaving "running…" on a section that is done.
+
+   A failure is read before anything else that is not still happening: a retry
+   that failed over a version saved earlier still has a saved version below it,
+   and a fold labelled "ready to send" would be the one place that never said
+   the last attempt went wrong. #}
+{% if deslop.state == 'running' %}<span class="deslop-tag">running…</span>
+{% elif deslop.error %}<span class="deslop-tag deslop-tag-stale">failed</span>
+{% elif deslop.stale %}<span class="deslop-tag deslop-tag-stale">out of date</span>
+{% elif deslop.state == 'done' %}<span class="deslop-tag deslop-tag-ready">ready to send</span>
+{% endif %}

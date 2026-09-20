@@ -1,0 +1,121 @@
+{# A run's answer, rewritten to be sent to a person — made on demand, kept
+   beside the answer rather than over it. Lives inside the panel's
+   <details class="deslop">, which is rendered once; this fragment replaces
+   itself (hx-swap="outerHTML" on the element carrying the trigger) while a
+   polish run works, so the section stays open and in place while it fills.
+   The finished fragment omits the trigger, which stops the polling — and
+   closing the panel removes the element, which stops it too. #}
+{% if oob %}
+{# Answering a request of its own: the fold's own line sits outside this
+   fragment, in the <summary> the panel rendered once, so it is updated by id
+   rather than left saying what was true when the panel was drawn. #}
+<span id="deslop-state" hx-swap-oob="true">{% include "_deslop_tag.html" %}</span>
+{% endif %}
+<div class="deslop-body"
+     {% if deslop.state == 'running' %}hx-get="{{ deslop.url }}"
+     hx-trigger="every {{ deslop.tick_s }}s" hx-swap="outerHTML"{% endif %}>
+
+  {% if deslop.error %}
+  {# Above whatever is shown below it: a failed second attempt must not look
+     like the version saved by the first one was never there. #}
+  <div class="review-error deslop-failed">
+    <strong>{{ deslop.label }} failed.</strong>
+    <pre>{{ deslop.error }}</pre>
+  </div>
+  {% endif %}
+
+  {% if deslop.state == 'running' %}
+  <div class="review-loading">
+    <span class="spinner"></span> rewriting the answer…
+    {% if deslop.remaining_s is not none %}
+    <span class="countdown{% if deslop.remaining_s <= 60 %} low{% endif %}">{{ deslop.clock_text }}</span>
+    {% endif %}
+  </div>
+  {# The polish run's own row: what it is doing, and how to stop it or give it
+     more time. `live` is false because the fragment around it already refreshes
+     on its own — two pollers over the same run would be two requests saying the
+     same thing. #}
+  {% if deslop.rows %}
+  {# `total` is set to nothing on purpose. Jinja's include inherits every name
+     the panel already has, and the panel's own `total` is the *source run's*
+     bill — printed in here it reads as what the rewrite cost. #}
+  {% with kind = deslop.kind, job = deslop.job, rows = deslop.rows, live = false,
+          total = none %}
+  {% include "_job_health.html" %}
+  {% endwith %}
+  {% endif %}
+
+  {% else %}
+
+  {% if deslop.persist_error %}<div class="save-warn">⚠ {{ deslop.persist_error }}</div>{% endif %}
+
+  {% if deslop.stale %}
+  {# Made from an answer this run has since replaced. Shown rather than hidden —
+     it is still a readable message about this merge request, and throwing it
+     away would be the one thing worse than labelling it — but never as though
+     it were a rewrite of what is on screen. #}
+  <div class="deslop-stale">
+    ⚠ Made from an earlier answer of this run. The answer on this panel has
+    changed since — rewrite it again to catch up.
+  </div>
+  {% endif %}
+
+  {% if deslop.content_html %}
+  <article class="review-output deslop-output">{{ deslop.content_html }}</article>
+  {# The markdown itself, for the copy buttons — these and the ones in the
+     header above. Off-screen rather than hidden, and with the newline straight
+     after the tag, for the reasons the panel's own copy source gives.
+
+     Two fields, because a rewrite is not one thing: the message, and the
+     message plus the checks and notes that came with it. The message goes
+     first, in the DOM and in the menu built from it, because it is the one
+     anyone came here for — pasting the checklist into the merge request is the
+     thing this whole section exists to stop. #}
+  {% if deslop.sendable %}
+  <textarea class="copy-source" id="deslop-send-src" tabindex="-1" readonly
+            data-copy-label="✨ the message — ready to send">
+{{ deslop.sendable }}</textarea>
+  {% endif %}
+  <textarea class="copy-source" id="deslop-copy-src" tabindex="-1" readonly
+            data-copy-label="{% if deslop.sendable %}✨ the whole rewrite — message, checks and notes{% else %}✨ polished — ready to send{% endif %}">
+{{ deslop.content }}</textarea>
+  {% elif deslop.state == 'none' %}
+  <p class="deslop-none">
+    The answer above is written for you — findings, evidence, and everything the
+    run checked. {{ deslop.label }} rewrites it as a message for someone else:
+    shorter, with what still needs verifying called out, and no claim the run
+    did not actually make. The answer above is kept exactly as it is.
+  </p>
+  {% endif %}
+
+  <div class="deslop-actions">
+    {% if deslop.sendable %}
+    {# The message alone. What the ✕ button next to it copies — everything —
+       is one click away in the header's menu, and on screen either way. #}
+    <button class="copy-btn" type="button" data-copy-src="deslop-send-src"
+            title="Copy just the message, without the checks and notes below it">⧉ copy the message</button>
+    {% elif deslop.content_html %}
+    <button class="copy-btn" type="button" data-copy-src="deslop-copy-src"
+            title="Copy the polished version as markdown">⧉ copy polished</button>
+    {% endif %}
+    {# The same button whether or not there is already a polished version: one
+       makes the first, the other replaces it. It spends real money on work
+       already done, so the replacement confirms first. #}
+    <button class="copy-btn deslop-run" type="button"
+            hx-post="{{ deslop.url }}" hx-target="closest .deslop-body" hx-swap="outerHTML"
+            hx-disabled-elt="this"
+            {% if deslop.content_html %}hx-confirm="Rewrite this again? The polished version here is replaced by the new one; the answer it was made from is untouched."{% endif %}
+            title="{% if deslop.content_html %}Rewrite the answer again, replacing the polished version here{% else %}Rewrite the answer above into something you can send{% endif %}">{{ deslop.icon }} {% if deslop.content_html %}↻ {{ deslop.button }} again{% else %}{{ deslop.button }}{% endif %}</button>
+    {% if deslop.generated_at %}
+    <span class="stamp">polished {{ deslop.generated_at[:19] }}Z</span>
+    {% endif %}
+  </div>
+
+  {% if deslop.stats %}
+  {# What the rewrite itself cost, on its own line: it is a second model run,
+     and a panel that only ever showed the first one's bill would be short. #}
+  {% with stats = deslop.stats %}{% include "_run_stats.html" %}{% endwith %}
+  {% endif %}
+
+  {% endif %}
+</div>

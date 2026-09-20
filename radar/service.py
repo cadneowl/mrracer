@@ -177,6 +177,9 @@ def build_dashboard(
     thread_counts = db.thread_counts()
 
     all_rows: list[dict] = []
+    # One read for the whole board, like the thread tallies above: the table
+    # holds one short row per answer anyone has ever polished.
+    polished = db.polished_runs()
     for snap in db.open_snapshots():
         events = list(db.iter_events(snap["project_id"], snap["mr_iid"]))
         obligations = derive_mr(events, snap, config, now)
@@ -198,6 +201,15 @@ def build_dashboard(
             config.jira.project_keys,
         )
         stored_kinds = db.stored_kinds(snap["project_id"], snap["mr_iid"])
+        # Skills whose answer for this merge request has a sendable version
+        # saved. Kept apart from `stored_kinds`: a polished answer can outlive
+        # the answer it was made from — a review skill stores nothing — and
+        # then this badge is the only way back to it.
+        polished_kinds = sorted(
+            kind for source, a, b, kind in polished
+            if source == "mr"
+            and (a, b) == (str(snap["project_id"]), str(snap["mr_iid"]))
+        )
         all_rows.append(
             {
                 "project_id": snap["project_id"],
@@ -213,6 +225,7 @@ def build_dashboard(
                 "min_urgency": _row_min_urgency(views),
                 "jira": [{"key": k, "url": browse_url(config.jira.base_url, k)} for k in keys],
                 "stored_kinds": stored_kinds,
+                "polished_kinds": polished_kinds,
                 "threads": {"total": counts["total"], "open": counts["open"]},
             }
         )

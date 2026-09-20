@@ -222,6 +222,41 @@ class JenkinsConfig:
 
 
 @dataclass(frozen=True)
+class DeslopifyConfig:
+    """Which skill rewrites a finished answer into something sendable, if any.
+
+    The same shape as ``jenkins.analysis`` and for the same reason: a button
+    that appears on every finished run is a fact about the configuration, and it
+    should be a sentence you can read rather than a property of a skill's name.
+
+    The named skill is not a board skill. It never runs for a merge request or
+    a build of its own — it is handed the text another run produced, on stdin,
+    and its answer is filed against that run.
+    """
+
+    enabled: bool = False
+    skill: str = ""
+    # Where the rewritten answer is going: a merge-request comment, a chat
+    # thread, an email. Named because a rewrite has no shape without it — the
+    # channel decides the length, the formatting and whether a link beats a
+    # paste — and because a skill told nothing has to either guess or stop and
+    # ask, and there is nobody on the other end of a headless run to answer.
+    #
+    # Empty means radar's own default for whatever the answer was about: a
+    # merge request's goes back to the merge request, a build's to the people
+    # watching the build.
+    destination: str = ""
+
+    def destination_for(self, source_kind: str) -> str:
+        """Where an answer about ``source_kind`` is headed, in words."""
+        if self.destination:
+            return self.destination
+        if source_kind == "build":
+            return "a chat message to the team watching this build"
+        return "a comment on the merge request"
+
+
+@dataclass(frozen=True)
 class Team:
     """A named group of GitLab usernames, used for board filters."""
 
@@ -247,6 +282,8 @@ class Config:
     # Defaulted: a config with no `jenkins:` block simply has no CI strip, and
     # every existing config predates the key.
     jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
+    # Likewise: no `deslopify:` block means no polish button on any panel.
+    deslopify: DeslopifyConfig = field(default_factory=DeslopifyConfig)
 
     def team_by_name(self, name: str) -> Team | None:
         for team in self.teams:
@@ -265,6 +302,17 @@ class Config:
         if not self.jenkins.analysis.enabled:
             return None
         return self.skill_by_name(self.jenkins.analysis.skill)
+
+    @property
+    def deslopify_skill(self) -> SkillConfig | None:
+        """The skill the panel's polish button runs, or None if unwired.
+
+        As ``analysis_skill``: asked for rather than inferred, so nothing has to
+        know that a skill called "deslopify" is special. Nothing here is.
+        """
+        if not self.deslopify.enabled:
+            return None
+        return self.skill_by_name(self.deslopify.skill)
 
     def skill_by_name(self, name: str) -> SkillConfig | None:
         """The skill declared under ``name``, or None if the config never names it.
@@ -981,6 +1029,43 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
     )
 
 
+_DESLOPIFY_KEYS = frozenset({"enabled", "skill", "destination"})
+# The conventional name for the polish skill, as `config.example.yaml` ships it.
+# Nothing is true of a skill because it is called this — the wiring is what
+# decides — but an enabled one wired to nothing is refused by name, exactly as
+# the analyser is (see `_check_deslopify_wiring`).
+_DESLOPIFY_NAME = "deslopify"
+
+
+def _parse_deslopify(raw: object) -> DeslopifyConfig:
+    """Parse the optional ``deslopify:`` block — the polish button's wiring.
+
+    Mirrors ``jenkins.analysis``: naming a skill is the intent, so ``enabled``
+    defaults to true once one is named, and ``enabled: false`` switches the
+    button off for a week without unpicking the wiring.
+    """
+    if raw is None:
+        return DeslopifyConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("deslopify: expected a mapping with 'skill' and 'enabled'")
+    _reject_unknown(raw, _DESLOPIFY_KEYS, "deslopify")
+
+    skill = str(raw.get("skill", "") or "").strip()
+    enabled = raw.get("enabled", bool(skill))
+    if not isinstance(enabled, bool):
+        raise ConfigError("deslopify.enabled: expected true or false")
+    if enabled and not skill:
+        raise ConfigError(
+            "deslopify.enabled is true but no 'skill' is named, so there is nothing for "
+            "the polish button to run. Name a skill from the 'skills' list, or set "
+            "enabled: false."
+        )
+    return DeslopifyConfig(
+        enabled=enabled, skill=skill,
+        destination=str(raw.get("destination", "") or "").strip(),
+    )
+
+
 def _parse_teams(raw: object) -> tuple[Team, ...]:
     if raw is None:
         return ()
@@ -1107,8 +1192,91 @@ def _check_analysis_wiring(jenkins: JenkinsConfig, skills: tuple[SkillConfig, ..
         )
 
 
+def _check_deslopify_wiring(
+    wiring: DeslopifyConfig, skills: tuple[SkillConfig, ...], jenkins: JenkinsConfig
+) -> None:
+    """Refuse a polish wiring that would produce no button, or a wrong one.
+
+    Same failure mode as the analyse button, and the same answer: every way of
+    getting this wrong showed up as a panel that looked entirely normal and
+    simply offered nothing to click.
+    """
+    if not wiring.enabled:
+        # A skill called `deslopify`, enabled, wired to nothing, is a button on
+        # every merge-request row running a command that expects an answer to
+        # rewrite and would be handed none. `config.example.yaml` ships that
+        # skill with `enabled: false`, so turning it on and leaving the block
+        # commented out is the likeliest way into this — refused with the line
+        # that fixes it rather than left to be found on the board.
+        stray = next((s for s in skills if s.name == _DESLOPIFY_NAME and s.enabled), None)
+        if stray is not None:
+            raise ConfigError(
+                f"a skill named {_DESLOPIFY_NAME!r} is enabled but nothing wires it to the "
+                "polish button, so it would appear as a button on every merge request "
+                "instead. Point at it from the deslopify block:\n\n"
+                "  deslopify:\n"
+                "    enabled: true\n"
+                f"    skill: {_DESLOPIFY_NAME}\n\n"
+                "or rename the skill if it really is a merge-request one."
+            )
+        return
+
+    named = next((s for s in skills if s.name == wiring.skill), None)
+    if named is None:
+        available = ", ".join(s.name for s in skills) or "none are declared"
+        raise ConfigError(
+            f"deslopify.skill: no skill named {wiring.skill!r} — the 'skills' list has "
+            f"{available}"
+        )
+    if not named.enabled:
+        raise ConfigError(
+            f"deslopify.skill names {wiring.skill!r}, but that skill has enabled: false, "
+            "so the polish button would have nothing to run. Enable the skill, or set "
+            "deslopify.enabled: false."
+        )
+    if named.pipeline:
+        raise ConfigError(
+            f"deslopify.skill names {wiring.skill!r}, which is a pipeline — polishing is "
+            "one pass over one answer. Name a skill with a command."
+        )
+    if jenkins.analysis.enabled and named.name == jenkins.analysis.skill:
+        raise ConfigError(
+            f"deslopify.skill and jenkins.analysis.skill both name {wiring.skill!r}. One "
+            "reads a broken build, the other rewrites an answer that already exists — a "
+            "skill cannot be handed both on the same stdin. Use two skills."
+        )
+    if named.checkout == "worktree":
+        # A worktree is made from a merge request's ref, and a polish run is
+        # about a piece of text that may have come from a build.
+        raise ConfigError(
+            f"deslopify.skill names {wiring.skill!r}, which uses 'checkout: worktree' — "
+            "that needs a merge request to make a worktree of, and this skill rewrites "
+            "text that may have come from a build. Use a plain 'source:' checkout."
+        )
+
+    # Settings that describe a board skill and do nothing here — refused rather
+    # than read and disregarded (see `_check_analysis_wiring` for the same rule).
+    inert = [
+        name
+        for name, is_set in (
+            ("context", bool(named.contexts)),
+            ("include_context", named.include_context),
+            ("stores_result", named.stores_result),
+        )
+        if is_set
+    ]
+    if inert:
+        raise ConfigError(
+            f"deslopify.skill names {wiring.skill!r}, which sets {', '.join(inert)} — "
+            "those describe a merge-request skill and do nothing for a polish run. Being "
+            "named here is what gets this skill the answer to rewrite, on stdin, and its "
+            "own answer is always saved against the run it polished. Remove them."
+        )
+
+
 def _check_pipelines(
-    skills: tuple[SkillConfig, ...], jenkins: JenkinsConfig
+    skills: tuple[SkillConfig, ...], jenkins: JenkinsConfig,
+    deslopify: DeslopifyConfig | None = None,
 ) -> tuple[SkillConfig, ...]:
     """Resolve every pipeline against the skills it names, and set its budget.
 
@@ -1120,6 +1288,7 @@ def _check_pipelines(
     """
     by_name = {s.name: s for s in skills}
     analyser = jenkins.analysis.skill if jenkins.analysis.enabled else ""
+    polisher = deslopify.skill if deslopify is not None and deslopify.enabled else ""
     out: list[SkillConfig] = []
     for skill in skills:
         if not skill.pipeline:
@@ -1130,6 +1299,13 @@ def _check_pipelines(
             raise ConfigError(
                 f"jenkins.analysis.skill names {skill.name!r}, which is a pipeline — the "
                 "analyse button runs one skill over one build. Name a skill with a command."
+            )
+        if skill.name == polisher:
+            # Also refused by `_check_deslopify_wiring`; caught here too so the
+            # message names the pipeline being declared rather than the wiring.
+            raise ConfigError(
+                f"deslopify.skill names {skill.name!r}, which is a pipeline — polishing is "
+                "one pass over one answer. Name a skill with a command."
             )
         budget = 0
         for stage in skill.pipeline:
@@ -1157,6 +1333,14 @@ def _check_pipelines(
                         f"{ctx}.pipeline: {step!r} is the skill jenkins.analysis.skill names. "
                         "It analyses a build, and a pipeline runs for a merge request, so it "
                         "would start with no build to read."
+                    )
+                if step == polisher:
+                    raise ConfigError(
+                        f"{ctx}.pipeline: {step!r} is the skill deslopify.skill names. It "
+                        "rewrites an answer it is handed on stdin, and a step is given the "
+                        "merge request instead, so it would start with nothing to rewrite. "
+                        "The polish button is offered on a finished run, which is where a "
+                        "pipeline's own answer gets one too."
                     )
                 slowest = max(slowest, target.timeout_seconds)
             budget += slowest
@@ -1213,13 +1397,15 @@ def load_config(path: str | Path) -> Config:
     skills = _parse_skills(raw, path.resolve().parent)
     jira = _parse_jira(raw.get("jira"))
     jenkins = _parse_jenkins(raw.get("jenkins"))
+    deslopify = _parse_deslopify(raw.get("deslopify"))
     teams = _parse_teams(raw.get("teams"))
     gamification = raw.get("gamification") or {}
     if not isinstance(gamification, dict):
         raise ConfigError("gamification: expected a mapping")
 
-    skills = _check_pipelines(skills, jenkins)
+    skills = _check_pipelines(skills, jenkins, deslopify)
     _check_analysis_wiring(jenkins, skills)
+    _check_deslopify_wiring(deslopify, skills, jenkins)
 
     return Config(
         gitlab=GitLabSettings(projects=projects, poll_interval_minutes=poll_interval),
@@ -1232,6 +1418,7 @@ def load_config(path: str | Path) -> Config:
         teams=teams,
         gamification=gamification,
         jenkins=jenkins,
+        deslopify=deslopify,
     )
 
 

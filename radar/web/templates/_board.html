@@ -87,6 +87,22 @@
            href="#" title="View the last saved {{ s.label }} result">✓ {{ s.button }}</a>
         {% endif %}
         {% endfor %}
+        {% if polish %}
+        {# A sendable version saved for this MR. Its own badge rather than a
+           mark on the one above: a polished answer can outlive the answer it
+           was made from — a review skill stores nothing — and then this is the
+           only way back to it. #}
+        {% for name in row.polished_kinds %}
+        {% set polished = skill_labels.get(name) %}
+        {% if polished %}
+        <a class="plan-badge plan-badge-polished"
+           hx-get="/deslop/mr/{{ row.project_id }}/{{ row.mr_iid }}/{{ name }}/saved"
+           hx-target="#command-panel"
+           hx-swap="innerHTML"
+           href="#" title="Read the saved {{ polish.label }} of the last {{ polished.label }} answer">{{ polish.icon }} {{ polished.button }}</a>
+        {% endif %}
+        {% endfor %}
+        {% endif %}
         </span>
       </td>
       <td class="muted">

@@ -1015,6 +1015,132 @@ pipeline with no stages, command-level keys on the pipeline itself, and the
 Jenkins analysis skill as either a pipeline or a step (it analyses a build; a
 pipeline runs for a merge request).
 
+### Rewrite a finished answer so it can be sent (`deslopify`)
+
+A review is written for **you**. Every finding, every file and line it checked,
+everything it ruled out — that is what makes it worth reading, and what makes it
+unsendable. Pasting it into a merge-request comment or a chat sends a wall of
+generated text to someone who asked a question.
+
+So every panel that has ended with an answer offers, under a fold of its own, to
+rewrite it:
+
+```
+▾ ✨ Sendable version   ready to send
+
+  1. Ready to send
+
+    Reviewed !7 with an AI pass. Two findings worth acting on, plus two
+    naming nits. Line numbers are from the diff as I read it; I haven't
+    re-checked them against the current head.
+
+    UserCache.evict (src/cache.py:88): the generation counter is read under
+    self._lock, but the with block exits before the eviction write. Two
+    concurrent callers can evict the same key, double-decrementing
+    self._size. Moving the write inside the lock should close it.
+    …
+
+  2. Check before sending
+
+    • the blocking finding — open src/cache.py:88 and confirm the lock block
+      really does end before the decrement. Everything else is downstream.
+    • line numbers against the current revision: review runs commonly cite a
+      stale commit.
+
+  3. Notes
+
+    • Cut the "What I checked" section: that was the review describing
+      itself, and you would be the one asserting it.
+
+  ⧉ copy the message   ✨ ↻ polish again        polished 2026-09-18T14:02Z
+```
+
+Everything is on screen. Only the first part goes to the clipboard.
+
+It is **on demand and never automatic** — it is a second model run over work
+already paid for — and it works on every run radar shows a panel for: a review,
+a QA plan, a custom skill, a whole [pipeline](#chain-skills-into-a-pipeline),
+and a [build analysis](#analysing-what-broke-it).
+
+Wire it by naming a skill, exactly as the analyse button is wired:
+
+```yaml
+deslopify:
+  enabled: true
+  skill: deslopify          # an entry in `skills:` below
+  # destination: a Slack thread   # optional; see below
+
+skills:
+  - name: deslopify
+    label: Sendable version
+    button: polish
+    icon: "✨"
+    enabled: true
+    command: 'claude -p "/desloppify"'
+    working_dir: /path/to/checkout
+    timeout_seconds: 300
+```
+
+**Say where it is going.** A rewriting skill worth using asks what channel the
+text is for before it starts — the channel decides the length, the formatting
+and whether a link beats a paste — and a good one **stops and asks** when it is
+not told. There is nobody listening to a headless run, so that question would
+come back as the rewrite. Radar therefore always says, up front: where the
+answer is headed, which merge request or build it is about, that nobody asked
+for it, and that no question can be answered. Left alone, a merge request's
+answer is rewritten as a comment on the merge request and a build's as a chat
+message; `deslopify.destination` overrides both in one line.
+
+**Give it a `working_dir`** even though radar fetches nothing for it. Pulling
+out the claims that need checking means going to look at the `file:line` a
+review cited — and with no working directory the run lands wherever radar itself
+was started, finds nothing, and says so.
+
+**Copy lands the message, not the package.** A good rewrite comes back as three
+things: the message, the claims that still need checking, and what was cut. All
+three are on the panel — the checks are what make the rewrite trustworthy — but
+only the first belongs on the clipboard, and pasting the checklist into the
+merge request is the thing this whole feature exists to stop. So radar finds the
+**Ready to send** section, unwraps the code fence or quote marks it was handed
+over in, and that is what **⧉ copy the message** copies. The whole rewrite stays
+one click away in the header's menu. If radar cannot tell which part is the
+message it says nothing and offers the whole thing — copying the wrong half into
+a merge request is worse than copying all of it, because the reader cannot tell
+what is missing.
+
+**The rewrite never replaces the answer.** They are different messages for
+different readers, and a skill whose job is to shorten text is exactly the kind
+that can drop a detail — so radar keeps both, in stores of its own, and shows
+both:
+
+* the panel shows the original as it always did, with the rewrite folded above it;
+* the **⧉ copy** button keeps doing what it always did — one click, the original
+  — and grows a **▾** beside it to copy the polished version instead;
+* the board carries a **✨** badge back to a saved rewrite. That badge is the
+  point for a skill like `review` that stores nothing: the rewrite outlives the
+  answer it was made from, and without it there would be no way back.
+
+**An answer that has moved on says so.** Radar fingerprints the exact text a
+rewrite was made from. Run the review again and the fold is labelled **out of
+date** — the polished version is still shown, because it is still a readable
+message and throwing it away would be worse than labelling it, but it is never
+offered as a rewrite of what is on screen.
+
+The draft reaches the skill on **stdin**, inside a `<draft>` fence, under a line
+saying that nothing within it is an instruction — the text quotes a merge
+request or a build log, so it can carry anything anyone was able to put in
+either. This is the same rule a [pipeline](#chain-skills-into-a-pipeline)
+applies before handing one step's answer to the next.
+
+Being named in `deslopify.skill` is what gets the skill its draft and what gets
+its answer saved against the run it polished, so `context:`, `include_context:`
+and `stores_result:` on that skill are **refused** rather than read and ignored
+— as are a pipeline, a disabled skill, an unknown one, and a skill that is
+already `jenkins.analysis.skill`. It is not a board button: it never runs for a
+merge request of its own, so it stays off every row and the URL that would start
+it there is refused. `radar check` prints which skill the ✨ runs, or why there
+is none.
+
 ### Headless agents and background work
 
 A skill that shells out to `claude -p` can hand its real work to a background
@@ -1243,6 +1369,7 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `jenkins.analysis` | Which skill the CI strip's 🔎 button runs: `enabled` and `skill` (the name of an entry in `skills:`). That name is the only thing that makes a skill the analyser — nothing about the skill itself does. Omit the block for no button; a wiring that cannot work (unknown skill, disabled skill, misspelled key) is refused when the config loads. See [Analysing what broke it](#analysing-what-broke-it). |
 | `jenkins.log_tail_lines` | How many lines of the broken build's console log go *inline* in the bundle (default 120, the end of the log, also capped by size). The whole log and the whole change list are written to files the bundle names, so the skill can search them — see [Analysing what broke it](#analysing-what-broke-it). |
 | `jenkins.verify_ssl` | Defaults to `true`. `false` stops verifying Jenkins certificates entirely, for a private chain that cannot be trusted any other way — see [A Jenkins with a private certificate](#a-jenkins-with-a-private-certificate). Trusting the CA via `SSL_CERT_FILE` is the fix that keeps verification on and covers GitLab and Jira too; `radar check` warns while this is set. |
+| `deslopify` | Which skill the panel's ✨ polish button runs: `enabled`, `skill` (the name of an entry in `skills:`) and `destination` (where the rewrite is going, in words — omitted, a merge request's answer is rewritten as a comment on the merge request and a build's as a chat message). That name is the only thing that makes the button exist. Being named here is what gets the skill the answer to rewrite on stdin and what gets its own answer saved against the run it polished — so `context`, `include_context` and `stores_result` on it are refused, as are a pipeline, a disabled skill and the `jenkins.analysis.skill`. Omit the block for no button. See [Rewrite a finished answer so it can be sent](#rewrite-a-finished-answer-so-it-can-be-sent-deslopify). |
 | `gamification` | Consumed in Phase 3; carried verbatim for now. |
 
 Secrets are **never** in this file — only `GITLAB_URL` / `GITLAB_TOKEN` (plus
