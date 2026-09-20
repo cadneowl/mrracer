@@ -311,6 +311,7 @@ skills:
     command: 'claude -p "/code-review {web_url}"' # e.g. a Claude Code skill, headless
     working_dir: /path/to/checkout                # optional; where to run it
     timeout_seconds: 600                          # budget for the whole job
+    timeout_grace_seconds: 300                    # …then ask, before stopping it
 ```
 
 Every skill lives in the `skills:` list — that is the only place they are
@@ -321,6 +322,48 @@ declared. `review` and `qa` are ordinary entries whose **names** carry defaults
 checkout and fetching the MR's context both talk to the network and are spent
 from the same clock, so a job can never outlast its budget — a hung fetch fails
 it rather than leaving the panel tailing a job that will never end.
+
+##### Running out of time is a question, not a verdict
+
+A run killed on the stroke of its deadline takes everything it did with it. Forty
+minutes of review, three dollars of model time, and the only way back is to pay
+for all of it again — because the process is gone and there is nothing left to
+resume. Held for five more minutes instead, it usually finishes.
+
+So that is what radar does. When the budget runs out the run is **not** killed:
+it is held, the panel says so in amber, and the row offers **＋ 10 min**.
+
+```
+AI review   ⏳ out of time after 43m   still running — 4m to give it more time
+                                      before it is stopped and its work is lost
+                                      ＋ 10 min   ■ stop
+```
+
+Answer and it carries on. Answer again later and it carries on again — the
+button has no limit, because a person clicking it is a person deciding. Say
+nothing and after `timeout_grace_seconds` it ends exactly as it used to: stopped,
+failed, and keeping whatever it had written, with the error saying it was held
+and nobody answered.
+
+The cost is honest and worth stating: **a held run is still running and still
+spending.** That is the trade — five minutes of one model's time against losing
+forty. `timeout_grace_seconds: 0` turns the hold off and the deadline is the
+deadline again, exactly as it behaved before.
+
+The same **＋ 10 min** sits on every running row from the start, not only once
+time has run out, so a countdown getting short while a review is plainly
+mid-thought is one click rather than a race. It is on a plain skill, on each step
+of a pipeline, and on a build analysis — everywhere radar runs a skill — and a
+pipeline gets one more, **＋ 10 min for every step**, because a stage of three
+reviews that ran out together is one decision. Time given to a step lengthens the
+pipeline's own countdown too, so the panel's clock keeps telling the truth about
+a run someone deliberately extended.
+
+Two things the hold deliberately does not cover. A **context fetch** that hangs
+still fails on the job's own deadline — there is no work to save, only a socket
+with nobody on it. And a pipeline has no hold of its own: `timeout_grace_seconds`
+is refused on a `pipeline:` entry, because its steps own the clocks and so they
+own what happens when one runs out.
 
 Placeholders filled from the MR: `{web_url}`, `{mr_iid}`, `{project_id}`,
 `{source_branch}`, `{target_branch}`, `{title}`, `{author}`, `{head_sha}`, plus
@@ -927,8 +970,10 @@ again from the board instead.
 
 **Budget.** `timeout_seconds` is worked out for you — the slowest step of each
 stage, summed. Each step is stopped by its own timeout and nothing stops it
-sooner, so that sum is the longest a run can take, and it is what the panel's
-countdown shows. Set `timeout_seconds` higher if you like; a lower figure is
+sooner, so that sum is the longest a run can take *if nobody gives a step more
+time* (see [Running out of time is a
+question](#running-out-of-time-is-a-question-not-a-verdict)), and it is what the
+panel's countdown shows. Set `timeout_seconds` higher if you like; a lower figure is
 refused.
 
 **Progress.** The panel streams every step's live log, each line prefixed with
@@ -1188,8 +1233,9 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `slas` | Ordered rules; **first match wins**. Each has a `match` (optional `target_branch` glob and/or required `labels`) and `first_response_business_hours` / `approval_business_hours`. The last rule must be the default `match: {}`. |
 | `slas[].assignment_business_hours` | Optional budget for getting **any** reviewer onto an MR that has none — the [NO REVIEWERS](#mrs-with-no-reviewers) chip. Omitted everywhere, the check is off. Set it on **every** rule or none: first match wins outright, so a partial config would silently skip MRs matching the rules that lack it (radar refuses to load one). |
 | `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is **currently** a draft, or the MR carries any `labels` listed here. (Only the current draft state waives; historical draft periods are not subtracted from the clock.) |
-| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `env`, `env_unset`. The names `review`, `qa` and `analyze` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
+| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `timeout_grace_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `env`, `env_unset`. The names `review`, `qa` and `analyze` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
 | `skills[].context` | Which backends radar fetches for the skill and pipes to it on stdin: `gitlab_diff`, `jira`, or a list. Only about merge-request skills — the CI strip's analyser is given the build's commits and log because [`jenkins.analysis.skill`](#analysing-what-broke-it) names it, and setting `context:` on that skill is refused rather than ignored. |
+| `skills[].timeout_grace_seconds` | How long a run that has used up its `timeout_seconds` is **held** — still alive, still spending — for someone to give it more time before it is stopped. Default 300; `0` stops it on its deadline as radar used to. The panel's **＋ 10 min** grants time at any point while a run works, on a plain skill, on each step of a pipeline and on a build analysis. Refused on a `pipeline:` entry: its steps own the clocks. See [Running out of time is a question](#running-out-of-time-is-a-question-not-a-verdict). |
 | `skills[].env` / `skills[].env_unset` | Extra environment for that skill's subprocess, and names it must not inherit. Values export as written; a valueless key is refused (use `env_unset`). radar's own credentials are stripped and refused in both, in any case spelling. radar exports `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` to every skill unless you exported one yourself — the second removes the CLI's own 10-minute background-agent cutoff, leaving `timeout_seconds` as the only clock. See [Headless agents and background work](#headless-agents-and-background-work). |
 | `jira` | `base_url` (builds the `PROJ-123` browse links on the board) and `project_keys` (optional filter so `UTF-8`-shaped tokens aren't matched). Not a credential — fetching a ticket uses `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` from the environment. |
 | `teams` | Named GitLab-username groups; each becomes an *authored* / *to review* filter pill on the board. |

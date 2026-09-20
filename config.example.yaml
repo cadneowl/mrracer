@@ -224,6 +224,14 @@ skills:
     # same clock, so a job can never outlast it. A slow fetch shortens what the
     # command gets rather than being added on top.
     timeout_seconds: 600
+    # What happens when that budget runs out. Rather than being killed on the
+    # stroke of the deadline — which throws away everything the run has done, and
+    # on a long review that is forty minutes and real money — the run is HELD for
+    # this long: still alive, still spending, with the panel saying so in amber
+    # and offering "+ 10 min". Answer and it carries on; say nothing and it ends
+    # exactly as it used to, a few minutes later, keeping what it wrote.
+    # 0 makes the deadline the deadline again.
+    timeout_grace_seconds: 300
     # env / env_unset: what THIS skill's subprocess gets on top of radar's own
     # environment, and what it must not inherit. Values are exported as written
     # (`true` stays `true`); a key with no value is refused rather than guessed

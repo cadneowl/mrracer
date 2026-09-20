@@ -101,6 +101,18 @@ _CI_TICK_S = 15
 # trajectory does not change meaningfully between one second and the next.
 _AI_TICK_S = 5
 
+# What one click of "+ more time" is worth. Ten minutes rather than the budget
+# again: a review whose budget is forty minutes does not need another forty to
+# finish its last finding, the button can be clicked twice, and a number the
+# reader can predict beats one that scales with something they would have to
+# look up. The route takes any figure, so a bookmark can grant a different one.
+_EXTEND_S = 600
+
+# The most one request may grant. A ceiling rather than no ceiling because this
+# is a URL: the button posts ten minutes, and a hand-written request should not
+# be able to turn a run's budget into a week by mistyping a number.
+_MAX_EXTEND_S = 24 * 3600
+
 
 def _remaining_s(job: CommandJob | None, status: str | None = None) -> int | None:
     """Seconds left of a running job's budget, or None if it has no clock left
@@ -116,13 +128,21 @@ def _remaining_s(job: CommandJob | None, status: str | None = None) -> int | Non
         return None
     if (status if status is not None else job.status) != "running":
         return None
-    return max(0, int(job.started_mono + job.budget_s - time.monotonic()))
+    # `extra_s` included: a run that has been given more time has more time, and
+    # a countdown that still showed the original budget would have the panel
+    # saying 0:00 through work somebody deliberately paid to continue.
+    return max(0, int(job.started_mono + job.budget_s + job.extra_s - time.monotonic()))
 
 
 def _clock_text(remaining_s: int | None) -> str:
     """"7:03 left", rendered server-side so the pill is never a blank box."""
     if remaining_s is None:
         return ""
+    if remaining_s <= 0:
+        # Not "0:00 left", which reads as a clock that has stopped ticking on a
+        # run that is still going. The rows say what is actually happening and
+        # what the choice is; this only has to stop contradicting them.
+        return "out of time"
     return f"{remaining_s // 60}:{remaining_s % 60:02d} left"
 
 
@@ -588,13 +608,25 @@ def _stats_groups(stats: RunStats) -> list[dict]:
     return groups
 
 
-def _health_row(job: CommandJob, name: str, label: str, step: str | None, now: float) -> dict:
+def _health_row(
+    job: CommandJob, name: str, label: str, step: str | None, now: float, grace: float = 0.0
+) -> dict:
     """One row of the panel's who-is-doing-what table (see _job_health.html)."""
-    health = job_health(job, now)
+    health = job_health(job, now, grace)
     status, elapsed = health["status"], _duration(health["elapsed_s"])
     if status == "running":
         state_text = f"running {elapsed}"
-        if health["stalled"]:
+        if health["out_of_time"]:
+            # The one state the panel exists to be read in. Said over the stall
+            # warning and over whatever the run last did, because it is the only
+            # one with a deadline of its own: when `decide_s` runs out the run is
+            # killed and everything it has done goes with it.
+            state_text = f"⏳ out of time after {elapsed}"
+            note = (
+                f"still running — {_duration(health['decide_s'])} to give it more "
+                "time before it is stopped and its work is lost"
+            )
+        elif health["stalled"]:
             note = (
                 f"⚠ only waiting for {_duration(health['idle_s'])} — "
                 f"last: {health['waiting_on']}"
@@ -603,6 +635,8 @@ def _health_row(job: CommandJob, name: str, label: str, step: str | None, now: f
             note = f"waiting: {health['waiting_on']}"
         else:
             note = health["last_line"]
+        if health["granted_s"] and not health["out_of_time"]:
+            state_text += f" (+{_duration(health['granted_s'])} given)"
     elif status == "done":
         state_text, note = f"✓ done in {elapsed}", ""
     else:
@@ -622,6 +656,13 @@ def _health_row(job: CommandJob, name: str, label: str, step: str | None, now: f
         # A session is resumed from the directory it ran in, or it isn't found.
         "resume": f"cd {job.cwd} && {resume}" if job.cwd else resume,
         "can_stop": status == "running",
+        # Anything still running can be given more time, not only a run that has
+        # already run out: a countdown getting short while a review is plainly
+        # mid-thought is exactly when to say "carry on", and saying it early
+        # costs nothing — an unused grant is unused time.
+        "can_extend": status == "running",
+        "out_of_time": health["out_of_time"],
+        "extend_minutes": _EXTEND_S // 60,
         # Any step of a finished pipeline that actually ran can be run again —
         # the one that failed, and the one that succeeded and answered badly.
         # A review that missed the point is not a failure radar can detect, and
@@ -670,7 +711,8 @@ def _health_rows(runner, job: CommandJob, now: float | None = None) -> list[dict
     plain skill's job."""
     now = time.monotonic() if now is None else now
     if not isinstance(runner, PipelineRunner):
-        return [_health_row(job, runner.kind, runner.config.label, None, now)]
+        return [_health_row(job, runner.kind, runner.config.label, None, now,
+                            runner.config.timeout_grace_seconds)]
     rows = []
     # What a retry replaced, kept beside the attempt that replaced it. The
     # total below these rows counts it — it was paid for — so leaving it out
@@ -690,7 +732,8 @@ def _health_rows(runner, job: CommandJob, now: float | None = None) -> list[dict
             child = job.steps.get(name)
             rows.extend(_spent_row(record) for record in earlier.get(name, ()))
             if child is not None:
-                row = _health_row(child, name, label, name, now)
+                row = _health_row(child, name, label, name, now,
+                                  runner.steps[name].config.timeout_grace_seconds)
                 row["can_retry"] = row["can_retry"] and not running
                 if row["can_retry"]:
                     row["retry_again"] = _retry_again(runner, job, index)
@@ -701,6 +744,7 @@ def _health_rows(runner, job: CommandJob, now: float | None = None) -> list[dict
                 "state_text": "pending",
                 "note": "" if running else "did not run",
                 "stalled": False, "session_id": "", "resume": "", "can_stop": False,
+                "can_extend": False, "out_of_time": False, "extend_minutes": 0,
                 "can_retry": False, "retry_text": "", "retry_again": "", "stats": None,
             })
     return rows
@@ -746,6 +790,9 @@ def _spent_row(record: dict) -> dict:
         "session_id": session,
         "resume": f"claude --resume {session}",
         "can_stop": False,
+        "can_extend": False,
+        "out_of_time": False,
+        "extend_minutes": 0,
         "can_retry": False,
         "retry_text": "",
         "retry_again": "",
@@ -899,6 +946,8 @@ def create_app(
                 "rows": rows,
                 "live": False,
                 "stop_all": False,
+                "extend_all": False,
+                "extend_minutes": 0,
                 "total": _stats_view(job.stats) if rows else None,
             }
 
@@ -1129,6 +1178,9 @@ def create_app(
             "rows": _health_rows(runner, job),
             "live": running,
             "stop_all": running and isinstance(runner, PipelineRunner),
+            # One decision for a stage of three reviews that ran out together.
+            "extend_all": running and isinstance(runner, PipelineRunner),
+            "extend_minutes": _EXTEND_S // 60,
             # A pipeline's steps each say what they spent; this is the bill for
             # the whole run, and it moves with this fragment's own refresh.
             "total": _stats_view(job.stats) if isinstance(runner, PipelineRunner) else None,
@@ -1184,6 +1236,36 @@ def create_app(
                 "a finished run that this radar started",
             )
         return _panel(request, job)
+
+    @app.post("/{kind}/extend/{job_id}", response_class=HTMLResponse)
+    def extend_job(
+        request: Request, kind: str, job_id: str,
+        step: str | None = None, seconds: int = _EXTEND_S,
+    ):
+        """Give a running job more time — one step of a pipeline, or all of them.
+
+        Answers with the health rows, which is where the countdown and the state
+        that changed both live, and which the browser is refreshing anyway. The
+        grant is a number of seconds so a bookmark can ask for a different one;
+        the panel's button asks for `_EXTEND_S`.
+        """
+        job = _running_job(kind, job_id)
+        runner = runners[kind]
+        if step is not None and (
+            not isinstance(runner, PipelineRunner) or step not in runner.steps
+        ):
+            raise HTTPException(status_code=404, detail=f"{kind} has no step named {step!r}")
+        if seconds <= 0 or seconds > _MAX_EXTEND_S:
+            raise HTTPException(
+                status_code=400,
+                detail=f"seconds must be between 1 and {_MAX_EXTEND_S}",
+            )
+        # False when it had already ended; the rows returned say so either way,
+        # exactly as they do for a stop that arrived a moment too late.
+        runner.extend(job_id, seconds, step)
+        return templates.TemplateResponse(
+            request, "_job_health.html", _health_context(kind, job)
+        )
 
     @app.post("/{kind}/stop/{job_id}", response_class=HTMLResponse)
     def stop_job(request: Request, kind: str, job_id: str, step: str | None = None):

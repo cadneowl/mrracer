@@ -351,3 +351,40 @@ def test_credentials_present(monkeypatch):
     url, token = gitlab_credentials()
     assert url == "https://gitlab.example.com"
     assert token == "secret-token"
+
+
+def test_the_hold_before_a_timeout_is_configurable(tmp_path):
+    """How long a run that is out of time is held before it is stopped."""
+    text = VALID + (
+        "\nskills:\n"
+        "  - name: review\n    command: 'mytool'\n    timeout_seconds: 60\n"
+        "  - name: qa\n    command: 'mytool'\n    timeout_grace_seconds: 0\n"
+        "  - name: db\n    command: 'mytool'\n    timeout_grace_seconds: 900\n"
+    )
+    cfg = load_config(_write(tmp_path, text))
+
+    # Held by default: a run killed on its deadline loses everything it did, and
+    # one held for a few minutes might not.
+    assert cfg.skill_by_name("review").timeout_grace_seconds == 300
+    assert cfg.skill_by_name("qa").timeout_grace_seconds == 0      # off means off
+    assert cfg.skill_by_name("db").timeout_grace_seconds == 900
+
+
+def test_a_hold_that_makes_no_sense_is_refused(tmp_path):
+    text = VALID + (
+        "\nskills:\n  - name: review\n    command: 'mytool'\n"
+        "    timeout_grace_seconds: -5\n"
+    )
+    with pytest.raises(ConfigError, match="timeout_grace_seconds"):
+        load_config(_write(tmp_path, text))
+
+
+def test_a_pipeline_has_no_hold_of_its_own(tmp_path):
+    """Its steps own the clocks, so they own what happens when one runs out."""
+    text = VALID + (
+        "\nskills:\n  - name: arch\n    command: 'mytool'\n"
+        "  - name: full\n    enabled: true\n    timeout_grace_seconds: 600\n"
+        "    pipeline: [arch]\n"
+    )
+    with pytest.raises(ConfigError, match="timeout_grace_seconds"):
+        load_config(_write(tmp_path, text))

@@ -55,6 +55,12 @@ def _until(predicate, limit=20.0):
         time.sleep(0.05)
 
 
+def _await(runner, job, limit=20.0):
+    """The job, once it has reached a terminal state."""
+    _until(lambda: runner.get(job.id).status != "running", limit)
+    return runner.get(job.id)
+
+
 # --- working or waiting ----------------------------------------------------
 
 
@@ -134,6 +140,97 @@ def test_a_stalled_row_says_how_long_and_on_what():
     assert "only waiting for 10m" in row["note"]
     assert "Wait 90 more seconds" in row["note"]
     assert row["resume"] == "cd /src/hub-backend && claude --resume 944faa5b-3a9f-41af"
+
+
+# --- out of time, and being given more -------------------------------------
+
+
+def test_a_run_out_of_time_is_held_rather_than_killed():
+    """The whole point: a deadline is no longer the end of the work.
+
+    A review killed on the stroke of its budget takes forty minutes of work with
+    it and the only way back is to pay for all of it again. Held instead, it
+    finishes — and the thing that was about to be thrown away is the answer.
+    """
+    code = "import time; print('working', flush=True); time.sleep(3); print('done')"
+    runner = CommandRunner(
+        SkillConfig(name="review", command=f'{PY} -c "{code}"',
+                    timeout_seconds=1, timeout_grace_seconds=30),
+        "review",
+    )
+    job = runner.start({"project_id": 1, "mr_iid": 2})
+    done = _await(runner, job, limit=30)
+
+    assert done.status == "done", done.error
+    assert "done" in done.output
+    assert any("out of time" in item["text"] for item in done.progress), (
+        "and it said so while it was being held"
+    )
+
+
+def test_a_held_run_nobody_answers_ends_as_it_always_did():
+    """The hold is bounded. Nobody there, and it fails — a few minutes later,
+    with what it wrote, and saying it could have been saved."""
+    code = "import time; print('half an answer', flush=True); time.sleep(60)"
+    runner = CommandRunner(
+        SkillConfig(name="review", command=f'{PY} -c "{code}"',
+                    timeout_seconds=1, timeout_grace_seconds=2),
+        "review",
+    )
+    done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}), limit=30)
+
+    assert done.status == "error"
+    assert "timed out" in done.error
+    assert "held for 2s" in done.error and "nobody gave it more time" in done.error
+    assert "half an answer" in done.output, "and what it wrote is still kept"
+
+
+def test_a_run_still_inside_its_budget_can_be_given_more_time():
+    """Not only at the deadline: a countdown getting short while a review is
+    plainly mid-thought is exactly when to say carry on."""
+    code = "import time; print('working', flush=True); time.sleep(3); print('done')"
+    runner = CommandRunner(
+        SkillConfig(name="review", command=f'{PY} -c "{code}"',
+                    timeout_seconds=2, timeout_grace_seconds=0),   # no hold to fall back on
+        "review",
+    )
+    job = runner.start({"project_id": 1, "mr_iid": 2})
+    _until(lambda: "working" in job.output or job.progress, limit=10)
+    assert runner.extend(job.id, 30) is True
+
+    done = _await(runner, job, limit=30)
+    assert done.status == "done", done.error
+    assert "done" in done.output
+    assert done.extra_s == 30
+
+    # And nothing to give it once it has ended.
+    assert runner.extend(job.id, 30) is False
+    assert runner.extend("no-such-job", 30) is False
+    assert runner.extend(job.id, 0) is False
+
+
+def test_a_held_row_says_what_the_choice_is_and_how_long_there_is_to_make_it():
+    runner = CommandRunner(
+        SkillConfig(name="review", label="AI review", command="x",
+                    timeout_seconds=600, timeout_grace_seconds=300),
+        "review",
+    )
+    job = _running_job()
+    job.started_mono -= 600
+    job.out_of_time_mono = time.monotonic() - 60      # held a minute ago
+    [row] = _health_rows(runner, job)
+
+    assert row["out_of_time"] and row["can_extend"] and row["can_stop"]
+    assert "out of time after 10m" in row["state_text"]
+    assert "to give it more time" in row["note"] and "its work is lost" in row["note"]
+    # The seconds left to decide in, counted down rather than called "soon".
+    left = job_health(job, grace=300)["decide_s"]
+    assert 230 <= left <= 240, left
+
+    # Given more, it is no longer out of time and says what it was given.
+    runner._grant(job, 600)
+    [row] = _health_rows(runner, job)
+    assert not row["out_of_time"] and "+10m given" in row["state_text"]
 
 
 # --- stopping --------------------------------------------------------------
@@ -226,6 +323,13 @@ skills:
 """
 
 
+def _clock_seconds(panel: str) -> int:
+    """The countdown the panel is showing, in seconds."""
+    found = re.search(r"(\d+):(\d\d) left", panel)
+    assert found, "the panel should be showing a countdown"
+    return int(found.group(1)) * 60 + int(found.group(2))
+
+
 def _app(tmp_path):
     script = tmp_path / "step.py"
     script.write_text(_STEP, encoding="utf-8")
@@ -277,7 +381,48 @@ def test_the_panel_shows_every_step_and_stops_one(tmp_path):
     assert client.get("/full/health/nope").status_code == 404
 
 
-@pytest.mark.parametrize("name", ["stop", "health"])
+def test_the_panel_gives_more_time_to_one_step_and_to_all_of_them(tmp_path):
+    """From the browser's side, on a pipeline: the offer is on every running row
+    and once more for the stage, and it is what moves the clock.
+
+    Asserted through the panel and the rows, because that is all an operator
+    has: the grant is only real if it shows up in what the next refresh draws.
+    """
+    client = _app(tmp_path)
+    panel = client.post("/full/1/7").text
+    job_id = re.search(r'data-job-id="([0-9a-f]+)"', panel).group(1)
+    _until(lambda: "ARCH review" in client.get(f"/full/health/{job_id}").text)
+
+    health = client.get(f"/full/health/{job_id}").text
+    assert f'hx-post="/full/extend/{job_id}?step=arch"' in health
+    assert f'hx-post="/full/extend/{job_id}"' in health, "and one for the whole stage"
+    assert "＋ 10 min" in health
+    before = _clock_seconds(client.get(f"/full/status/{job_id}").text)
+
+    assert client.post(f"/full/extend/{job_id}?step=arch").status_code == 200
+    assert "(+10m given)" in client.get(f"/full/health/{job_id}").text
+
+    # The pipeline's own countdown follows its steps', so the panel's clock does
+    # not sit at 0:00 through work somebody deliberately paid to continue.
+    _until(lambda: _clock_seconds(client.get(f"/full/status/{job_id}").text) > before + 500)
+
+    # Every step running now, in one click — dba has finished and synth has not
+    # started, so that is arch, again.
+    client.post(f"/full/extend/{job_id}")
+    assert "(+20m given)" in client.get(f"/full/health/{job_id}").text
+
+    # A step that is not this pipeline's, and figures nobody meant.
+    assert client.post(f"/full/extend/{job_id}?step=nope").status_code == 404
+    assert client.post(f"/full/extend/{job_id}?seconds=0").status_code == 400
+    assert client.post(f"/full/extend/{job_id}?seconds=999999").status_code == 400
+    assert client.post("/full/extend/nope").status_code == 404
+
+    client.post(f"/full/stop/{job_id}")
+
+
+@pytest.mark.parametrize(
+    "name", ["stop", "health", "status", "stream", "close", "stored", "retry", "stats", "extend"]
+)
 def test_the_panel_routes_are_reserved_names(tmp_path, name):
     path = tmp_path / "config.yaml"
     path.write_text(

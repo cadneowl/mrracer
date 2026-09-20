@@ -843,6 +843,17 @@ class CommandJob:
     ended_mono: float = 0.0
     # Set from the panel; only the worker that owns the process acts on it.
     stop_requested: threading.Event = field(default_factory=threading.Event)
+    # Time granted after the fact, in seconds: the worker re-reads it every
+    # second, so it moves the deadline of a run already under way (see
+    # `CommandRunner.extend`). Written from a request thread, read by the
+    # worker — one float, assigned whole, never incremented from both sides.
+    extra_s: float = 0.0
+    # When the budget ran out with the run still going, on the monotonic clock.
+    # While this is set the run is being held rather than killed: it has spent
+    # its budget, and whoever is watching has `timeout_grace_seconds` to give it
+    # more before the worker does what it used to do at the deadline. Cleared by
+    # an extension, so a run given more time is no longer out of time.
+    out_of_time_mono: float = 0.0
     # A pipeline's steps as they start, by step name (see `pipeline`).
     steps: dict[str, CommandJob] = field(default_factory=dict)
     # What earlier attempts of a step spent, kept when a retry replaces the
@@ -911,11 +922,17 @@ def request_stop(job: CommandJob) -> bool:
     return True
 
 
-def job_health(job: CommandJob, now: float | None = None) -> dict:
-    """How a job is doing, as numbers the panel phrases (see ``web.app``)."""
+def job_health(job: CommandJob, now: float | None = None, grace: float = 0.0) -> dict:
+    """How a job is doing, as numbers the panel phrases (see ``web.app``).
+
+    ``grace`` is the skill's ``timeout_grace_seconds``, needed only to say how
+    long is left to answer a run that is out of time: the job knows when its
+    budget ran out, and the config knows how long the answer may take.
+    """
     now = time.monotonic() if now is None else now
     running = job.status == "running"
     idle = max(0.0, now - (job.last_work_mono or job.started_mono)) if running else 0.0
+    held = running and bool(job.out_of_time_mono)
     return {
         "status": job.status,
         "elapsed_s": int(max(0.0, (job.ended_mono or now) - job.started_mono)),
@@ -924,6 +941,12 @@ def job_health(job: CommandJob, now: float | None = None) -> dict:
         "waiting_on": job.waiting_on if job.waits_since_work else "",
         "session_id": job.session_id,
         "last_line": job.progress[-1]["text"] if job.progress else "",
+        # Out of time and still alive, waiting to be told whether to carry on.
+        # The seconds are what is left to decide in, so the panel can count it
+        # down rather than saying "soon".
+        "out_of_time": held,
+        "decide_s": max(0, int(grace - (now - job.out_of_time_mono))) if held else 0,
+        "granted_s": int(job.extra_s),
     }
 
 
@@ -1338,18 +1361,20 @@ class CommandRunner:
         wait_until = time.monotonic() + remaining
         timed_out = stopped = False
         # Waited in slices of a second so a stop from the panel is acted on at
-        # once. The request only sets a flag; the kill still happens here.
+        # once — and so the deadline can move while the run is under way: both
+        # the flag and the grant are read here, on every slice, and nothing else
+        # acts on either. The request only asks; the kill still happens here.
         while True:
-            left = wait_until - time.monotonic()
+            left = wait_until + job.extra_s - time.monotonic()
             # poll() first: a child that exited just as the stop arrived is a
             # finished run, not a stopped one.
             if job.stop_requested.is_set() and proc.poll() is None:
                 stopped = True
-            elif left <= 0:
+            elif left <= 0 and not self._held_for_an_answer(job):
                 timed_out = True
             else:
                 try:
-                    proc.wait(timeout=min(left, 1.0))
+                    proc.wait(timeout=min(max(left, 0.0), 1.0) or 1.0)
                     break
                 except subprocess.TimeoutExpired:
                     continue
@@ -1411,7 +1436,22 @@ class CommandRunner:
             # Keep what the run did manage to say. A long review that ran out of
             # clock is more use half-written than replaced by the word "timeout".
             job.output = output
-            detail = f"{self.kind} timed out after {self.config.timeout_seconds}s"
+            spent = self.config.timeout_seconds + int(job.extra_s)
+            detail = f"{self.kind} timed out after {spent}s"
+            if job.extra_s:
+                detail += (
+                    f" ({self.config.timeout_seconds}s of budget and "
+                    f"{int(job.extra_s)}s more that was granted)"
+                )
+            if job.out_of_time_mono:
+                # It was held at the deadline and nobody answered. Said plainly,
+                # because the next question is always whether it could have been
+                # saved, and this is the answer: yes, and here is the knob.
+                detail += (
+                    f". It was held for {self.config.timeout_grace_seconds}s first and "
+                    "nobody gave it more time — raise timeout_seconds, or click "
+                    "+ more time on the panel next time"
+                )
             if stats.get("async_agent"):
                 detail += (
                     " while a background agent it launched was still working "
@@ -1460,6 +1500,63 @@ class CommandRunner:
         else:
             detail = stderr_text.strip() or output or f"exited with code {proc.returncode}"
             _fail(job, detail.strip())
+
+    def _held_for_an_answer(self, job: CommandJob) -> bool:
+        """Whether a run that is out of time is being held rather than killed.
+
+        The moment the budget runs out radar has a choice, and until now it made
+        the one that costs most: kill the process, and with it everything the run
+        had done — a review forty minutes deep, whose only way back is to pay for
+        all forty again. So the run is held instead. It is still alive and still
+        spending, the panel says so and offers to extend it, and if nobody
+        answers within ``timeout_grace_seconds`` it ends exactly as it used to.
+
+        Called once a second from the wait loop, and it is what keeps the hold
+        bounded: True while there is time left to decide in, False when the
+        window closes. An extension clears ``out_of_time_mono``, so a run that
+        was given more time can be held again when *that* budget runs out —
+        which is the same offer, not an unbounded one.
+        """
+        grace = float(getattr(self.config, "timeout_grace_seconds", 0) or 0)
+        if grace <= 0:
+            return False
+        now = time.monotonic()
+        if not job.out_of_time_mono:
+            job.out_of_time_mono = now
+            self._add(job, "log", (
+                f"out of time after {self.config.timeout_seconds}s — holding it for "
+                f"{int(grace)}s in case you want to give it more. It is still "
+                f"running, and still spending, while it waits."
+            ))
+            log.warning("%s: out of time; held for %ss", self.kind, int(grace))
+        return now - job.out_of_time_mono < grace
+
+    def extend(self, job_id: str, seconds: float, step: str | None = None) -> bool:
+        """Give a running job more time. False if there is nothing to give it to.
+
+        Granted from a request thread and read by the worker, which re-reads the
+        grant every second — so this moves the deadline of a run already under
+        way, whether it is still inside its budget or being held past the end of
+        one. ``step`` is a pipeline's step and a plain skill has none (as in
+        ``stop``); the pipeline's own runner overrides this to route it.
+        """
+        job = self.get(job_id)
+        if job is None or step is not None or job.status != "running" or seconds <= 0:
+            return False
+        return self._grant(job, seconds)
+
+    def _grant(self, job: CommandJob, seconds: float) -> bool:
+        """The grant itself: more time, and no longer out of time."""
+        job.extra_s += float(seconds)
+        # Cleared last: the worker reads the deadline first, so there is no
+        # instant in which the run is neither held nor inside its budget.
+        was_out_of_time = bool(job.out_of_time_mono)
+        job.out_of_time_mono = 0.0
+        self._add(job, "log", (
+            f"given {int(seconds // 60)} more minute(s)"
+            + (" — it was out of time" if was_out_of_time else "")
+        ))
+        return True
 
     def _fetch_context(self, job: CommandJob, fetch: Callable[[], object], deadline: float):
         """Fetch the skill's stdin bundle, trying again if the network blinks.

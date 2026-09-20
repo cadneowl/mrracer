@@ -247,7 +247,10 @@ def test_a_step_that_ran_out_of_time_hands_on_what_it_wrote(tmp_path, step_scrip
         tmp_path,
         _skill(step_script, "arch")
         + f"  - name: dba\n    label: DBA review\n    command: '{PY} \"{slow}\"'\n"
-        "    timeout_seconds: 1\n"
+        # Stopped on its deadline, with no hold: what is under test is what a
+        # step that ran out of time hands the next one, and the hold exists to
+        # stop a run reaching that point (see `timeout_grace_seconds`).
+        "    timeout_seconds: 1\n    timeout_grace_seconds: 0\n"
         + _skill(step_script, "synth")
         + "  - name: full\n    pipeline: [{parallel: [arch, dba]}, synth]\n",
     )

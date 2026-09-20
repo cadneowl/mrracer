@@ -6,7 +6,7 @@
 <div class="job-health"
      {% if live %}hx-get="/{{ kind }}/health/{{ job.id }}" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
   {% for row in rows %}
-  <div class="health-row health-{{ row.state }}{% if row.stalled %} health-stalled{% endif %}">
+  <div class="health-row health-{{ row.state }}{% if row.stalled %} health-stalled{% endif %}{% if row.out_of_time %} health-outoftime{% endif %}">
     <span class="health-name">{{ row.label }}</span>
     <span class="health-state">{{ row.state_text }}</span>
     <span class="health-note" title="{{ row.note }}">{{ row.note }}</span>
@@ -14,6 +14,17 @@
     {# The whole conversation lives in that Claude session; resuming it is how
        to read what the agent was thinking, not just which tools it called. #}
     <code class="health-session" title="See the whole conversation: {{ row.resume }}">{{ row.session_id[:8] }}</code>
+    {% endif %}
+    {% if row.can_extend %}
+    {# More time, for a run that is going to be stopped otherwise. No
+       confirmation: the click buys time on work already paid for, and the one
+       thing this must not do is put a dialog between the operator and a run
+       that is seconds from being killed. Unused time costs nothing — the run
+       ends when it ends. #}
+    <button class="health-extend{% if row.out_of_time %} health-extend-now{% endif %}" type="button"
+            hx-post="/{{ kind }}/extend/{{ job.id }}{% if row.step %}?step={{ row.step|urlencode }}{% endif %}"
+            hx-target="closest .job-health" hx-swap="outerHTML"
+            title="Give {{ row.label }} another {{ row.extend_minutes }} minutes{% if row.out_of_time %} — it is out of time and will be stopped otherwise{% endif %}">＋ {{ row.extend_minutes }} min</button>
     {% endif %}
     {% if row.can_stop %}
     <button class="health-stop" type="button"
@@ -55,10 +66,22 @@
     {% with stats = total %}{% include "_run_stats.html" %}{% endwith %}
   </div>
   {% endif %}
-  {% if stop_all %}
-  <button class="health-stop health-stop-all" type="button"
-          hx-post="/{{ kind }}/stop/{{ job.id }}"
-          hx-target="closest .job-health" hx-swap="outerHTML"
-          hx-confirm="Stop every running step, and skip the stages still to come?">■ stop the whole pipeline</button>
+  {% if extend_all or stop_all %}
+  <div class="health-all">
+    {% if extend_all %}
+    {# Every step running now, in one click: a stage of three reviews that ran
+       out together is one decision, not three races against the same clock. #}
+    <button class="health-extend" type="button"
+            hx-post="/{{ kind }}/extend/{{ job.id }}"
+            hx-target="closest .job-health" hx-swap="outerHTML"
+            title="Give every step running now another {{ extend_minutes }} minutes">＋ {{ extend_minutes }} min for every step</button>
+    {% endif %}
+    {% if stop_all %}
+    <button class="health-stop health-stop-all" type="button"
+            hx-post="/{{ kind }}/stop/{{ job.id }}"
+            hx-target="closest .job-health" hx-swap="outerHTML"
+            hx-confirm="Stop every running step, and skip the stages still to come?">■ stop the whole pipeline</button>
+    {% endif %}
+  </div>
   {% endif %}
 </div>

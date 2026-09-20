@@ -134,7 +134,11 @@ def test_the_command_gets_what_is_left_of_the_budget():
     the command about a second, which a 2s command overruns — while a command
     given its own fresh 4s would finish comfortably and the job would be "done".
     """
-    cfg = ReviewConfig(enabled=True, command=SLEEP_2, timeout_seconds=4)
+    # No hold: what is under test is the arithmetic of the shared budget, and a
+    # run held at the deadline for someone to answer would finish instead of
+    # overrunning — which is what the hold is for, and not what this measures.
+    cfg = ReviewConfig(enabled=True, command=SLEEP_2, timeout_seconds=4,
+                       timeout_grace_seconds=0)
     runner = CommandRunner(cfg, "review")
     done = _await(
         runner,

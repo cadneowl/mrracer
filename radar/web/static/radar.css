@@ -432,6 +432,22 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .health-rerun:hover { opacity: 1; }
 .health-retry:disabled { opacity: .5; cursor: wait; }
 .health-stop-all { align-self: flex-end; }
+/* More time for a run that would otherwise be stopped. Quiet while the run is
+   inside its budget — it is an offer, not a thing to do — and lit the moment the
+   run is out of time and the only alternative is losing its work. */
+.health-extend {
+  background: transparent; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 6px; font-size: 11px; padding: 2px 8px; cursor: pointer;
+}
+.health-extend:hover { color: var(--green); border-color: var(--green); }
+.health-extend-now {
+  color: var(--amber); border-color: var(--amber); font-weight: 700;
+}
+.health-extend-now:hover { color: var(--text); border-color: var(--amber); }
+/* A run held past its deadline: the row says so, and says it in the colour the
+   panel uses for "this needs you", not the one it uses for "this failed". */
+.health-row.health-outoftime { border-color: var(--amber); }
+.health-all { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .spinner {
   width: 16px; height: 16px; border-radius: 50%;
   border: 2px solid var(--line); border-top-color: var(--green);

@@ -161,6 +161,31 @@ class PipelineRunner(CommandRunner):
             request_stop(child)
         return True
 
+    def extend(self, job_id: str, seconds: float, step: str | None = None) -> bool:
+        """Give one step more time — or, with no step, every step running now.
+
+        A pipeline has no clock of its own to extend (see the module docstring):
+        the steps own the clocks, and this is where the grant has to land. With
+        no step named it reaches all of them, which is what the panel's
+        pipeline-wide button means — a stage of three reviews that all ran out
+        together is one decision, not three.
+
+        The pipeline's own countdown follows in `_roll_up`, so the panel's clock
+        keeps telling the truth about a run that has been given more time.
+        """
+        job = self.get(job_id)
+        if job is None or job.status != "running" or seconds <= 0:
+            return False
+        if step is not None:
+            child = job.steps.get(step)
+            return (child is not None and child.status == "running"
+                    and self.steps[step]._grant(child, seconds))
+        granted = [
+            self.steps[name]._grant(child, seconds)
+            for name, child in list(job.steps.items()) if child.status == "running"
+        ]
+        return any(granted)
+
     def retry_step(self, job_id: str, name: str) -> bool:
         """Run one step again, then finish the pipeline from there.
 
@@ -398,8 +423,7 @@ class PipelineRunner(CommandRunner):
                 time.sleep(_FOLLOW_TICK)
         return [finished[name] for name, _ in started]
 
-    @staticmethod
-    def _roll_up(job: CommandJob) -> None:
+    def _roll_up(self, job: CommandJob) -> None:
         """A pipeline's numbers are its steps': re-added on every tick, so the
         panel's totals grow with the run rather than appearing at the end.
 
@@ -421,6 +445,15 @@ class PipelineRunner(CommandRunner):
         job.stats = aggregate_stats(
             [step.stats for _, step in children]
             + [record["stats"] for record in job.retried_spend]
+        )
+        # Time granted to a step is time the whole run now takes. Per stage,
+        # because stages run one after another and the steps of one run at once:
+        # a stage is delayed by the most any one of its steps was given, and the
+        # run by the sum of those. Anything else makes the panel's countdown lie
+        # about a run someone has deliberately extended.
+        job.extra_s = sum(
+            max((job.steps[name].extra_s for name in stage if name in job.steps), default=0.0)
+            for stage in self.config.pipeline
         )
         now = time.monotonic()
         earlier: dict[str, list] = {}
