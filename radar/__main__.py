@@ -5,6 +5,10 @@
     python -m radar recompute     re-derive all obligations from the event log
     python -m radar validate      check config.yaml and exit
     python -m radar check         validate config + GitLab/Jira/DB connectivity
+    python -m radar serve --capture        …and keep every run's raw event
+                                  stream, for diagnose-stream to read back
+    python -m radar diagnose-stream        read back the last captured run
+                                  (or a file, or a whole directory)
 
 Secrets come only from the environment: GITLAB_URL / GITLAB_TOKEN, and (for QA
 context fetch) JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN. A Jenkins that does
@@ -15,8 +19,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
+from pathlib import Path
 
+from .commands import _CAPTURE_ENV, DEFAULT_CAPTURE_DIR
 from .config import ConfigError, gitlab_credentials, load_config
 from .db import Database
 from .dotenv import load_dotenv
@@ -89,6 +96,19 @@ def cmd_recompute(args) -> int:
     return 0
 
 
+def _enable_capture(capture: str | None) -> str:
+    """Turn stream capturing on for the skills this process will launch.
+
+    Set here rather than per job, because the workers read the environment when
+    they start one. An explicit variable wins over the flag: whoever exported
+    it said what they wanted, and `--capture` is the convenient way to say the
+    same thing, not a way to overrule them.
+    """
+    if capture and not os.environ.get(_CAPTURE_ENV):
+        os.environ[_CAPTURE_ENV] = capture
+    return os.environ.get(_CAPTURE_ENV, "")
+
+
 def cmd_serve(args) -> int:
     import uvicorn
 
@@ -99,6 +119,13 @@ def cmd_serve(args) -> int:
     db_path = str(config.database_path)
     # Ensure schema exists before the first request.
     Database(db_path).close()
+
+    captured = _enable_capture(getattr(args, "capture", None))
+    if captured:
+        log.info(
+            "capturing every run's raw event stream to %s — read one back with "
+            "`radar diagnose-stream`", Path(captured).absolute()
+        )
 
     scheduler = make_scheduler()
 
@@ -177,6 +204,50 @@ def cmd_check(args) -> int:
     return 0
 
 
+def cmd_diagnose_stream(args) -> int:
+    """Read back captured runs and say what happened to them.
+
+    Takes no config and touches no network: the files are the whole input, so a
+    stream captured on the machine that saw the problem can be read anywhere.
+
+    With no path it reads the newest capture in the default directory, because
+    the run someone wants to look at is almost always the one that just went
+    wrong. A directory compares its runs side by side — which is the shape of
+    the question when a pipeline's steps behave differently from each other.
+    """
+    from .streamdiag import compare, diagnose, newest
+
+    path = Path(args.file or os.environ.get(_CAPTURE_ENV) or DEFAULT_CAPTURE_DIR)
+    try:
+        if path.is_dir():
+            files = sorted(path.glob("*.jsonl"))
+            if not files:
+                print(f"no captured runs in {path}. Start radar with "
+                      f"`serve --capture` and run a skill.", file=sys.stderr)
+                return 1
+            if args.all or len(files) == 1:
+                print(compare(files) if len(files) > 1 else diagnose(files[0], args.rows))
+                return 0
+            latest = newest(files)
+            print(f"{len(files)} captured runs in {path}; reading the newest. "
+                  f"Use --all to compare them.\n")
+            print(diagnose(latest, rows=args.rows))
+            return 0
+        print(diagnose(path, rows=args.rows))
+    except OSError as exc:
+        print(f"cannot read {path}: {exc}", file=sys.stderr)
+        return 1
+    except (ValueError, TypeError, KeyError) as exc:
+        # The file is the whole input and it may not have been written by radar
+        # — a stream redirected to disk by hand, or edited on the way here. A
+        # field of the wrong shape is worth saying plainly; a traceback from a
+        # diagnostic is one more thing to diagnose.
+        print(f"{path} is not a stream this can read ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="radar", description=__doc__)
     parser.add_argument("-c", "--config", default="config.yaml", help="path to config.yaml")
@@ -199,9 +270,33 @@ def build_parser() -> argparse.ArgumentParser:
         "check", help="validate config, DB, and GitLab/Jira connectivity"
     ).set_defaults(func=cmd_check)
 
+    stream = sub.add_parser(
+        "diagnose-stream",
+        help="read back a captured run (default: the newest one)",
+    )
+    stream.add_argument(
+        "file", nargs="?",
+        help="a captured .jsonl, a raw stream-json dump, or a directory of them "
+        "(default: the capture directory)",
+    )
+    stream.add_argument(
+        "--all", action="store_true",
+        help="compare every run in the directory instead of reading the newest",
+    )
+    stream.add_argument(
+        "--rows", type=int, default=40,
+        help="how many requests to table, head and tail (default 40; 0 for all)",
+    )
+    stream.set_defaults(func=cmd_diagnose_stream)
+
     serve = sub.add_parser("serve", help="run dashboard + background poller")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--capture", nargs="?", const=DEFAULT_CAPTURE_DIR, metavar="DIR",
+        help="keep every run's raw event stream in DIR (default: "
+        f"./{DEFAULT_CAPTURE_DIR}) for `radar diagnose-stream` to read back",
+    )
     serve.set_defaults(func=cmd_serve)
     return parser
 

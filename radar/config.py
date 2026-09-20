@@ -138,6 +138,17 @@ class SkillConfig:
     command: str = ""
     working_dir: str | None = None
     timeout_seconds: int = 600
+    # What happens when that budget runs out. Rather than killing the run on the
+    # stroke of the deadline, radar holds it — still alive, still spending — for
+    # this long, says on the panel that it is out of time, and takes an answer:
+    # more time, or stop. Nobody answers and it fails exactly as it used to, a
+    # few minutes later. 0 turns the hold off and the deadline is the deadline.
+    #
+    # It exists because the cost of the two mistakes is not symmetrical. A run
+    # killed at forty-three minutes takes everything it had done with it, and
+    # the only way back is to pay for all of it again; a run held for five more
+    # is five minutes of one model's time. See `commands.CommandRunner._execute`.
+    timeout_grace_seconds: int = 300
     include_context: bool = False
     contexts: tuple[str, ...] = ()  # subset of {"gitlab_diff", "jira"}
     stores_result: bool = False
@@ -421,7 +432,13 @@ _VALID_CHECKOUTS = {"none", "worktree"}
 # (/{name}/{project_id}/{mr_iid}), so it must be a URL-safe slug and must not
 # shadow a fixed sub-path used within a skill's own route namespace.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-_RESERVED_NAMES = frozenset({"status", "stream", "close", "stored", "health", "stop"})
+# One entry per fixed sub-path the panel uses inside a skill's own namespace,
+# whether or not a name could collide with it today: the set is what keeps the
+# routes free to grow. `retry`, `stats` and `extend` were added with the routes
+# that use them, which is the only moment anybody remembers this list exists.
+_RESERVED_NAMES = frozenset({
+    "status", "stream", "close", "stored", "health", "stop", "retry", "stats", "extend",
+})
 
 # Defaults carried by two well-known names. They are *not* skills in their own
 # right — nothing exists until `skills:` declares it — but a skill that claims
@@ -547,7 +564,7 @@ def _parse_env_unset(raw: object, ctx: str) -> tuple[str, ...]:
 # and ignored.
 _STEP_ONLY_KEYS = (
     "command", "working_dir", "include_context", "context", "source", "inputs",
-    "checkout", "remote", "env", "env_unset",
+    "checkout", "remote", "env", "env_unset", "timeout_grace_seconds",
 )
 
 
@@ -657,6 +674,16 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
     if timeout < 1:
         raise ConfigError(f"{ctx}.timeout_seconds: must be >= 1")
 
+    default_grace = builtin.get("timeout_grace_seconds", SkillConfig.timeout_grace_seconds)
+    try:
+        grace = int(raw.get("timeout_grace_seconds", default_grace))
+    except (TypeError, ValueError):
+        raise ConfigError(f"{ctx}.timeout_grace_seconds: expected an integer") from None
+    if grace < 0:
+        raise ConfigError(
+            f"{ctx}.timeout_grace_seconds: must be >= 0 (0 stops the run on its deadline)"
+        )
+
     contexts = _parse_contexts(raw.get("context", builtin.get("context")), ctx)
 
     # Checked in `_check_analysis_wiring` rather than here: whether an empty
@@ -702,6 +729,7 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
     return SkillConfig(
         name=name, label=label, button=button, icon=icon, enabled=enabled,
         command=command, working_dir=working_dir, timeout_seconds=timeout,
+        timeout_grace_seconds=grace,
         include_context=include_context, contexts=contexts, stores_result=stores_result,
         source=source, inputs=inputs, checkout=checkout, remote=remote,
         env=_parse_env(raw.get("env"), ctx),

@@ -33,9 +33,17 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .commands import CommandJob, CommandRunner, _fail, request_stop
+from .commands import (
+    CommandJob,
+    CommandRunner,
+    _fail,
+    aggregate_stats,
+    job_health,
+    request_stop,
+    stats_to_record,
+)
 from .config import SkillConfig
 
 log = logging.getLogger("radar.pipeline")
@@ -126,6 +134,12 @@ class PipelineRunner(CommandRunner):
         as a QA plan.
         """
         job = self._admit(ctx)
+        # Kept so one failed step can be run again later without the caller
+        # having to reconstruct what it was given (see `retry_step`).
+        job.retry_with = {
+            "ctx": ctx, "on_success": on_success,
+            "provider_for": provider_for, "on_success_for": on_success_for,
+        }
         threading.Thread(
             target=self._run_pipeline,
             args=(job, ctx, on_success, provider_for, on_success_for),
@@ -147,38 +161,194 @@ class PipelineRunner(CommandRunner):
             request_stop(child)
         return True
 
-    def _run_pipeline(self, job, ctx, on_success, provider_for, on_success_for) -> None:
+    def extend(self, job_id: str, seconds: float, step: str | None = None) -> bool:
+        """Give one step more time — or, with no step, every step running now.
+
+        A pipeline has no clock of its own to extend (see the module docstring):
+        the steps own the clocks, and this is where the grant has to land. With
+        no step named it reaches all of them, which is what the panel's
+        pipeline-wide button means — a stage of three reviews that all ran out
+        together is one decision, not three.
+
+        The pipeline's own countdown follows in `_roll_up`, so the panel's clock
+        keeps telling the truth about a run that has been given more time.
+        """
+        job = self.get(job_id)
+        if job is None or job.status != "running" or seconds <= 0:
+            return False
+        if step is not None:
+            child = job.steps.get(step)
+            return (child is not None and child.status == "running"
+                    and self.steps[step]._grant(child, seconds))
+        granted = [
+            self.steps[name]._grant(child, seconds)
+            for name, child in list(job.steps.items()) if child.status == "running"
+        ]
+        return any(granted)
+
+    def retry_step(self, job_id: str, name: str) -> bool:
+        """Run one step again, then finish the pipeline from there.
+
+        For the case this exists for: three reviews took half an hour and the
+        synthesis that merges them died on a connection reset. Re-running the
+        whole pipeline would pay for the reviews twice; re-running the step
+        alone would leave the pipeline still marked failed, with its answer
+        still the failure. So this resumes — the step, then every stage after
+        it, with the earlier results handed forward exactly as the first run
+        handed them.
+
+        A step that *succeeded* can be run again too, which is not the same
+        thing as undoing a failure. A review can finish cleanly and answer
+        badly, and radar cannot tell: a run whose exit code is zero and whose
+        output is not empty is a success by every measure available here. And
+        when one review of three is re-run, the synthesis that merged the first
+        three is a synthesis of something that no longer exists — re-running it
+        over what is there now is the whole point of having steps. Nothing is
+        lost either way: what an earlier attempt spent stays on the bill and
+        keeps its own row (see `_roll_up`).
+
+        Refused when there is nothing to resume: an unknown job or step, a run
+        still going, a step this run never reached, or a job started before
+        radar kept what a retry needs.
+        """
+        job = self.get(job_id)
+        if job is None or job.status == "running" or not job.retry_with:
+            return False
+        if name not in self.steps:
+            return False
+        stages = self.config.pipeline
+        stage_index = next((i for i, stage in enumerate(stages) if name in stage), None)
+        child = job.steps.get(name)
+        if stage_index is None or child is None or child.status == "running":
+            return False
+
+        def result_of(step: str) -> StepResult:
+            return StepResult(step, self.steps[step].config.label, job.steps[step].status,
+                              job.steps[step].output, job.steps[step].error)
+
+        # What the earlier stages produced, in the order the first run had it —
+        # this is what the resumed steps will be handed as "## Earlier steps".
+        carried = [
+            result_of(step)
+            for index, stage in enumerate(stages) for step in stage
+            if index < stage_index and step in job.steps
+        ]
+        # And this stage's other steps, failures included. A step that failed is
+        # part of the picture the next stage has to be given: a synthesis told
+        # only about the two reviews that worked cannot say what went
+        # unreviewed, and would read as a review of the whole change.
+        carried += [
+            result_of(step) for step in stages[stage_index]
+            if step != name and step in job.steps
+        ]
+
+        # Claimed under the lock, because everything above only *read* the job:
+        # two clicks, or two tabs, would otherwise both find it finished and
+        # both start a run of it. The loser is refused exactly as it would be
+        # if there were nothing to retry — which by then is true, the winner
+        # having already taken it. `_add` takes the same lock, so it waits
+        # until this block has let go.
+        with self._lock:
+            if job.status == "running":
+                return False
+            job.status = "running"
+            job.error = ""
+            job.persist_error = ""
+            job.stop_requested = threading.Event()
+            job.started_mono = time.monotonic()
+            job.ended_mono = 0.0
+        self._add(job, "log", f"retrying {name} and everything after it")
+
+        spec = job.retry_with
+        threading.Thread(
+            target=self._run_pipeline,
+            args=(job, spec["ctx"], spec["on_success"],
+                  spec["provider_for"], spec["on_success_for"]),
+            kwargs={"from_stage": stage_index, "only": {name}, "carried": carried},
+            daemon=True,
+        ).start()
+        return True
+
+    def _run_pipeline(
+        self, job, ctx, on_success, provider_for, on_success_for,
+        from_stage: int = 0, only: set | None = None, carried: list | None = None,
+    ) -> None:
+        """Run the stages, or the tail of them.
+
+        ``from_stage``, ``only`` and ``carried`` are what a retry supplies: the
+        stage to resume at, which of its steps to actually re-run (the ones
+        that already finished are not paid for twice), and the results the
+        earlier stages produced, so a later step is still handed what it was
+        promised. A fresh run passes none of them and reads as it always did.
+        """
         # Catch-all guarantees a terminal state, as in CommandRunner._run.
         stages = self.config.pipeline
-        results: list[StepResult] = []
+        results: list[StepResult] = list(carried or [])
         try:
-            last: list[StepResult] = []
-            for index, stage in enumerate(stages, 1):
+            for index in range(from_stage, len(stages)):
+                stage = stages[index]
                 if job.stop_requested.is_set():
                     break
-                self._add(job, "log", f"stage {index}/{len(stages)}: {' + '.join(stage)}")
+                names = [n for n in stage
+                         if only is None or index > from_stage or n in only]
+                self._add(job, "log", f"stage {index + 1}/{len(stages)}: {' + '.join(names)}")
                 started = []
-                for name in stage:
+                for name in names:
                     step_job = self.steps[name].start(
                         ctx,
                         on_success=on_success_for(name) if on_success_for else None,
                         stdin_provider=self._stdin_for(name, provider_for, results),
                     )
+                    previous = job.steps.get(name)
+                    if previous is not None:
+                        # A retry replaces the step's job, and the roll-up below
+                        # only sees the jobs that are still there. What the
+                        # first attempt spent is kept so the bill does not fall
+                        # when a step is run again. Its timeline is dropped:
+                        # the charts are the shape of the run as it stands, and
+                        # the totals are everything it cost to get there.
+                        #
+                        # Kept as a record, not just numbers: it earns a line of
+                        # its own under the step that replaced it, and how long
+                        # it ran for is only knowable here, while the job it ran
+                        # as is still the one in hand.
+                        job.retried_spend.append({
+                            "name": name,
+                            # Named as what it is: two rows under the same
+                            # label would read as the step having run twice in
+                            # one pipeline rather than as the attempt this one
+                            # replaced.
+                            "label": f"{previous.stats.label or name} (earlier attempt)",
+                            "status": previous.status,
+                            "elapsed_s": job_health(previous)["elapsed_s"],
+                            "session_id": previous.session_id,
+                            "stats": replace(previous.stats, samples=[], series=[]),
+                        })
                     # Registered at once, so a stop from the panel can reach it.
                     job.steps[name] = step_job
+
                     if job.stop_requested.is_set():
                         request_stop(step_job)  # the stop landed while this one started
                     started.append((name, step_job))
-                last = self._follow(job, started)
-                results.extend(last)
+                results.extend(self._follow(job, started))
                 if job.stop_requested.is_set():
                     break
-                if not any(r.status == "done" for r in last):
-                    job.output = combine_results(last)
+                # Steps of this stage that a retry did not re-run count too:
+                # what matters is whether the next stage has anything to read.
+                in_stage = [r for r in results if r.name in stage]
+                if not any(r.status == "done" for r in in_stage):
+                    # Everything that ran, not just the stage that failed. A
+                    # synthesis that cannot start is no reason to throw away
+                    # the three reviews it was going to merge — half an hour
+                    # of work, and the reader can merge them by eye.
+                    job.output = combine_results(results)
+                    survived = [r.name for r in results if r.status == "done"]
                     _fail(job, (
-                        f"stage {index} of {len(stages)} failed: no step in it "
+                        f"stage {index + 1} of {len(stages)} failed: no step in it "
                         f"({', '.join(stage)}) finished"
-                        + (", so nothing ran after it" if index < len(stages) else "")
+                        + (", so nothing ran after it" if index + 1 < len(stages) else "")
+                        + (f". What did finish is below: {', '.join(survived)}."
+                           if survived else "")
                     ))
                     return
             if job.stop_requested.is_set():
@@ -186,16 +356,21 @@ class PipelineRunner(CommandRunner):
                 ran = ", ".join(r.name for r in results) or "no step"
                 _fail(job, f"stopped from the panel ({ran} ran; nothing after that did)")
                 return
-            job.output = last[0].output if len(last) == 1 else combine_results(last)
+            final = [r for r in results if r.name in stages[-1]]
+            job.output = final[0].output if len(final) == 1 else combine_results(final)
             if on_success is not None:
                 try:
                     on_success(job)
                 except Exception as exc:  # noqa: BLE001 - report, don't crash
                     log.exception("%s result produced but not saved", self.kind)
                     job.persist_error = f"result was generated but could not be saved: {exc}"
+            job.error = ""     # a retry that worked is not still carrying the old fault
             job.status = "done"
         except Exception as exc:  # noqa: BLE001 - last-resort terminal state
             log.exception("%s pipeline crashed", self.kind)
+            # Same rule as above: whatever the steps produced before the crash
+            # is worth more than the traceback that replaced it.
+            job.output = job.output or combine_results(results)
             _fail(job, f"unexpected error: {exc}")
         finally:
             job.ended_mono = time.monotonic()
@@ -243,9 +418,60 @@ class PipelineRunner(CommandRunner):
                     )
                     ended = "finished" if status == "done" else "failed"
                     self._add(job, "log", f"[{name}] {ended}")
+            self._roll_up(job)
             if len(finished) < len(started):
                 time.sleep(_FOLLOW_TICK)
         return [finished[name] for name, _ in started]
+
+    def _roll_up(self, job: CommandJob) -> None:
+        """A pipeline's numbers are its steps': re-added on every tick, so the
+        panel's totals grow with the run rather than appearing at the end.
+
+        Replaced rather than mutated, so a request rendering the panel reads one
+        consistent set of totals and never a half-summed one.
+
+        A step that was retried counts twice over, because it was paid for
+        twice: the attempt that is still in `steps`, and what the one it
+        replaced had spent before it failed. Both get a line, the earlier one
+        first — money in the total with no row to account for it is the one
+        thing a breakdown must not do.
+
+        The breakdown is kept alongside the total, because added together the
+        steps stop saying which of them was the slow one — and that is the
+        first thing asked of a run that took half an hour. It rides on the
+        total, so storing the result stores it too.
+        """
+        children = list(job.steps.items())
+        job.stats = aggregate_stats(
+            [step.stats for _, step in children]
+            + [record["stats"] for record in job.retried_spend]
+        )
+        # Time granted to a step is time the whole run now takes. Per stage,
+        # because stages run one after another and the steps of one run at once:
+        # a stage is delayed by the most any one of its steps was given, and the
+        # run by the sum of those. Anything else makes the panel's countdown lie
+        # about a run someone has deliberately extended.
+        job.extra_s = sum(
+            max((job.steps[name].extra_s for name in stage if name in job.steps), default=0.0)
+            for stage in self.config.pipeline
+        )
+        now = time.monotonic()
+        earlier: dict[str, list] = {}
+        for record in job.retried_spend:
+            earlier.setdefault(record["name"], []).append(record)
+        steps = []
+        for name, step in children:
+            for record in earlier.get(name, ()):
+                steps.append(dict(record, stats=stats_to_record(record["stats"])))
+            steps.append({
+                "name": name,
+                "label": step.stats.label or name,
+                "status": step.status,
+                "elapsed_s": job_health(step, now)["elapsed_s"],
+                "session_id": step.session_id,
+                "stats": stats_to_record(step.stats),
+            })
+        job.stats.steps = steps
 
     def _mirror(self, job: CommandJob, drawn: dict, name: str, item: dict) -> None:
         """Copy one line of a step's log, updating the copy already drawn when

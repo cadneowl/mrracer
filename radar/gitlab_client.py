@@ -14,8 +14,11 @@ environment by the caller and passed in; it is never logged here.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Protocol
+
+log = logging.getLogger("radar.gitlab")
 
 
 class MRSource(Protocol):
@@ -59,13 +62,67 @@ class GitLabSource:
     # poller's scheduler thread, or a review job, with nothing to time it out.
     HTTP_TIMEOUT_S = 60
 
+    # A connection that dies mid-request is not an answer, and reads here are
+    # idempotent — so they are worth attempting again. Sized small: three tries
+    # over a few seconds covers a reset peer or a proxy recycling a connection,
+    # and anything that survives that is a fault worth reporting rather than
+    # hammering. GitLab's own rate limiting (429) is included, with the backoff
+    # that makes retrying it polite instead of rude.
+    HTTP_RETRIES = 3
+    RETRY_BACKOFF_S = 1.0
+    RETRY_ON_STATUS = (429, 500, 502, 503, 504)
+
     def __init__(self, url: str, token: str, timeout: int | None = None):
         import gitlab  # imported lazily so tests need no network stack
 
         self._gl = gitlab.Gitlab(
             url, private_token=token, timeout=timeout or self.HTTP_TIMEOUT_S
         )
+        self._install_retries()
         self._project_cache: dict[str, object] = {}
+
+    def _install_retries(self) -> None:
+        """Retry transient failures on the session python-gitlab talks over.
+
+        Done at the adapter rather than around each call: urllib3 retries the
+        one request that failed, instead of radar re-running a fetch that had
+        already downloaded a large diff. Best effort — a python-gitlab that
+        stops exposing a requests session costs the retries, not the poller.
+        """
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+
+            retry = Retry(
+                total=self.HTTP_RETRIES,
+                connect=self.HTTP_RETRIES,
+                read=self.HTTP_RETRIES,
+                status=self.HTTP_RETRIES,
+                backoff_factor=self.RETRY_BACKOFF_S,
+                status_forcelist=self.RETRY_ON_STATUS,
+                allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
+                raise_on_status=False,
+                # Radar's backoff, not the server's. urllib3 honours a
+                # `Retry-After` header by default and sleeps exactly as long as
+                # it says — up to six hours, per attempt — which no timeout here
+                # bounds, because `HTTP_TIMEOUT_S` is a socket timeout and this
+                # is a sleep. A GitLab or a proxy that answers a throttled read
+                # with `Retry-After: 600` would park whichever thread asked: the
+                # poller's, whose pass then stops for ten minutes, or a skill's
+                # context fetch, which radar has its own deadline for and would
+                # have given up on long before the sleep ended. Three tries a
+                # few seconds apart is the policy; a header cannot extend it.
+                respect_retry_after_header=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            session = getattr(self._gl, "session", None)
+            if session is None:
+                return
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+        except Exception:  # noqa: BLE001 - retries are an improvement, not a requirement
+            log.warning("could not install HTTP retries; transient failures will not "
+                        "be retried", exc_info=True)
 
     def _project(self, project: str):
         if project not in self._project_cache:

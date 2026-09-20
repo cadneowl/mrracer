@@ -322,7 +322,8 @@ def test_a_timed_out_run_keeps_what_it_wrote(tmp_path):
         "time.sleep(30)\n",
         encoding="utf-8",
     )
-    cfg = ReviewConfig(enabled=True, command=f'{PY} "{script}"', timeout_seconds=1)
+    cfg = ReviewConfig(enabled=True, command=f'{PY} "{script}"', timeout_seconds=1,
+                       timeout_grace_seconds=0)
     runner = CommandRunner(cfg, "review")
     done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
     assert done.status == "error"
@@ -498,7 +499,7 @@ def test_timeout_kills_the_whole_process_tree(tmp_path):
     )
     cmd = f'{PY} -c "{script}"'
     cfg = ReviewConfig(
-        enabled=True, command=cmd, timeout_seconds=1,
+        enabled=True, command=cmd, timeout_seconds=1, timeout_grace_seconds=0,
         env=(("RADAR_GRANDCHILD", grandchild), ("RADAR_TEST_MARKER", str(marker))),
     )
     runner = CommandRunner(cfg, "review")
@@ -522,7 +523,8 @@ def test_timeout_error_names_a_still_running_background_agent():
         "sys.stdout.flush(); time.sleep(60)"
     )
     cmd = f'{PY} -c "{script}"'
-    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=2)
+    cfg = ReviewConfig(enabled=True, command=cmd, timeout_seconds=2,
+                       timeout_grace_seconds=0)   # the deadline is the deadline here
     runner = CommandRunner(cfg, "review")
     done = _await(runner, runner.start({"project_id": 1, "mr_iid": 2}))
     assert done.status == "error"

@@ -311,6 +311,7 @@ skills:
     command: 'claude -p "/code-review {web_url}"' # e.g. a Claude Code skill, headless
     working_dir: /path/to/checkout                # optional; where to run it
     timeout_seconds: 600                          # budget for the whole job
+    timeout_grace_seconds: 300                    # …then ask, before stopping it
 ```
 
 Every skill lives in the `skills:` list — that is the only place they are
@@ -321,6 +322,48 @@ declared. `review` and `qa` are ordinary entries whose **names** carry defaults
 checkout and fetching the MR's context both talk to the network and are spent
 from the same clock, so a job can never outlast its budget — a hung fetch fails
 it rather than leaving the panel tailing a job that will never end.
+
+##### Running out of time is a question, not a verdict
+
+A run killed on the stroke of its deadline takes everything it did with it. Forty
+minutes of review, three dollars of model time, and the only way back is to pay
+for all of it again — because the process is gone and there is nothing left to
+resume. Held for five more minutes instead, it usually finishes.
+
+So that is what radar does. When the budget runs out the run is **not** killed:
+it is held, the panel says so in amber, and the row offers **＋ 10 min**.
+
+```
+AI review   ⏳ out of time after 43m   still running — 4m to give it more time
+                                      before it is stopped and its work is lost
+                                      ＋ 10 min   ■ stop
+```
+
+Answer and it carries on. Answer again later and it carries on again — the
+button has no limit, because a person clicking it is a person deciding. Say
+nothing and after `timeout_grace_seconds` it ends exactly as it used to: stopped,
+failed, and keeping whatever it had written, with the error saying it was held
+and nobody answered.
+
+The cost is honest and worth stating: **a held run is still running and still
+spending.** That is the trade — five minutes of one model's time against losing
+forty. `timeout_grace_seconds: 0` turns the hold off and the deadline is the
+deadline again, exactly as it behaved before.
+
+The same **＋ 10 min** sits on every running row from the start, not only once
+time has run out, so a countdown getting short while a review is plainly
+mid-thought is one click rather than a race. It is on a plain skill, on each step
+of a pipeline, and on a build analysis — everywhere radar runs a skill — and a
+pipeline gets one more, **＋ 10 min for every step**, because a stage of three
+reviews that ran out together is one decision. Time given to a step lengthens the
+pipeline's own countdown too, so the panel's clock keeps telling the truth about
+a run someone deliberately extended.
+
+Two things the hold deliberately does not cover. A **context fetch** that hangs
+still fails on the job's own deadline — there is no work to save, only a socket
+with nobody on it. And a pipeline has no hold of its own: `timeout_grace_seconds`
+is refused on a `pipeline:` entry, because its steps own the clocks and so they
+own what happens when one runs out.
 
 Placeholders filled from the MR: `{web_url}`, `{mr_iid}`, `{project_id}`,
 `{source_branch}`, `{target_branch}`, `{title}`, `{author}`, `{head_sha}`, plus
@@ -382,12 +425,210 @@ ask for tool permissions. Run the skill with permissions pre-resolved:
   work — their stdout lines become the progress log; they just aren't as
   granular. The countdown shows for those too.
 
-Authentication comes from your normal Claude Code setup (`~/.claude/settings.json`
-gateway/token, or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the
-environment that launches `radar serve`). Don't use `--bare` — it skips loading
-`settings.json`. radar strips `GITLAB_TOKEN`/`GITLAB_URL` from the child env, so
-a skill that needs GitLab/Jira access must have its own credentials (e.g. a
-GitLab/Atlassian MCP).
+##### What the run spent
+
+The same events say what a run *costs*, and the panel shows it. The headline is
+one line — the model that answered, requests made, everything it read, how much
+of that the prompt cache served, output, the thinking inside that output, the
+bill, and the average time one request took the model:
+
+```
+claude-opus-5[1m]  REQUESTS 3  IN 73.6k  CACHED 69%  OUT 411  THINKING 139  COST $0.209  AVG 2.5s
+```
+
+Two of those words mean something specific. A **request** is one exchange with
+the model: the API is stateless, so every tool call sends the whole conversation
+again and counts as another one — three requests here were *decide to run a
+command*, *read its output and delegate*, *read that and write the answer*.
+**In** is everything the model read on those requests, which is not the same as
+what was billed at full price: `input_tokens` on its own counts only what was
+neither read from nor written to the cache, and Claude Code caches nearly the
+whole prompt, so that figure is 8 tokens beside a 73.6k prompt. The split is in
+the tooltip and in the details below.
+
+While a run works the figures sit under its step and move with it; when it ends
+they move to the top of the panel, and a pipeline also gets a **total** across
+its steps. Under the line, **AI stats** folds open with everything else the
+run reported:
+
+| | |
+|---|---|
+| **Tokens** | everything the model read · fresh input (the part that missed the cache) · cache read (with the hit rate) · cache written (split by the 5m and 1h TTLs, which are priced apart) · output · thinking · total · **biggest request**, against the context window — how close the run came to running out of room, which no total tells you |
+| **Money** | what it was billed, and the same again per model — a run whose subagents answer on a cheaper model than its main loop has two bills |
+| **Time** | wall clock · time waiting on the model and what share of the run that was (a review that spends four minutes of five running greps wants better context, not a faster model) · time to first token · average per request · queued turns |
+| **What it did** | requests · tool calls, tallied by tool (`Read ×12, Bash ×9`) · web searches and fetches, which are billed per request rather than in tokens · subagents spawned, finished, failed, killed and **refused** (by depth, concurrency or budget), how deep they nested and of which type |
+| **How it ended** | the run's own terminal reason and stop reason · errors it flagged · **denied tool calls**, by tool · where the account's rate limits stood (five-hour and seven-day utilisation) |
+| **The run** | model and window · Claude Code version · permission mode · output style · how many tools and MCP servers it was given · service tier, speed and inference geography |
+
+Two of those are worth the operator's attention beyond curiosity. **Denied tool
+calls**: radar runs skills with `--permission-mode dontAsk`, so a tool off your
+allowlist is refused without asking and the run writes its answer anyway — the
+denials are the difference between a finding and a guess, and they get a pill on
+the headline whenever there are any. **Biggest request**: a skill creeping
+towards its window is one review away from truncating the diff it is meant to be
+reading.
+
+Where the numbers come from, because they are not all equally settled:
+
+- **Input, cached, turns, tool calls and the context peak are counted as the run
+  goes.** A request's input side is settled before the model starts answering,
+  so those are exact from the first turn.
+- **Output, thinking, money and the per-model breakdown arrive with the run's
+  final `result` event**, which is where the CLI publishes what it was billed
+  for. A message's usage is emitted with its first content block, long before
+  the turn has finished writing, so its output count is a fragment (16 tokens
+  against a real 479) and radar never adds those up. Thinking meanwhile shows
+  the CLI's own live estimate, marked with a `~`, until the billed count
+  replaces it. The per-model breakdown is preferred over the run's top-level
+  totals: those cover its main loop, so a run that delegated to a subagent
+  reports 8.7k cache writes there against the 22.5k it actually paid for.
+- **The average** is the run's own `duration_api_ms` over its own turn count
+  once it reports them — the model's time and nothing else. Until then it is
+  radar's measure of the same wait: tool results going back, to the next answer
+  starting.
+
+A command that doesn't speak stream-json reports none of this, and its panel
+shows no numbers rather than a row of zeros. A stored result (a QA plan, a build
+analysis) keeps the numbers of the run that wrote it, so re-opening it later
+answers what it cost as well as what it said.
+
+##### The AI stats section, and the shape of a run
+
+All of the above lives under **AI stats**, a collapsible section in the panel —
+folded away by default, remembered per browser once you open it, and present
+from the moment a run starts rather than only when it ends. It refreshes itself
+every few seconds while the run works, so the numbers and the charts move
+without the panel around them being redrawn (and without disturbing the live
+progress log or the per-step figures above it, which are unchanged).
+
+Totals cannot say that the last six requests each took a minute, or that the
+context doubled halfway through and never came back down. Five charts do, all
+sharing one x axis — seconds into the run — so a spike in one can be read
+against the others:
+
+| Chart | What it answers |
+|---|---|
+| **Response time per request** | is the model getting slower as the conversation grows? Drawn against the run's average |
+| **Context carried per request** | is this skill filling its window? Drawn against the window when it gets close |
+| **Tool calls per request** | a tall bar beside a long wait is an agent grinding through tools, not a slow model |
+| **Thinking per request** | where the reasoning actually happened, from the run's live estimate |
+| **Tokens read, cumulative** | every request re-sends the conversation, so this is the shape of the bill |
+
+A pipeline draws one line per step on each chart, colour-coded with a legend, so
+three parallel reviews can be compared on one axis. The charts are inline SVG
+rendered server-side — no chart library, no client-side data fetch, and they
+work with JavaScript off. A long run keeps its shape rather than its tail: past
+400 requests the timeline halves its resolution instead of dropping the
+beginning.
+
+##### A stored result keeps what its run cost
+
+Re-opening a saved answer — the **✓ Full review** button on the board — shows
+the same figures the panel showed when the run finished, not just the answer:
+the headline strip, the charts, and for a pipeline **the line per step**. Which
+step, how long it took, and what it spent, because added together the steps
+stop saying that the synthesis took two minutes and the QA plan twenty-four,
+and that is the first thing anyone asks of a run that took half an hour.
+
+What is not there is everything that only means something while a job is alive:
+nothing to stop, nothing to retry, and no polling. The session id is still
+shown — `claude --resume` either finds the conversation or says it cannot, and
+the id is also how a run is matched to a captured stream.
+
+The breakdown rides on the same `stats` column as the totals (a `RunStats` as
+JSON; see `commands.py`), storing only the fields a step actually reported and
+leaving its timeline to the shared `series` — about 400 bytes per step. The
+column itself is bigger than that: nearly all of it is the timeline the charts
+are drawn from, which measures ~15 KB for a run the size of a typical review
+and up to ~160 KB for a four-step pipeline that reached the 400-sample cap on
+every step. One row per merge request per skill, replaced rather than appended
+to. A result stored before radar kept the breakdown shows its total exactly as
+it always did, and is not back-filled: the per-step numbers were never measured
+for those runs, and inventing them from the timeline would be a worse answer
+than the honest absence.
+
+##### When the numbers themselves are the mystery
+
+Two things the panel says that are easy to misread, and one switch for when
+reading is not enough.
+
+**`IN 0` is not "this run read nothing".** It means no request came back with
+token counts attached. Providers differ here — a gateway in front of a
+third-party model may report usage on some request shapes and not others — so
+whenever any request goes unreported, the details block says so outright:
+
+```
+usage reported   3 of 15 requests   the others came back with no token counts at all,
+                                    so the totals here are only what the provider did
+                                    report — not what the run actually read
+```
+
+Radar takes a request's counts from **whichever** of its events carries them,
+not just the first. On a model that thinks before it acts, the turn opens with a
+thinking block that may carry nothing and the counts arrive on the block after
+it; reading only the first event recorded zero for entire runs against such a
+provider, and made a reporting quirk look like a provider that reports nothing.
+
+**Keep the evidence, then read it back.** Add `--capture` to the command you
+already run, and every skill writes its raw event stream to `./radar-streams`,
+one file per job, each line stamped with when radar saw it — the half no event
+carries, and the half a latency question needs:
+
+```bash
+radar serve --capture                    # or --capture /somewhere/else
+# one file per job: radar-streams/review-9f2c1ab4e7d1.jsonl
+# {"t": 12.481, "event": {"type": "assistant", "message": {...}}}
+```
+
+It is off unless asked for — a forensic tool, not a log — and the panel prints
+the exact command to read each run back, so the next step is a copy and a
+paste. (`RADAR_CAPTURE_STREAM=<dir>` does the same thing for a radar started
+some other way, and wins over the flag.)
+
+Then, with no arguments, `radar diagnose-stream` reads back the newest run:
+
+```
+requests         14, of which 0 reported token counts
+                 ⚠ no request reported any: the provider is not returning usage
+served by        more than one model — this run was not answered by one backend:
+                 deepseek-v4p1-flash@a: 2 requests, median 4.1s, max 6.6s
+                 deepseek-v4p1-flash@b: 12 requests, median 29.5s, max 48.4s
+
+  #  at      wait   context  think  first block  tool
+  1   0:08      8.0s    31.6k    900  thinking     Bash
+  …
+  14  7:06     48.4s    31.1k    900  thinking     Bash
+
+waits            min 8.0s · median 29.5s · max 48.4s
+                 growing steadily: +3.16s per request (r=+1.00)
+                 but they do NOT track the prompt size (r=-0.15) — the prompt
+                 is not what is driving them
+model went quiet 57s at 2:30, 41s at 1:12
+result           completed · 14 turns · 9k out · $0.5100
+```
+
+Those last lines are the point: **growing waits that track the prompt size are
+the skill accumulating context** (fix the skill), and **growing waits that
+ignore it are the provider** (fix the provider, or stop running three of them at
+once). `served by` is what shows a gateway routing concurrent sessions to
+different upstreams — the model string is on every assistant event, so two of
+them in one run is the diagnosis by itself.
+
+`radar diagnose-stream --all` compares every run in the directory instead, which
+is the shape of the question when a pipeline's steps behave differently from
+each other:
+
+```
+run                       reqs  usage  median  max    trend      served by
+------------------------  ----  -----  ------  -----  ---------  -----------------
+review-15839d2d.jsonl     15    0/15   13.6s   57.1s  +3.1s/req  deepseek-flash@b
+db-review-00229c06.jsonl  62    62/62  3.2s    9.4s   flat       deepseek-flash@a
+qa-7c7e0562.jsonl         14    0/14   15.5s   55.2s  +3.4s/req  deepseek-flash@b
+```
+
+Either form takes no config and no network, so a capture from the machine that
+saw the problem reads anywhere — including a plain `claude -p … > run.jsonl`
+somebody produced by hand, which simply comes out with no waits.
 
 ### Launch a QA test plan from the board (shift-left)
 
@@ -458,6 +699,16 @@ skills:
     include_context: true
     context: [gitlab_diff, jira]  # the diff *and* the ticket that motivated it
 ```
+
+**Transient failures are retried.** These fetches are idempotent reads, and the
+one that costs most is the cheapest to survive — a connection reset a minute
+into a pipeline, on the step that merges half an hour of reviews. The GitLab
+session retries a reset or a 429/5xx three times with backoff, and radar retries
+the whole bundle up to three times a few seconds apart, never past the job's own
+deadline. A misconfiguration (an unset variable, a source root that is not a
+directory) is refused immediately instead: it will be just as unset next time.
+The panel says when a fetch is being retried, and reports the real fault if the
+retries run out.
 
 ### Tell a skill where the code is (`source:` and `inputs:`)
 
@@ -678,10 +929,51 @@ of three beats none, and it is told which one is missing. A stage in which
 *every* step failed does stop it, since the next stage would have nothing to
 work from; the panel shows each step's error.
 
+When a stage does stop the run, the pipeline still answers with **everything
+that finished** — a synthesis that could not start is no reason to lose the
+three reviews it was going to merge, which on a slow model is half an hour of
+work. The error names what survived and the output carries it.
+
+**Running one step again.** Every step that ran carries a button on its row:
+**↻ retry** on the one that failed, **↻ run again** on the one that didn't. It
+runs that step and finishes the pipeline from there, keeping every step that
+already finished *before* it — so a synthesis that died on a connection reset
+costs one step to put right instead of the whole review. The resumed step is
+handed the same `## Earlier steps` section the first run gave it, and a retry
+that works clears the error rather than leaving it beside a good answer.
+
+A step that *succeeded* is worth running again for two reasons, and neither is
+a failure radar can detect. A review can finish cleanly and answer badly — a
+zero exit code and a non-empty answer is a success by every measure available
+here. And a synthesis of three reviews is a synthesis of something that no
+longer exists the moment one of those reviews is re-run, so re-running it over
+what is there *now* is the point of having steps at all. That case is one
+click: nothing comes after the synthesis, so only the synthesis runs, over
+whatever the reviews currently say — including a review that failed, which it
+is still told about, because a synthesis that only hears from the steps that
+worked cannot say what went unreviewed.
+
+Every stage *after* the step runs again too, because its input is about to
+change, so the button confirms first, names what that re-runs, and says when an
+answer is about to be replaced. The pipeline's total keeps the earlier attempt's
+tokens and money: it was paid for, and a bill that fell when you re-ran
+something would be worth nothing. The attempt keeps its own row as well —
+*SYNTH (earlier attempt)*, with what it spent — because money in a total with
+no line to account for it is worse than no breakdown at all.
+
+The buttons need the job radar started, which lives in memory for as long as
+`serve` runs — but not only for as long as the panel stays open: re-opening a
+saved answer from the board (**✓ Full review**) finds that job again and shows
+the panel that produced it, rows and all. After a restart there is only the
+saved row, which reads the same and offers nothing it cannot do; run the skill
+again from the board instead.
+
 **Budget.** `timeout_seconds` is worked out for you — the slowest step of each
 stage, summed. Each step is stopped by its own timeout and nothing stops it
-sooner, so that sum is the longest a run can take, and it is what the panel's
-countdown shows. Set `timeout_seconds` higher if you like; a lower figure is
+sooner, so that sum is the longest a run can take *if nobody gives a step more
+time* (see [Running out of time is a
+question](#running-out-of-time-is-a-question-not-a-verdict)), and it is what the
+panel's countdown shows. Set `timeout_seconds` higher if you like; a lower figure is
 refused.
 
 **Progress.** The panel streams every step's live log, each line prefixed with
@@ -913,8 +1205,10 @@ log is on disk in SQLite).
 | `radar poll-once` | One polling pass, then exit (also refreshes the derived snapshot). |
 | `radar poll-once --full` | Same, but ignores the last-polled watermark and re-fetches **every open MR**. Safe any time (events dedup, caches are replaced); run it once after upgrading to backfill discussion threads. |
 | `radar serve [--host H] [--port P]` | Run the dashboard and the background poller. |
+| `radar serve --capture [DIR]` | Same, but keep every run's raw event stream (default `./radar-streams`) for `diagnose-stream` to read back. Off unless asked for. |
 | `radar recompute` | Re-derive every obligation from the event log under the current config. Run after changing SLA rules. |
 | `radar validate` | Validate `config.yaml` and exit. |
+| `radar diagnose-stream [PATH]` | Read back a captured run — the newest one by default, a file if named, or `--all` to compare a whole directory: one line per request with its wait, prompt size, thinking and tool, then whether the waits are growing, whether they track the prompt (the skill's fault) or ignore it (the provider's), which model actually served each request, and what went unreported. Takes no config and no network — a stream captured elsewhere reads fine. |
 | `radar check` | Diagnostics: validate config + the DB, and check GitLab/Jira connectivity (auth, token scope, project reachability) and that the review/QA commands are on PATH. Prints ✅/⚠️/❌ per check; exits non-zero on any failure. Also flags if review-request times came from created-date backfill (inflated breaches) rather than system notes. |
 
 Global flags: `-c/--config PATH` (default `config.yaml`), `-v/--verbose`.
@@ -939,8 +1233,9 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `slas` | Ordered rules; **first match wins**. Each has a `match` (optional `target_branch` glob and/or required `labels`) and `first_response_business_hours` / `approval_business_hours`. The last rule must be the default `match: {}`. |
 | `slas[].assignment_business_hours` | Optional budget for getting **any** reviewer onto an MR that has none — the [NO REVIEWERS](#mrs-with-no-reviewers) chip. Omitted everywhere, the check is off. Set it on **every** rule or none: first match wins outright, so a partial config would silently skip MRs matching the rules that lack it (radar refuses to load one). |
 | `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is **currently** a draft, or the MR carries any `labels` listed here. (Only the current draft state waives; historical draft periods are not subtracted from the clock.) |
-| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `env`, `env_unset`. The names `review`, `qa` and `analyze` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
+| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `timeout_grace_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `env`, `env_unset`. The names `review`, `qa` and `analyze` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
 | `skills[].context` | Which backends radar fetches for the skill and pipes to it on stdin: `gitlab_diff`, `jira`, or a list. Only about merge-request skills — the CI strip's analyser is given the build's commits and log because [`jenkins.analysis.skill`](#analysing-what-broke-it) names it, and setting `context:` on that skill is refused rather than ignored. |
+| `skills[].timeout_grace_seconds` | How long a run that has used up its `timeout_seconds` is **held** — still alive, still spending — for someone to give it more time before it is stopped. Default 300; `0` stops it on its deadline as radar used to. The panel's **＋ 10 min** grants time at any point while a run works, on a plain skill, on each step of a pipeline and on a build analysis. Refused on a `pipeline:` entry: its steps own the clocks. See [Running out of time is a question](#running-out-of-time-is-a-question-not-a-verdict). |
 | `skills[].env` / `skills[].env_unset` | Extra environment for that skill's subprocess, and names it must not inherit. Values export as written; a valueless key is refused (use `env_unset`). radar's own credentials are stripped and refused in both, in any case spelling. radar exports `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` to every skill unless you exported one yourself — the second removes the CLI's own 10-minute background-agent cutoff, leaving `timeout_seconds` as the only clock. See [Headless agents and background work](#headless-agents-and-background-work). |
 | `jira` | `base_url` (builds the `PROJ-123` browse links on the board) and `project_keys` (optional filter so `UTF-8`-shaped tokens aren't matched). Not a credential — fetching a ticket uses `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` from the environment. |
 | `teams` | Named GitLab-username groups; each becomes an *authored* / *to review* filter pill on the board. |
@@ -995,7 +1290,10 @@ GitLab REST ─▶ gitlab_client ─▶ poller ─▶ [ events ]  (append-only, 
 - `jenkins.py` — the CI strip: a small Jenkins client, the state table behind
   the dots, and the background-refreshed cache every request renders from (no
   request path ever calls Jenkins).
-- `commands.py` — launch one skill's command for a job, stream its progress.
+- `commands.py` — launch one skill's command for a job, stream its progress,
+  and measure it (`RunStats`: tokens in/cached/out/thinking, money, requests,
+  tools, subagents, denials, and a per-request timeline).
+- `charts.py` — the inline-SVG charts the panel draws that timeline with.
 - `pipeline.py` — run several skills as one job: stages in order, the steps of
   a stage in parallel, each later step handed the earlier steps' answers.
 - `service.py` / `web/` — read-side dashboard and recompute.
