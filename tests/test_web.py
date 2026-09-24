@@ -321,3 +321,39 @@ def test_refresh_is_absent_without_a_poller(config, tmp_path):
 
     assert "refresh now" not in client.get("/").text
     assert client.post("/refresh").status_code == 404
+
+
+def test_a_running_panel_always_offers_a_way_to_ask_the_server():
+    """The panel is redrawn by an event stream, and a stream can be lost — a
+    sleeping tab, a dropped connection — while the run finishes normally and
+    saves its answer. That left a spinner over a finished run with no way out
+    but closing the panel. The link is rendered from the start, because by the
+    time it is wanted the thing that would have added it is what failed."""
+    html = _render_panel(status="running")
+
+    assert 'class="panel-reload"' in html
+    assert 'hx-get="/qa/status/x"' in html
+
+
+def test_the_redraw_keeps_asking_until_the_panel_is_actually_replaced():
+    """One request, fired once, stranded the panel whenever it did not land.
+    The DOM is the source of truth: a successful swap removes this panel, so
+    the progress log still being in the document means it did not take."""
+    html = _render_panel(status="running")
+
+    assert "function redraw(attempt)" in html
+    assert "setTimeout(function () { redraw(attempt + 1); }, 1500 * attempt);" in html
+    # And when the retries run out it says so rather than spinning in silence.
+    assert 'id="stuck-x"' in html
+
+
+def test_a_run_radar_has_forgotten_is_not_retried_six_times():
+    """The two failures need opposite answers. A 404 means radar was restarted
+    and the job registry — which lives in memory — went with it, so retrying
+    can only produce five more 404s and then a message claiming the run
+    finished, which by then nobody knows."""
+    html = _render_panel(status="running")
+
+    assert 'if (res.status === 404) { say("gone-x"); return; }' in html
+    assert 'id="gone-x"' in html
+    assert "radar has been restarted" in html

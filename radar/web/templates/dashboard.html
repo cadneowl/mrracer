@@ -46,9 +46,13 @@
   </section>
   {% endif %}
 
+  {# `board-refresh` is sent by the panel (an HX-Trigger header) when a run
+     has just finished and when the panel is closed: a result saved a moment
+     ago otherwise reaches its row only on the next minute's tick, and the
+     operator who closes the panel looks for it straight away. #}
   <main id="board"
         hx-get="/partials/board"
-        hx-trigger="every 60s"
+        hx-trigger="every 60s, board-refresh from:body"
         hx-swap="innerHTML">
     {% include "_board.html" %}
   </main>

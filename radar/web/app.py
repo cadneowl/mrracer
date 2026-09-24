@@ -106,6 +106,8 @@ _CI_TICK_S = 15
 # the health rows above it: this is five charts and a page of numbers, and a
 # trajectory does not change meaningfully between one second and the next.
 _AI_TICK_S = 5
+# The event that redraws the board at once (see dashboard.html).
+_BOARD_REFRESH = "board-refresh"
 
 # How often the polish section re-reads a polish run of its own. Faster than the
 # AI stats below it: this is a handful of lines and a spinner, and the thing it
@@ -347,13 +349,25 @@ def _stats_view(stats: RunStats, details: bool = False) -> dict | None:
     billed or still radar's own count: a thinking total nobody can tell apart
     from an estimate is worse than one labelled as an estimate.
     """
-    if not stats.measured:
+    # A run being refused by the provider has usually measured nothing at all —
+    # no tokens, no cost, no turns — so the `measured` gate below would drop the
+    # one fact worth showing. It goes first, and on its own if need be.
+    refused = sum(stats.api_errors.values())
+    if not stats.measured and not refused:
         return None
     pills: list[dict] = []
 
     def pill(label: str, value: str, title: str) -> None:
         pills.append({"label": label, "value": value, "title": title})
 
+    if refused:
+        pill(
+            "provider refused", f"{stats.last_api_error} ×{refused}",
+            "the model provider turned these calls down and the run retried. "
+            "401 is authentication, 429 a rate limit, 5xx the gateway itself — "
+            "none of it reaches the command's stderr, so radar reads it from "
+            "the run's own event stream",
+        )
     if stats.turn_count:
         pill(
             "requests", str(stats.turn_count),
@@ -406,6 +420,24 @@ def _stats_view(stats: RunStats, details: bool = False) -> dict | None:
             "average time one request took the model — radar's own measure while "
             "the run is in flight",
         )
+    # One pill for both, because they answer one question — is the provider
+    # slow to start, or slow to write? — and the strip is kept to a headline.
+    ttft, speed = stats.ttft_s, stats.output_tokens_per_s
+    if ttft is not None or speed is not None:
+        parts, notes = [], []
+        if speed is not None:
+            parts.append(f"{speed:.0f} tok/s")
+            notes.append(
+                f"output tokens per second of model time ({_tokens(stats.output_tokens)} "
+                f"in {_secs(stats.api_ms)}), time to first token included, tools not"
+            )
+        if ttft is not None:
+            parts.append(f"{ttft:.1f}s ttft")
+            notes.append(
+                "time to first token: how long the model took to start answering"
+                + (", averaged over the steps" if stats.ttft_reports > 1 else "")
+            )
+        pill("speed", " · ".join(parts), "; ".join(notes))
     # Not a measurement but a warning, and the one figure here that changes what
     # the answer above it is worth: a denied tool is something the run wanted to
     # look at and was not allowed to.
@@ -653,8 +685,14 @@ def _stats_groups(stats: RunStats) -> list[dict]:
         ("wall clock", _secs(stats.wall_ms) if stats.wall_ms else "", "as the run clocked itself"),
         ("waiting on the model", _secs(stats.api_ms) if stats.api_ms else "",
          f"{_pct(share)} of the run; the rest was tools and radar" if share else ""),
-        ("first token", _secs(stats.first_token_ms) if stats.first_token_ms else "",
-         "from launch to the first word of the answer"),
+        ("time to first token", f"{stats.ttft_s:.1f}s" if stats.ttft_s is not None else "",
+         f"averaged over {stats.ttft_reports} steps; the slowest took "
+         f"{_secs(stats.first_token_ms)}" if stats.ttft_reports > 1 else
+         "from the request to the first word of the answer"),
+        ("output speed",
+         f"{stats.output_tokens_per_s:.0f} tok/s" if stats.output_tokens_per_s else "",
+         "output tokens over the time spent waiting on the model, time to first "
+         "token included"),
         ("per request", f"{stats.avg_response_s:.1f}s" if stats.avg_response_s else "",
          "on average" if stats.billed else "radar's measure, while it runs"),
         ("queued turns", str(stats.queued_turns) if stats.queued_turns else "", ""),
@@ -1204,7 +1242,7 @@ def create_app(
             and (status == "running" or isinstance(runner, PipelineRunner))
         )
         if show_rows:
-            health = _health_context(job.kind, job)
+            health = _health_context(job.kind, job, watch=(status == "running"))
         else:
             # A finished plain skill has nothing to break down, and a
             # re-opened result has no live job to ask — but it carries the
@@ -1242,7 +1280,7 @@ def create_app(
             if build_skill is not None and skill is build_skill and job.title
             else None
         )
-        return templates.TemplateResponse(
+        response = templates.TemplateResponse(
             request,
             "_command_panel.html",
             {
@@ -1278,6 +1316,11 @@ def create_app(
                 "deslop": _deslop_for(job, skill, status, output),
             },
         )
+        if status != "running" and job.id != "stored":
+            # A run that has just ended may have saved a result, and its row
+            # on the board should say so now rather than at the next tick.
+            response.headers["HX-Trigger"] = _BOARD_REFRESH
+        return response
 
     def _ctx_for(snap: dict, project_id: int, mr_iid: int) -> tuple[dict, list[str]]:
         keys = extract_keys(
@@ -1687,13 +1730,28 @@ def create_app(
             "tick_s": _AI_TICK_S,
         }
 
-    def _health_context(kind: str, job: CommandJob) -> dict:
-        """What _job_health.html needs: the rows, and whether to keep refreshing."""
+    def _health_context(kind: str, job: CommandJob, watch: bool = False) -> dict:
+        """What _job_health.html needs: the rows, and whether to keep refreshing.
+
+        ``watch`` marks a fragment that was drawn into a *running* panel, and it
+        is what lets the panel notice that the run has ended. The event stream
+        was the only thing doing that, and a stream is exactly what a browser
+        throws away when it freezes a background tab — leaving a finished run
+        under a spinner, with its answer already on disk. These rows keep
+        arriving because they are ordinary polled requests, so when they come
+        back saying the run is over, they say so loudly enough to redraw the
+        panel around them.
+        """
         runner = runners[kind]
         running = job.status == "running"
         return {
             "kind": kind,
             "job": job,
+            # Only in a panel that is still showing the run as going: rendered
+            # into a finished one it would ask for a redraw of what is already
+            # there, once every time, forever.
+            "redraw_when_done": watch and not running,
+            "watch": watch,
             "rows": _health_rows(runner, job),
             "live": running,
             "stop_all": running and isinstance(runner, PipelineRunner),
@@ -1716,10 +1774,10 @@ def create_app(
     # untyped until validation, so "/review/stop/<id>" would match that route
     # and be refused as a bad merge-request number rather than reach this one.
     @app.get("/{kind}/health/{job_id}", response_class=HTMLResponse)
-    def job_health_rows(request: Request, kind: str, job_id: str):
+    def job_health_rows(request: Request, kind: str, job_id: str, watch: int = 0):
         job = _running_job(kind, job_id)
         return templates.TemplateResponse(
-            request, "_job_health.html", _health_context(kind, job)
+            request, "_job_health.html", _health_context(kind, job, watch=bool(watch))
         )
 
     @app.get("/{kind}/stats/{job_id}", response_class=HTMLResponse)
@@ -1918,7 +1976,9 @@ def create_app(
 
     @app.get("/{kind}/close", response_class=HTMLResponse)
     def command_close(kind: str):
-        return HTMLResponse("")  # htmx swaps this empty content in to dismiss
+        # htmx swaps this empty content in to dismiss — and the board is
+        # redrawn, because closing a panel is when its result is looked for.
+        return HTMLResponse("", headers={"HX-Trigger": _BOARD_REFRESH})
 
     @app.get("/{kind}/stored/{project_id}/{mr_iid}", response_class=HTMLResponse)
     def stored_plan(request: Request, kind: str, project_id: int, mr_iid: int):

@@ -4,7 +4,17 @@
    finished fragment omits the trigger, which stops the polling — and closing
    the panel removes the element, which stops it too. #}
 <div class="job-health"
-     {% if live %}hx-get="/{{ kind }}/health/{{ job.id }}" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
+     {% if live %}hx-get="/{{ kind }}/health/{{ job.id }}{% if watch %}?watch=1{% endif %}" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
+  {% if redraw_when_done %}
+  {# The run has ended and the panel around these rows still shows it going.
+     That panel is redrawn by an event stream, and a browser that freezes a
+     background tab throws the stream away without a word — so the spinner
+     outlives the run, over an answer that is already saved. These rows are
+     ordinary polled requests and kept arriving, so this is the one channel
+     known to still work: it asks for the finished panel, once, on arrival. #}
+  <div hx-get="/{{ kind }}/status/{{ job.id }}" hx-trigger="load"
+       hx-target="#command-panel" hx-swap="innerHTML"></div>
+  {% endif %}
   {% for row in rows %}
   <div class="health-row health-{{ row.state }}{% if row.stalled %} health-stalled{% endif %}{% if row.out_of_time %} health-outoftime{% endif %}">
     <span class="health-name">{{ row.label }}</span>

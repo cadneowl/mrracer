@@ -551,3 +551,8 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 /* A saved sendable version, beside the saved answers. Blue rather than green:
    it is a second thing about the same merge request, not a second answer. */
 .plan-badge-polished { border-color: var(--blue); color: var(--blue); background: rgba(59,130,246,.12); }
+/* The manual way out of a redraw that never came (see _command_panel.html).
+   Quiet — it is an escape hatch, not a thing to reach for — but always there. */
+.panel-reload { color: var(--muted); font-size: 12px; text-decoration: none; padding: 2px 6px;
+  border: 1px solid var(--line); border-radius: 10px; }
+.panel-reload:hover { color: var(--text); border-color: var(--green); }

@@ -360,7 +360,9 @@ def test_the_panel_shows_every_step_and_stops_one(tmp_path):
     client = _app(tmp_path)
     start = client.post("/full/1/7")
     job_id = re.search(r'data-job-id="([0-9a-f]+)"', start.text).group(1)
-    assert f'hx-get="/full/health/{job_id}"' in start.text
+    # The rows poll their own endpoint, and while the panel around them shows
+    # the run as going they ask to be told when it stops (see `watch`).
+    assert f'hx-get="/full/health/{job_id}?watch=1"' in start.text
 
     _until(lambda: "arch says hi" in client.get(f"/full/health/{job_id}").text)
     health = client.get(f"/full/health/{job_id}").text
@@ -430,3 +432,73 @@ def test_the_panel_routes_are_reserved_names(tmp_path, name):
     )
     with pytest.raises(ConfigError, match="reserved"):
         load_config(path)
+
+
+def test_a_finished_run_redraws_the_panel_without_the_event_stream(tmp_path):
+    """The stuck panel, reproduced and closed off.
+
+    A pipeline finishes and saves its answer; the panel over it keeps spinning
+    for another twenty minutes. The panel is redrawn by an event stream, and a
+    browser that freezes a background tab throws the stream away without firing
+    an error — so nothing ever notices, and the only way to the answer is to
+    close the panel and find it again.
+
+    The rows underneath kept arriving the whole time, because they are ordinary
+    polled requests. So they are what carries the news: a `watch`ed fragment
+    that comes back with the run over asks for the finished panel itself.
+    """
+    client = _app(tmp_path)
+    start = client.post("/full/1/7")
+    job_id = re.search(r'data-job-id="([0-9a-f]+)"', start.text).group(1)
+
+    # While it runs: polling, and nothing asking for a redraw yet.
+    running = client.get(f"/full/health/{job_id}?watch=1").text
+    assert 'hx-trigger="every 3s"' in running
+    assert f'hx-get="/full/status/{job_id}"' not in running
+
+    _until(lambda: client.get(f"/full/status/{job_id}").text.count("review-output") > 0, 60)
+
+    # Now it is over. The rows say so, stop polling, and ask for the panel.
+    ended = client.get(f"/full/health/{job_id}?watch=1").text
+    assert 'hx-trigger="every 3s"' not in ended, "a finished run must stop polling"
+    assert f'hx-get="/full/status/{job_id}"' in ended
+    assert 'hx-target="#command-panel"' in ended and 'hx-trigger="load"' in ended
+
+
+def test_rows_in_an_already_finished_panel_do_not_ask_for_a_redraw(tmp_path):
+    """Without this the fragment would ask to redraw the panel it is already
+    part of, once on every arrival, for as long as it is open."""
+    client = _app(tmp_path)
+    start = client.post("/full/1/7")
+    job_id = re.search(r'data-job-id="([0-9a-f]+)"', start.text).group(1)
+    _until(lambda: client.get(f"/full/status/{job_id}").text.count("review-output") > 0, 60)
+
+    # No `watch`: these rows were drawn into a panel that already shows the answer.
+    settled = client.get(f"/full/health/{job_id}").text
+    assert f'hx-get="/full/status/{job_id}"' not in settled
+    # And the finished panel itself carries no redraw either.
+    assert f'hx-get="/full/status/{job_id}"' not in client.get(f"/full/status/{job_id}").text
+
+
+def test_the_board_is_redrawn_when_a_run_ends_and_when_its_panel_closes(tmp_path):
+    """A saved result reached its row only on the board's next 60s tick, so the
+    operator who read the answer and closed the panel found the row unchanged.
+    The finished panel and the close both tell the board to redraw now."""
+    client = _app(tmp_path)
+    start = client.post("/full/1/7")
+    job_id = re.search(r'data-job-id="([0-9a-f]+)"', start.text).group(1)
+    # Nothing to show yet, and a board redrawn every time a panel opens is waste.
+    assert "HX-Trigger" not in start.headers
+
+    _until(lambda: client.get(f"/full/status/{job_id}").text.count("review-output") > 0, 60)
+    assert client.get(f"/full/status/{job_id}").headers["HX-Trigger"] == "board-refresh"
+    assert client.get("/full/close").headers["HX-Trigger"] == "board-refresh"
+    assert "board-refresh from:body" in client.get("/").text
+
+
+def test_a_running_panel_checks_on_the_run_when_its_tab_is_looked_at_again(tmp_path):
+    """A frozen background tab gets no stream events, timers or polls, and is
+    not told what it missed when it wakes."""
+    client = _app(tmp_path)
+    start = client.post("/full/1/7")
+    assert 'addEventListener("visibilitychange", onVisible)' in start.text
