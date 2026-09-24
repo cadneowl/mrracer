@@ -457,6 +457,11 @@ class RunStats:
     api_ms: int = 0            # time the run spent waiting on the model
     wall_ms: int = 0           # how long the run took, as the CLI clocked it
     first_token_ms: int = 0    # from launch to the first token of the answer
+    # The same wait, added up over every result that reported one, so a
+    # pipeline's time to first token is its steps' average rather than only
+    # the slowest of them (which is what ``first_token_ms`` keeps).
+    ttft_ms_total: int = 0
+    ttft_reports: int = 0
     reported_turns: int = 0    # the run's own turn count (``num_turns``)
     queued_turns: int = 0
     # Radar's own measure of how long the model takes to start answering, summed
@@ -484,6 +489,14 @@ class RunStats:
     # A review that could not read the file it wanted still writes an answer, so
     # this is the difference between a finding and a guess.
     denials: dict = field(default_factory=dict)  # tool name -> denied calls
+    # Failed API calls the run retried through, as "<status> <reason>" -> count.
+    # The provider's own refusals: a 401, a 429, a 500 from a gateway. The CLI
+    # retries these quietly and, when the retries run out, exits non-zero having
+    # printed nothing about them to stderr — so without this the reason a run
+    # failed is discarded while the run is still reporting it.
+    api_errors: dict = field(default_factory=dict)
+    # The last one, kept whole so the panel can lead with it.
+    last_api_error: str = ""
     errors: int = 0                              # results the run flagged as errors
     outcome: str = ""                            # the run's own terminal_reason
     stop_reason: str = ""
@@ -568,6 +581,33 @@ class RunStats:
         return None
 
     @property
+    def ttft_s(self) -> float | None:
+        """Time to first token, in seconds, or None if the run never said.
+
+        The CLI's own ``ttft_ms``, averaged over the results that reported it —
+        one per plain run, one per step of a pipeline. A result stored before
+        the average was kept has only ``first_token_ms``, which stands in.
+        """
+        if self.ttft_reports:
+            return self.ttft_ms_total / 1000 / self.ttft_reports
+        if self.first_token_ms:
+            return self.first_token_ms / 1000
+        return None
+
+    @property
+    def output_tokens_per_s(self) -> float | None:
+        """How fast the model wrote: output tokens over the time spent on it.
+
+        Over ``api_ms``, the model's time and nothing else — tools and radar are
+        not in it — but time to first token is, so it is end-to-end throughput
+        rather than the decode speed alone. Only once the run has billed its
+        output: live, radar does not count output at all (see ``RunStats``).
+        """
+        if not self.output_tokens or not self.api_ms:
+            return None
+        return self.output_tokens / (self.api_ms / 1000)
+
+    @property
     def model_share(self) -> float | None:
         """What fraction of the run was the model thinking, 0..1.
 
@@ -615,7 +655,8 @@ class RunStats:
 _SUM_FIELDS = (
     "turns", "requests_with_usage", "input_tokens", "cache_read_tokens", "cache_write_tokens",
     "cache_write_5m_tokens", "cache_write_1h_tokens", "output_tokens",
-    "thinking_tokens", "cost_usd", "api_ms", "wall_ms", "reported_turns",
+    "thinking_tokens", "cost_usd", "api_ms", "wall_ms", "ttft_ms_total", "ttft_reports",
+    "reported_turns",
     "queued_turns", "latency_s", "latency_turns", "tool_calls", "web_searches",
     "web_fetches", "subagents_spawned", "subagents_completed", "subagents_failed",
     "subagents_killed", "subagents_refused", "errors", "tools_offered",
@@ -629,6 +670,7 @@ _COUNTER_FIELDS = ("tools", "subagent_types", "denials")
 _TEXT_FIELDS = (
     "model", "cli_version", "permission_mode", "output_style", "service_tier",
     "speed", "inference_geo", "outcome", "stop_reason", "rate_limit_status",
+    "last_api_error",
 )
 
 
@@ -1505,8 +1547,92 @@ class CommandRunner:
                     job.persist_error = f"result was generated but could not be saved: {exc}"
             job.status = "done"
         else:
-            detail = stderr_text.strip() or output or f"exited with code {proc.returncode}"
-            _fail(job, detail.strip())
+            # The exit code first, and always. It used to appear only when the
+            # child had written nothing to stderr — so a run that failed while
+            # printing a harmless warning was reported *as* that warning, and
+            # the panel confidently named a cause that was nothing of the kind.
+            # (A gateway that warns `unrecognized_model` on every call and then
+            # works is what taught this lesson.)
+            #
+            # stderr is kept, labelled as what it is rather than as the reason,
+            # and tailed: the end is where a process says why it is stopping.
+            detail = f"{self.kind} exited with code {proc.returncode}"
+            # What the provider said, first, because when it said anything it is
+            # almost always the reason — and it is the one thing the child never
+            # writes to stderr. A run that spent three minutes being refused a
+            # dozen times should not be reported as the warning it printed on
+            # the way in (see `api_retry` in `_ingest`).
+            if job.stats.api_errors:
+                refusals = ", ".join(
+                    f"{label} ×{count}" for label, count in job.stats.api_errors.items()
+                )
+                detail += (
+                    f"\n\nThe model provider refused every call: {refusals}. "
+                    "The run retried until it ran out of attempts and then gave up, "
+                    "so nothing it did was ever sent to a model."
+                )
+                if job.stats.last_api_error.startswith("HTTP 401"):
+                    # The order here is the order to look, and it is not the
+                    # obvious one. A settings file in the working directory
+                    # outranks the user-level one the skill's CLAUDE_CONFIG_DIR
+                    # names, so a skill can be given one gateway's token and
+                    # sent to another gateway entirely — which reads as a dead
+                    # credential and is nothing of the kind. It is named first
+                    # because it is the only one of these that is invisible from
+                    # the skill's own configuration.
+                    detail += (
+                        "\n\n401 is authentication: this skill's credential is being "
+                        "rejected by whatever endpoint it actually reached. Check, in "
+                        "this order:\n"
+                        f"  1. {job.cwd or os.getcwd()}/.claude/settings.json — a "
+                        "settings file in the working directory overrides the one the "
+                        "skill names, including ANTHROPIC_BASE_URL. A token for one "
+                        "gateway sent to another fails exactly like a bad token.\n"
+                        "  2. the skill's env: block in radar's config\n"
+                        "  3. the auth token in the CLAUDE_CONFIG_DIR settings.json it names"
+                    )
+            noise = stderr_text.strip()
+            if noise:
+                detail += (
+                    "\n\nIt wrote this to stderr — which may or may not be why:"
+                    f"\n\n{noise[-4000:]}"
+                )
+            elif output.strip():
+                detail += (
+                    "\n\nIt wrote nothing to stderr. What it had written when it "
+                    f"stopped:\n\n{output.strip()[:2000]}"
+                )
+            else:
+                detail += (
+                    ". It wrote nothing at all — no answer and no error. A command "
+                    "that says nothing usually could not start: check that the "
+                    "first word of `command:` is the one you mean, and that "
+                    "`working_dir` is a directory this radar can read."
+                )
+            # What it was actually asked to do. This is the half that is never
+            # in the child's own message and is exactly what the next question
+            # asks: which command, run where, with how much on its stdin.
+            piped = (
+                f"{len(stdin_text):,} characters" if stdin_text is not None
+                else "nothing was piped"
+            )
+            detail += (
+                f"\n\nradar ran: {shlex.join(argv)}"
+                f"\nin: {job.cwd or os.getcwd()}"
+                f"\nstdin: {piped}"
+            )
+            # And the same thing in the log, because until now a failed run left
+            # no trace on the server at all: the operator watching the terminal
+            # saw a skill start and never heard how it ended, and the only copy
+            # of the reason was in a panel that closing threw away.
+            log.error(
+                "%s failed: exit %s · cwd %s · stdin %s chars · provider: %s · stderr: %s",
+                self.kind, proc.returncode, job.cwd or os.getcwd(),
+                len(stdin_text) if stdin_text is not None else 0,
+                job.stats.last_api_error or "no refusals",
+                noise[-2000:] or "(empty)",
+            )
+            _fail(job, detail)
 
     def _held_for_an_answer(self, job: CommandJob) -> bool:
         """Whether a run that is out of time is being held rather than killed.
@@ -1764,6 +1890,29 @@ class CommandRunner:
                 description = stats.get("tasks", {}).get(str(obj.get("task_id")), "a subagent")
                 status = _short(str(obj.get("status") or "ended"), 30)
                 self._add(job, "log", f"subagent {status}: {description}")
+            elif subtype == "api_retry":
+                # The provider refused and the CLI is trying again. This is the
+                # single most useful line in the whole stream when a run dies:
+                # ten of these at 401 is an expired token, at 429 a rate limit,
+                # at 5xx a gateway falling over — and none of it reaches stderr,
+                # so radar used to report such a run as whatever unrelated
+                # warning the CLI happened to print instead.
+                status = _positive_int(obj, "error_status")
+                reason = _text(obj, "error", 60) or "no reason given"
+                label = f"HTTP {status} {reason}" if status else reason
+                _bump(job.stats.api_errors, label)
+                job.stats.last_api_error = label
+                attempt = _positive_int(obj, "attempt")
+                total = _positive_int(obj, "max_retries")
+                wait = _positive_int(obj, "retry_delay_ms")
+                where = f"attempt {attempt}/{total}" if attempt and total else "retrying"
+                line = f"⚠ the model provider refused: {label} ({where}"
+                line += f", waiting {wait // 1000}s)" if wait else ")"
+                self._add(job, "log", line)
+                # And on the server, where someone watching the terminal is.
+                log.warning(
+                    "%s: provider refused: %s (%s)", self.kind, label, where
+                )
             elif subtype == "thinking_tokens":
                 # The CLI's own running estimate of what the model is thinking,
                 # in tokens. `estimated_tokens` restarts with each turn, so it is
@@ -2059,7 +2208,11 @@ class CommandRunner:
         stats.cost_usd += _positive_float(obj, "total_cost_usd")
         stats.api_ms += _positive_int(obj, "duration_api_ms")
         stats.wall_ms += _positive_int(obj, "duration_ms")
-        stats.first_token_ms = max(stats.first_token_ms, _positive_int(obj, "ttft_ms"))
+        ttft = _positive_int(obj, "ttft_ms")
+        if ttft:
+            stats.first_token_ms = max(stats.first_token_ms, ttft)
+            stats.ttft_ms_total += ttft
+            stats.ttft_reports += 1
         stats.reported_turns += _positive_int(obj, "num_turns")
         stats.queued_turns += _positive_int(obj, "queued_turn_count")
 

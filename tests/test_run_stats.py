@@ -495,7 +495,7 @@ def test_the_strip_names_every_figure_it_shows():
 
     assert shown == {
         "requests": "3", "in": "59.4k", "cached": "83%", "out": "479",
-        "thinking": "134", "avg": "2.3s",
+        "thinking": "134", "avg": "2.3s", "speed": "69 tok/s",
     }
     # And the split the bill is actually made of is one hover away.
     hover = next(pill["title"] for pill in view["pills"] if pill["label"] == "in")
@@ -783,6 +783,47 @@ def test_where_the_time_went():
     assert stats.queued_turns == 2
 
 
+def test_time_to_first_token_and_output_speed():
+    """How long the model takes to start, and how fast it writes once it has —
+    the two numbers that tell a slow provider from a long answer."""
+    runner, job = _runner(), _job()
+    _feed(runner, job, _FULL_RESULT)
+    stats = job.stats
+
+    assert stats.ttft_s == 1.948
+    # 411 billed output tokens over 7.478s of model time.
+    assert round(stats.output_tokens_per_s) == 55
+    shown = {pill["label"]: pill["value"] for pill in _stats_view(stats)["pills"]}
+    assert shown["speed"] == "55 tok/s · 1.9s ttft"
+
+
+def test_output_speed_waits_for_the_billed_output():
+    """Live, radar counts no output at all, so a speed then would read as zero
+    tokens a second from a model that is busy writing."""
+    stats = RunStats(turns=2, input_tokens=900, api_ms=5000)
+    assert stats.output_tokens_per_s is None
+    assert stats.ttft_s is None
+    assert "speed" not in {pill["label"] for pill in _stats_view(stats)["pills"]}
+
+
+def test_a_pipeline_averages_its_steps_time_to_first_token():
+    """The slowest step alone would make every pipeline look like its worst
+    provider; the average is what a step can expect."""
+    fast = RunStats(turns=1, output_tokens=100, api_ms=1000,
+                    first_token_ms=1000, ttft_ms_total=1000, ttft_reports=1)
+    slow = RunStats(turns=1, output_tokens=300, api_ms=5000,
+                    first_token_ms=3000, ttft_ms_total=3000, ttft_reports=1)
+    total = aggregate_stats([fast, slow])
+
+    assert total.ttft_s == 2.0
+    assert total.first_token_ms == 3000
+    assert round(total.output_tokens_per_s) == round(400 / 6)
+
+
+def test_a_result_stored_before_the_average_still_has_a_time_to_first_token():
+    assert stats_from_json(json.dumps({"turns": 1, "first_token_ms": 2500})).ttft_s == 2.5
+
+
 def test_denied_tool_calls_are_surfaced():
     """Radar runs skills with `--permission-mode dontAsk`: a tool off the
     allowlist is refused without asking and the run writes its answer anyway.
@@ -989,7 +1030,7 @@ def test_the_headline_stays_a_headline():
     _feed(runner, job, _INIT, *_TURNS, _FULL_RESULT)
 
     assert "groups" not in _stats_view(job.stats)
-    assert len(_stats_view(job.stats)["pills"]) <= 8
+    assert len(_stats_view(job.stats)["pills"]) <= 9
 
 
 def test_a_pipelines_total_adds_the_new_numbers_up_too():
@@ -1723,3 +1764,53 @@ def test_a_slow_failure_does_not_buy_a_retry_it_cannot_afford(tmp_path):
     # it has eaten 2s of a 5s budget there is not.
     assert "Connection reset by peer" in job.error, job.error
     assert elapsed < 4.5, f"the fetch ran {elapsed:.1f}s of a 5s budget and retried anyway"
+
+
+# --- what the provider said, when it refused -------------------------------
+
+
+def _retry(status: int, reason: str, attempt: int = 1, total: int = 10) -> dict:
+    return {
+        "type": "system", "subtype": "api_retry", "error_status": status,
+        "error": reason, "attempt": attempt, "max_retries": total,
+        "retry_delay_ms": 37312,
+    }
+
+
+def test_a_provider_refusal_is_read_from_the_stream(tmp_path):
+    """The reason a run died is in its own event stream and nowhere else: the
+    CLI retries a 401 quietly and then exits non-zero having printed only
+    whatever unrelated warning it happened to emit. Radar used to report that
+    warning as the cause."""
+    from radar.commands import CommandJob, CommandRunner
+    from radar.config import SkillConfig
+
+    runner = CommandRunner(SkillConfig(name="review", command="x"), "review")
+    job = CommandJob(id="j", kind="review")
+    stats: dict = {}
+    for attempt in (1, 2, 10):
+        runner._ingest(job, json.dumps(_retry(401, "authentication_failed", attempt)),
+                       [], [], stats)
+
+    assert job.stats.api_errors == {"HTTP 401 authentication_failed": 3}
+    assert job.stats.last_api_error == "HTTP 401 authentication_failed"
+    # And it reaches the panel's live log while it is happening, not only after.
+    said = " ".join(item["text"] for item in job.progress)
+    assert "the model provider refused" in said and "401" in said
+    assert "attempt 10/10" in said
+
+
+def test_a_refused_run_still_shows_the_refusal_though_it_measured_nothing():
+    """A run the provider turned down has no tokens, no cost and no turns, so
+    the "did this report anything?" gate would drop the one fact worth having."""
+    from radar.web.app import _stats_view
+
+    stats = RunStats()
+    stats.api_errors = {"HTTP 401 authentication_failed": 10}
+    stats.last_api_error = "HTTP 401 authentication_failed"
+    assert not stats.measured          # nothing was spent — nothing got through
+
+    view = _stats_view(stats)
+    assert view is not None
+    labels = {p["label"]: p["value"] for p in view["pills"]}
+    assert labels["provider refused"] == "HTTP 401 authentication_failed ×10"

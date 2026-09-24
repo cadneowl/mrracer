@@ -242,6 +242,27 @@
         <span class="countdown{% if remaining_s <= 60 %} low{% endif %}"
               id="clock-{{ job.id }}" data-remaining="{{ remaining_s }}">{{ clock_text }}</span>
         {% endif %}
+        {# The way out of a redraw that never came. The panel is driven by an
+           event stream, and a stream can be lost — by a sleeping tab, a dropped
+           connection, a proxy — while the run itself finishes normally and its
+           answer is saved. This asks the server what happened, which is all the
+           stream was going to do. Always here, not only once something has gone
+           wrong: by the time it is needed, whatever detects it may be the thing
+           that failed. #}
+        <a class="panel-reload" href="#"
+           hx-get="/{{ kind }}/status/{{ job.id }}"
+           hx-target="#command-panel" hx-swap="innerHTML"
+           title="Ask the server where this run has got to. Safe at any point — it re-reads the run, it does not start one.">↻ reload</a>
+      </div>
+      <div class="save-warn" id="stuck-{{ job.id }}" hidden>
+        ⚠ This run has finished, but the panel could not refresh itself — the
+        live connection to radar was lost. Its answer is saved: press ↻ reload
+        above, or re-open it from the board.
+      </div>
+      <div class="save-warn" id="gone-{{ job.id }}" hidden>
+        ⚠ radar has been restarted since this panel was opened, so it no longer
+        knows about this run — what a run is doing is held in memory, not on
+        disk. If it had finished and saved an answer, the board still has it.
       </div>
       <ul class="progress-log" id="plog-{{ job.id }}" data-job-id="{{ job.id }}" data-kind="{{ kind }}"></ul>
       <script>
@@ -292,6 +313,47 @@
           el.scrollTop = el.scrollHeight;
         });
         var done = false;
+        // Redraw the panel with the finished run in it, and keep asking until
+        // it actually happens.
+        //
+        // This used to be one request, fired once. When it did not land — a
+        // dropped connection, a tab asleep at the moment the run ended, a
+        // server hiccup — the panel was stranded: a spinner over a run that had
+        // finished twenty minutes earlier, with the answer sitting on disk and
+        // no way to reach it but closing the panel. Nothing retried and nothing
+        // said anything, so it read as a hung job rather than a lost redraw.
+        //
+        // The DOM is what says whether it worked: a successful swap replaces
+        // this whole panel, so our own progress log stops being in the
+        // document. Still there means it did not take.
+        var url = "/" + kind + "/status/" + id;
+        function say(id_) {
+          var note = document.getElementById(id_);
+          if (note) note.hidden = false;
+        }
+        function again(attempt) {
+          if (!document.body.contains(el)) return;   // the swap took after all
+          if (attempt >= 6) { say("stuck-{{ job.id }}"); return; }
+          setTimeout(function () { redraw(attempt + 1); }, 1500 * attempt);
+        }
+        function redraw(attempt) {
+          if (!document.body.contains(el) || !window.htmx) return;
+          // Asked before it is swapped, because the two failures need opposite
+          // answers and htmx alone cannot tell them apart. A 404 means radar no
+          // longer has this run — it was restarted, and the job registry is in
+          // memory — so retrying can only ever produce five more 404s and a
+          // message claiming the run finished, which nobody knows. Anything
+          // else is a hiccup worth asking again about.
+          fetch(url, { headers: { "HX-Request": "true" } }).then(function (res) {
+            if (!document.body.contains(el)) return;
+            if (res.status === 404) { say("gone-{{ job.id }}"); return; }
+            if (!res.ok) { again(attempt); return; }
+            htmx.ajax("GET", url, { target: "#command-panel", swap: "innerHTML" });
+            // The DOM is what says whether it worked: a successful swap
+            // replaces this panel, so our own progress log leaves the document.
+            setTimeout(function () { again(attempt); }, 1500);
+          }).catch(function () { again(attempt); });
+        }
         function finish() {
           if (done) return;
           done = true;
@@ -299,13 +361,31 @@
           es.close();
           // Only redraw a panel that is still on screen. Reaching here because
           // the operator closed it means the run's result is not wanted back.
-          if (document.body.contains(el) && window.htmx) {
-            htmx.ajax("GET", "/" + kind + "/status/" + id,
-                      { target: "#command-panel", swap: "innerHTML" });
-          }
+          redraw(1);
         }
         es.addEventListener("end", finish);
         es.onerror = finish;  // server closed the stream or a network hiccup
+
+        // And ask again the moment the tab is looked at. A background tab can
+        // be frozen outright — no stream events, no timers, no polling — for
+        // as long as the run takes, and whatever it missed is not replayed
+        // when it wakes. The operator coming back to it is exactly when the
+        // answer is wanted, so this is when to check, not a minute later.
+        function onVisible() {
+          if (!document.body.contains(el)) {
+            document.removeEventListener("visibilitychange", onVisible);
+            return;
+          }
+          if (done || document.hidden) return;
+          fetch(url, { headers: { "HX-Request": "true" } }).then(function (res) {
+            return res.ok ? res.text() : null;
+          }).then(function (html) {
+            // Still running is the panel with the spinner in it; anything else
+            // is a finished run this panel has not been told about.
+            if (html !== null && html.indexOf('class="review-loading"') === -1) finish();
+          }).catch(function () { /* the stream and the rows are still trying */ });
+        }
+        document.addEventListener("visibilitychange", onVisible);
       })();
       </script>
       {% elif status == "done" %}
