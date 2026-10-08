@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -25,9 +26,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 
+from .. import runlog
 from ..charts import Series, chart
 from ..coach import build_coach
 from ..commands import (
+    MODEL_KEY,
     SNAPSHOT_KEYS,
     CommandJob,
     RunStats,
@@ -67,6 +70,9 @@ def _asset_version(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
 
 COOKIE_NAME = "radar_view"
+# The model picked for the next run (see `models:` in the config). A cookie like
+# the view filter: it is this browser's choice, and it should survive a reload.
+MODEL_COOKIE = "radar_model"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365  # 1 year
 
 
@@ -267,6 +273,15 @@ def _clock_text(remaining_s: int | None) -> str:
         # what the choice is; this only has to stop contradicting them.
         return "out of time"
     return f"{remaining_s // 60}:{remaining_s % 60:02d} left"
+
+
+def _parse_iso(stamp: str) -> datetime | None:
+    """A stored ISO timestamp, timezone-aware, or None if it is not one."""
+    try:
+        when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=UTC)
 
 
 def _duration(seconds: int) -> str:
@@ -1010,6 +1025,14 @@ def create_app(
     templates.env.globals["css_version"] = _asset_version(_BASE / "static" / "radar.css")
     skills_by_name = {s.name: s for s in config.skills}
     runners = build_runners(config.skills)
+    # Every run is recorded when it ends — each skill, each pipeline and each
+    # of its steps — so models can be compared across runs (see `runlog`). The
+    # results saved before the record existed are added to it once.
+    for runner in runners.values():
+        runner.on_finish = runlog.recorder(db_path, runner)
+    with Database(db_path) as db:
+        runlog.backfill(db)
+        runlog.reanalyse(db)
     enabled = {s.name: s.enabled for s in config.skills}
 
     def _skill_view(s) -> dict:
@@ -1023,9 +1046,24 @@ def create_app(
         if s.stores_result and s is not config.analysis_skill
     ]
 
-    def context(view: str | None) -> dict:
+    model_ids = {m.id for m in config.models}
+
+    def _chosen_model(request: Request) -> str:
+        """The model this browser picked for its next run, or "" for the
+        command's own default. Only ever one the config offers: the cookie is
+        the browser's to change, and what reaches a child's environment is not."""
+        picked = request.cookies.get(MODEL_COOKIE) or ""
+        return picked if picked in model_ids else ""
+
+    def _with_model(request: Request, ctx: dict) -> dict:
+        picked = _chosen_model(request)
+        return {**ctx, MODEL_KEY: picked} if picked else ctx
+
+    def context(view: str | None, request: Request | None = None) -> dict:
         with Database(db_path) as db:
             data = build_dashboard(db, config, view=view)
+        data["models"] = [{"id": m.id, "label": m.label} for m in config.models]
+        data["chosen_model"] = _chosen_model(request) if request is not None else ""
         data["poll_interval_minutes"] = config.gitlab.poll_interval_minutes
         data["can_refresh"] = poll_now is not None
         data["enabled_skills"] = [
@@ -1220,7 +1258,10 @@ def create_app(
             return None
         return _deslop_view(source, job.kind, _deslop_url(source, job.kind, job.id), output)
 
-    def _panel(request: Request, job, generated_at: str | None = None) -> HTMLResponse:
+    def _panel(
+        request: Request, job, generated_at: str | None = None, back_url: str | None = None,
+        polish: bool = True,
+    ) -> HTMLResponse:
         skill = skills_by_name.get(job.kind)
         # Read the job's mutable state ONCE, and render from that read. The
         # worker thread flips status while this request is being served, so a
@@ -1293,6 +1334,8 @@ def create_app(
                 "heading": skill.label if skill else job.kind,
                 "icon": skill.icon if skill else "▶",
                 "generated_at": generated_at,
+                # Back to the list of runs this one was opened from, if it was.
+                "back_url": back_url,
                 # Seconds left of the worker's budget, for the panel's
                 # countdown; None once there is no clock left to show. Uses the
                 # status read above, not a fresh one — see _remaining_s.
@@ -1313,7 +1356,7 @@ def create_app(
                 # The polish section: a rewrite of this answer fit to send, on
                 # demand, kept beside the answer rather than replacing it. None
                 # when this panel has nothing to offer one (see `_deslop_for`).
-                "deslop": _deslop_for(job, skill, status, output),
+                "deslop": _deslop_for(job, skill, status, output) if polish else None,
             },
         )
         if status != "running" and job.id != "stored":
@@ -1341,13 +1384,25 @@ def create_app(
         token = (view or None) if view is not None else cookie
 
         resp = templates.TemplateResponse(
-            request, "dashboard.html", context(token) | {"ci": _ci_view()}
+            request, "dashboard.html", context(token, request) | {"ci": _ci_view()}
         )
         if view is not None:
             if token:
                 resp.set_cookie(COOKIE_NAME, token, max_age=COOKIE_MAX_AGE, samesite="lax")
             else:
                 resp.delete_cookie(COOKIE_NAME)
+        return resp
+
+    @app.post("/model", response_class=HTMLResponse)
+    def pick_model(model: str = ""):
+        """Remember the model for this browser's next runs; "" is the default."""
+        if model and model not in model_ids:
+            raise HTTPException(status_code=400, detail=f"{model!r} is not offered")
+        resp = HTMLResponse("", status_code=204)
+        if model:
+            resp.set_cookie(MODEL_COOKIE, model, max_age=COOKIE_MAX_AGE, samesite="lax")
+        else:
+            resp.delete_cookie(MODEL_COOKIE)
         return resp
 
     @app.get("/partials/board", response_class=HTMLResponse)
@@ -1395,6 +1450,7 @@ def create_app(
             "title": job.name,
             "subject": f"#{build}",
         }
+        ctx = _with_model(request, ctx)
         client = jenkins.client
 
         def on_success(finished) -> None:
@@ -1596,7 +1652,7 @@ def create_app(
             running = runner.get(previous[0]) if previous else None
             if running is None or running.status != "running":
                 started = runner.start(
-                    _polish_ctx(source, subject),
+                    _with_model(request, _polish_ctx(source, subject)),
                     on_success=on_success,
                     stdin_provider=provider,
                 )
@@ -1887,6 +1943,7 @@ def create_app(
         if snap is None:
             raise HTTPException(status_code=404, detail="unknown merge request")
         ctx, keys = _ctx_for(snap, project_id, mr_iid)
+        ctx = _with_model(request, ctx)
 
         def on_success_for(name: str):
             """What to do with a finished result of skill ``name`` for this MR."""
@@ -1979,6 +2036,124 @@ def create_app(
         # htmx swaps this empty content in to dismiss — and the board is
         # redrawn, because closing a panel is when its result is looked for.
         return HTMLResponse("", headers={"HX-Trigger": _BOARD_REFRESH})
+
+    def _local(stamp: str) -> str:
+        """"2026-09-24 09:39" in the board's timezone, from a stored ISO stamp."""
+        when = _parse_iso(stamp)
+        if when is None:
+            return stamp[:16]
+        return when.astimezone(config.calendar.tz_for(None)).strftime("%Y-%m-%d %H:%M")
+
+    def _run_line(row: dict, latest_id: str | None) -> dict:
+        """One run, as the run list shows it."""
+        try:
+            found = json.loads(row.get("findings") or "{}")
+            measured = json.loads(row.get("metrics") or "{}")
+        except ValueError:
+            found, measured = {}, {}
+        found = found if isinstance(found, dict) else {}
+        measured = measured if isinstance(measured, dict) else {}
+        elapsed = measured.get("elapsed_s") or (measured.get("wall_ms") or 0) / 1000
+        requested = measured.get("requested_model") or ""
+        model = row.get("model") or ""
+        return {
+            "id": row["id"],
+            "url": f"/{row['kind']}/run/{quote(row['id'], safe='')}",
+            "when": _local(row.get("ended_at") or ""),
+            "model": model.rsplit("/", 1)[-1] if model else "",
+            # The pick and the model that answered, when they differ — which
+            # is worth seeing, because the second is the one being compared.
+            "requested": requested.rsplit("/", 1)[-1]
+            if requested and requested != model else "",
+            "status": row["status"],
+            "verdict": found.get("verdict", ""),
+            "blockers": found.get("blockers"),
+            "high": found.get("high"),
+            "medium": found.get("medium"),
+            "tests": found.get("tests_proposed") if found.get("shape") == "qa" else None,
+            "cost": _money(measured.get("cost_usd") or 0),
+            "time": _duration(int(elapsed)) if elapsed else "",
+            "ttft": f"{measured['ttft_s']:.1f}s" if measured.get("ttft_s") else "",
+            "tok_s": f"{measured['tokens_per_s']:.0f}" if measured.get("tokens_per_s") else "",
+            "in_pipeline": bool(row.get("parent_id")),
+            "saved": row["source"] != "live",
+            "latest": row["id"] == latest_id,
+            "has_answer": bool((row.get("output") or "").strip()),
+        }
+
+    @app.get("/{kind}/runs/{project_id}/{mr_iid}", response_class=HTMLResponse)
+    def run_list(request: Request, kind: str, project_id: int, mr_iid: int):
+        """Every run of one skill on one MR — the saved badge opens this.
+
+        The board keeps one answer per MR per skill, and the next run replaces
+        it; the run record keeps all of them. This is where the others are
+        read: when each ran, on which model, what it found and what it cost,
+        each one opening its own answer.
+        """
+        skill = skills_by_name.get(kind)
+        if skill is None or not skill.stores_result or skill is config.analysis_skill:
+            raise HTTPException(status_code=404, detail=f"{kind} has no stored results")
+        with Database(db_path) as db:
+            rows = [r for r in db.runs_for(kind, project_id, mr_iid)
+                    if (r.get("output") or "").strip() or r["status"] != "done"]
+            snap = db.get_snapshot(project_id, mr_iid) or {}
+        if not rows:
+            # Nothing in the record (a result saved before it, and not yet
+            # seeded): the saved answer is still there, so open that.
+            return stored_plan(request, kind, project_id, mr_iid)
+        # The one the board shows: the newest run that finished with an answer.
+        latest = next((r["id"] for r in rows
+                       if r["status"] == "done" and (r.get("output") or "").strip()), None)
+        return templates.TemplateResponse(request, "_run_list.html", {
+            "kind": kind,
+            "heading": skill.label,
+            "icon": skill.icon,
+            "subject": f"!{mr_iid}",
+            "title": snap.get("title") or "",
+            "runs": [_run_line(r, latest) for r in rows],
+            "stored_url": f"/{kind}/stored/{project_id}/{mr_iid}",
+        })
+
+    @app.get("/{kind}/run/{run_id}", response_class=HTMLResponse)
+    def one_run(request: Request, kind: str, run_id: str):
+        """One recorded run's answer, in the ordinary panel.
+
+        For the run the board shows (the newest with an answer), the live job
+        when this process still has it — it knows which step wrote what, and a
+        step can be run again from it — otherwise rebuilt from the record,
+        exactly as a saved result is. An older run is always rebuilt, and
+        without the polish: re-running a step of it, or polishing it, would
+        file the result as the MR's current answer over the newer one.
+        """
+        with Database(db_path) as db:
+            row = db.get_run(run_id)
+            has_mr = row is not None and row.get("mr_iid") is not None
+            snap = (db.get_snapshot(row["project_id"], row["mr_iid"]) if has_mr else None) or {}
+            newest = next((r["id"] for r in (
+                db.runs_for(kind, row["project_id"], row["mr_iid"]) if has_mr else ())
+                if r["status"] == "done" and (r.get("output") or "").strip()), None)
+        if row is None or row["kind"] != kind:
+            raise HTTPException(status_code=404, detail="no such run")
+        current = newest == row["id"]
+        back = (f"/{kind}/runs/{row['project_id']}/{row['mr_iid']}"
+                if row.get("mr_iid") is not None else None)
+        runner = runners.get(kind)
+        live = runner.get(run_id) if runner is not None and row["source"] == "live" else None
+        if live is not None and live.status != "running" and current:
+            return _panel(request, live, generated_at=row["ended_at"], back_url=back)
+        job = CommandJob(
+            id="stored", kind=kind, project_id=row.get("project_id"),
+            mr_iid=row.get("mr_iid"), subject=row.get("subject") or "",
+            title=snap.get("title") or "",
+            # Shown on the panel's 🧠 pill: for a run read back from the record,
+            # the model that answered it.
+            requested_model=row.get("model") or "",
+            status="done" if row["status"] == "done" else "error",
+            output=row.get("output") or "", error=row.get("error") or "",
+            stats=stats_from_json(row.get("stats")),
+        )
+        return _panel(request, job, generated_at=row["ended_at"], back_url=back,
+                      polish=current)
 
     @app.get("/{kind}/stored/{project_id}/{mr_iid}", response_class=HTMLResponse)
     def stored_plan(request: Request, kind: str, project_id: int, mr_iid: int):

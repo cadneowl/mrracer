@@ -1,0 +1,65 @@
+{# Every recorded run of one skill on one MR — what the saved badge opens.
+   Newest first; the one the board keeps is marked. Each row opens its own
+   answer in the ordinary panel (see `one_run`), which links back here. #}
+<div class="modal-overlay">
+  <div class="modal modal-wide">
+    <div class="modal-head">
+      <span class="modal-title">
+        {{ icon }} {{ heading }} — {{ title }} <span class="mrid">{{ subject }}</span>
+        <span class="stamp">{{ runs|length }} run{{ '' if runs|length == 1 else 's' }}</span>
+      </span>
+      <span class="modal-actions">
+        <a class="modal-close" href="#" hx-get="/{{ kind }}/close" hx-target="#command-panel" hx-swap="innerHTML">✕</a>
+      </span>
+    </div>
+    <div class="modal-body">
+      <table class="run-list">
+        <thead>
+          <tr>
+            <th>when</th><th>model</th><th>verdict</th>
+            <th class="num" title="blockers">🚫</th>
+            <th class="num" title="high — should fix / strong recommendations">high</th>
+            <th class="num" title="medium — consider / probing">med</th>
+            {% if runs|selectattr('tests', 'ne', none)|list %}<th class="num">tests</th>{% endif %}
+            <th class="num">cost</th><th class="num">time</th>
+            <th class="num" title="time to first token">TTFT</th>
+            <th class="num" title="output tokens per second">tok/s</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% set show_tests = runs|selectattr('tests', 'ne', none)|list %}
+          {% for run in runs %}
+          <tr class="run-row{% if run.status != 'done' %} run-failed{% endif %}{% if run.latest %} run-latest{% endif %}"
+              {% if run.has_answer %}hx-get="{{ run.url }}" hx-target="#command-panel" hx-swap="innerHTML"
+              tabindex="0" title="Open this run's answer"{% endif %}>
+            <td>
+              {{ run.when }}
+              {% if run.latest %}<span class="run-tag run-tag-latest" title="The answer the board's badge shows">on board</span>{% endif %}
+              {% if run.in_pipeline %}<span class="run-tag" title="Written as a step of a full review">in full review</span>{% endif %}
+              {% if run.saved %}<span class="run-tag" title="Recorded from the saved result, before every run was kept — numbers may be partial">saved</span>{% endif %}
+            </td>
+            <td>
+              {{ run.model or '—' }}
+              {% if run.requested %}<span class="run-tag" title="Picked on the board; the gateway answered with the model to the left">picked {{ run.requested }}</span>{% endif %}
+            </td>
+            <td>
+              {% if run.status != 'done' %}<span class="run-verdict run-verdict-error">failed</span>
+              {% elif run.verdict %}<span class="run-verdict{% if run.verdict == 'blocked' %} run-verdict-blocked{% endif %}">{{ run.verdict }}</span>
+              {% else %}—{% endif %}
+            </td>
+            <td class="num">{{ run.blockers if run.blockers is not none else '—' }}</td>
+            <td class="num">{{ run.high if run.high is not none else '—' }}</td>
+            <td class="num">{{ run.medium if run.medium is not none else '—' }}</td>
+            {% if show_tests %}<td class="num">{{ run.tests if run.tests is not none else '—' }}</td>{% endif %}
+            <td class="num">{{ run.cost or '—' }}</td>
+            <td class="num">{{ run.time or '—' }}</td>
+            <td class="num">{{ run.ttft or '—' }}</td>
+            <td class="num">{{ run.tok_s or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="run-list-note">Findings are counted from each answer's own sections. Click a run to read it.</p>
+    </div>
+  </div>
+</div>

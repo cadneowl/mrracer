@@ -50,12 +50,21 @@ import time
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, fields, replace
+from datetime import UTC, datetime
 
 from .config import SECRET_ENV_NAMES, CommandConfig
 from .skillcontext import SkillContextError, job_context
 from .worktree import WorktreeError, create_mr_worktree
 
 log = logging.getLogger("radar.commands")
+
+# The context key a pipeline hands its steps to say whose step they are (see
+# `CommandJob.parent_id`). Underscored so no command template can name it.
+PARENT_KEY = "_parent_id"
+# The context key carrying the model picked on the board for this run (see
+# `CommandJob.requested_model`); a pipeline hands its context, and so its
+# model, to every step.
+MODEL_KEY = "_model"
 
 # Env vars never exported to the skill subprocess. The child is an LLM agent fed
 # attacker-influenceable MR content; it must not inherit radar's GitLab PAT or
@@ -309,6 +318,24 @@ def _tool_detail(name: str, tool_input: object) -> str:
                 detail = f"{detail} in {_short(where, 40)}"
             return f"{name}: {detail}"
     return name
+
+
+def _pick_model(argv: list[str], model: str) -> list[str]:
+    """The command with any ``--model`` it names replaced by the picked one.
+
+    The pick reaches the child as ANTHROPIC_MODEL (see ``_child_env``), and a
+    ``--model`` flag outranks that — so a command that names its own model
+    would otherwise run it while the panel and the run record claimed the pick.
+    A command that names none is left as written: the env var is enough, and
+    adding a flag to a command that may not be ``claude`` could break it.
+    """
+    out = list(argv)
+    for i, token in enumerate(out):
+        if token == "--model" and i + 1 < len(out):
+            out[i + 1] = model
+        elif token.startswith("--model="):
+            out[i] = f"--model={model}"
+    return out
 
 
 def build_argv(command: str, ctx: dict) -> list[str]:
@@ -666,7 +693,7 @@ _MAX_FIELDS = (
     "peak_context_tokens", "context_window", "max_output_tokens",
     "first_token_ms", "subagent_depth",
 )
-_COUNTER_FIELDS = ("tools", "subagent_types", "denials")
+_COUNTER_FIELDS = ("tools", "subagent_types", "denials", "api_errors")
 _TEXT_FIELDS = (
     "model", "cli_version", "permission_mode", "output_style", "service_tier",
     "speed", "inference_geo", "outcome", "stop_reason", "rate_limit_status",
@@ -859,6 +886,16 @@ class CommandJob:
     build_number: int | None = None
     subject: str = ""  # "!123" or "backend-ci #128" — what the panel heads with
     title: str = ""
+    # For the run record (see `runlog`): the pipeline run this job is a step
+    # of, the commit it was about, and when it started by the wall clock —
+    # `started_mono` only measures durations and cannot be written down.
+    parent_id: str = ""
+    head_sha: str = ""
+    started_at: str = ""
+    # The model picked for this run on the board, or "" for whatever the
+    # command's own settings choose. Handed to the child as ANTHROPIC_MODEL,
+    # which Claude Code ranks above the `model` in its settings.json.
+    requested_model: str = ""
     status: str = "running"  # running / done / error
     output: str = ""
     error: str = ""
@@ -1093,6 +1130,9 @@ class CommandRunner:
         self.kind = kind
         self._jobs: dict[str, CommandJob] = {}
         self._lock = threading.Lock()
+        # Called with every job once it has ended, however it ended (see
+        # `_finished`); the web app sets it to write the run record.
+        self.on_finish: Callable[[CommandJob], None] | None = None
 
     @property
     def checkout(self) -> str:
@@ -1112,6 +1152,10 @@ class CommandRunner:
             build_number=int(build) if build not in (None, "") else None,
             subject=str(ctx.get("subject", "")),
             title=str(ctx.get("title", "")),
+            parent_id=str(ctx.get(PARENT_KEY) or ""),
+            requested_model=str(ctx.get(MODEL_KEY) or ""),
+            head_sha=str(ctx.get("head_sha") or ""),
+            started_at=datetime.now(UTC).isoformat(),
             started_mono=time.monotonic(),
             budget_s=self.config.timeout_seconds,
         )
@@ -1151,6 +1195,8 @@ class CommandRunner:
                 )
         except SkillContextError as exc:
             job.status, job.error = "error", str(exc)
+            job.ended_mono = time.monotonic()
+            self._finished(job)
             return job
         threading.Thread(
             target=self._run,
@@ -1296,6 +1342,23 @@ class CommandRunner:
                 shutil.rmtree(scratch, ignore_errors=True)
             if worktree is not None:
                 worktree.cleanup()
+            self._finished(job)
+
+    def _finished(self, job: CommandJob) -> None:
+        """Tell ``on_finish`` a run has ended — and never let it hurt the run.
+
+        The hook writes the run record (see ``runlog``). It is called after the
+        job is terminal and its answer saved, so a failure to record costs the
+        record and nothing else: it is logged, not raised into a worker that
+        has already done its work.
+        """
+        hook = self.on_finish
+        if hook is None:
+            return
+        try:
+            hook(job)
+        except Exception:  # noqa: BLE001 - the run is done; only its record failed
+            log.exception("%s: could not record run %s", self.kind, job.id)
 
     def _execute(
         self,
@@ -1319,6 +1382,8 @@ class CommandRunner:
         if not argv:
             _fail(job, f"{self.kind}.command is empty")
             return
+        if job.requested_model:
+            argv = _pick_model(argv, job.requested_model)
         # An explicit working_dir wins; otherwise the checkout is the natural
         # place to run, so the agent's own file tools land on the right tree.
         job.cwd = self.config.working_dir or source_root or None
@@ -1344,7 +1409,7 @@ class CommandRunner:
                 encoding="utf-8",   # decode as UTF-8 regardless of OS locale
                 errors="replace",
                 bufsize=1,          # line-buffered, for live streaming
-                env=self._child_env(),
+                env=self._child_env(job.requested_model),
                 # Group leader on POSIX so a timeout can kill the whole tree
                 # (see _kill_tree); Windows gets the tree via taskkill instead.
                 start_new_session=(os.name != "nt"),
@@ -2261,7 +2326,7 @@ class CommandRunner:
                     if isinstance(name, str):
                         _bump(stats.subagent_types, _short(name, 40), _positive_int(by_type, name))
 
-    def _child_env(self) -> dict:
+    def _child_env(self, model: str = "") -> dict:
         env = {k: v for k, v in os.environ.items() if not _is_secret_env(k)}
         env["PYTHONIOENCODING"] = "utf-8"  # nudge Python skills to emit UTF-8
         # setdefault, not update: an operator who exported one of these before
@@ -2278,4 +2343,8 @@ class CommandRunner:
                 env[name] = value
         for name in getattr(self.config, "env_unset", ()) or ():
             _unset_env(env, name)
+        # A model picked for this one run outranks the skill's own env: it is
+        # the more specific choice, made by the person who pressed the button.
+        if model:
+            env["ANTHROPIC_MODEL"] = model
         return env

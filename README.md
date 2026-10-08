@@ -1197,6 +1197,47 @@ an overridden ceiling elapses and it kills agents it was waiting for — is
 failed, not stored: its output is a deferral note, not your review, and it
 shows under the error together with which override to go looking for.
 
+### Compare the models your skills run on
+
+To choose the model per run, list the models in `config.yaml` under `models:`
+(see `config.example.yaml`). A 🧠 picker appears in the top bar, remembered per
+browser, and every run started from the board — each skill, and every step of
+a full review — is given the pick as `ANTHROPIC_MODEL`, which Claude Code ranks
+above the `model` in its `settings.json`. "settings default" leaves the choice
+to that file. The panel shows the model picked; its stats strip shows the one
+that actually answered.
+
+Every run of every skill is recorded in the `runs` table when it ends — each
+pipeline and each of its steps as a row of its own — and nothing overwrites it.
+(The board's saved results keep only the latest answer per MR, which is exactly
+what a comparison cannot use.) A row keeps the model the run reported, the
+gateway it was pointed at, the CLI version, the command, the MR and commit, the
+answer itself, the findings counted from it (blockers / high / medium / low,
+tests proposed, files and `file:line` locations cited, the verdict), and every
+number the run measured: cost, tokens, cache hits, TTFT, tokens per second,
+requests, tool calls, denials, provider errors, timeouts.
+
+```bash
+uv run python scripts/model-compare.py                      # every skill, per model
+uv run python scripts/model-compare.py --kind review --since 2026-09-01
+uv run python scripts/model-compare.py --by gateway --csv runs.csv
+uv run python scripts/team-stats.py --by week               # review times, findings, tests over time
+```
+
+`model-compare.py` prints, per skill and model: reliability, cost and speed,
+what the answers found, value (cost per finding, per blocker), and — for the
+steps of a full review — how many of each step's findings the synthesis kept
+and credited to it, the one measure that is not the model's own word. Then a
+head-to-head of every MR that more than one model answered. Results saved
+before the record existed are added to it on startup, marked
+`source = 'saved result'`; for those, a full review's steps have their numbers
+but not their answers. "Finished" and "timed out" count live runs only, since a
+saved result always finished; `--live-only` leaves the backfilled rows out of
+every table. The script makes the same two idempotent passes radar makes at
+startup (backfill, and recounting answers an older parser counted), so it
+writes to the database it reads. `--db` reads another database file, without
+needing `config.yaml`. `team-stats.py` reads the database `--config` names.
+
 ### Business-hours math
 
 SLA budgets are in **business hours**. Weekends and off-hours never burn budget.
