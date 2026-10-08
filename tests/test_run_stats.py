@@ -1814,3 +1814,11 @@ def test_a_refused_run_still_shows_the_refusal_though_it_measured_nothing():
     assert view is not None
     labels = {p["label"]: p["value"] for p in view["pills"]}
     assert labels["provider refused"] == "HTTP 401 authentication_failed ×10"
+
+
+def test_a_pipeline_total_counts_its_steps_provider_refusals():
+    """The steps' own rows showed eight refusals while the pipeline's total said
+    none: the counter was not among the fields a total adds up."""
+    one = RunStats(turns=1, api_errors={"HTTP 429 rate_limited": 5})
+    two = RunStats(turns=1, api_errors={"HTTP 429 rate_limited": 3, "HTTP 500 x": 1})
+    assert aggregate_stats([one, two]).api_errors == {"HTTP 429 rate_limited": 8, "HTTP 500 x": 1}

@@ -80,11 +80,13 @@
         {% endfor %}
         {% for s in storing_skills %}
         {% if s.name in row.stored_kinds %}
+        {# Every run of this skill on this MR, not just the latest: a second
+           model's review no longer hides the first one's. #}
         <a class="plan-badge"
-           hx-get="/{{ s.name }}/stored/{{ row.project_id }}/{{ row.mr_iid }}"
+           hx-get="/{{ s.name }}/runs/{{ row.project_id }}/{{ row.mr_iid }}"
            hx-target="#command-panel"
            hx-swap="innerHTML"
-           href="#" title="View the last saved {{ s.label }} result">✓ {{ s.button }}</a>
+           href="#" title="Every {{ s.label }} run on this MR — when, which model, what it found">✓ {{ s.button }}</a>
         {% endif %}
         {% endfor %}
         {% if polish %}

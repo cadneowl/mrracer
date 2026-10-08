@@ -16,6 +16,22 @@
       <span class="subtitle">review SLA board</span>
     </div>
     <div class="meta">
+      {% if models %}
+      {# The model the next run is started on — any skill, every step of a
+         pipeline. Remembered per browser; "settings default" leaves the choice
+         to the command's own settings.json. A run already going keeps the
+         model it started with. #}
+      <label class="model-pick" title="The model the next AI run from this board uses. Runs already going keep theirs.">
+        🧠
+        <select id="model-pick"
+                onchange="fetch('/model?model=' + encodeURIComponent(this.value), {method: 'POST'})">
+          <option value="">settings default</option>
+          {% for m in models %}
+          <option value="{{ m.id }}"{% if m.id == chosen_model %} selected{% endif %}>{{ m.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      {% endif %}
       {% if can_refresh %}
       {# Doesn't wait for the next tick: fetches from GitLab and swaps in the
          board built from it, for the MR someone just asked you to review. #}

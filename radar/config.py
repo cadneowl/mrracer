@@ -257,6 +257,18 @@ class DeslopifyConfig:
 
 
 @dataclass(frozen=True)
+class ModelChoice:
+    """A model the board offers for the next run (see ``models:``).
+
+    ``id`` is what the command is told to use — the name the gateway knows the
+    model by — and ``label`` what the picker shows.
+    """
+
+    id: str
+    label: str
+
+
+@dataclass(frozen=True)
 class Team:
     """A named group of GitLab usernames, used for board filters."""
 
@@ -284,6 +296,9 @@ class Config:
     jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
     # Likewise: no `deslopify:` block means no polish button on any panel.
     deslopify: DeslopifyConfig = field(default_factory=DeslopifyConfig)
+    # The models the board's picker offers. Empty means no picker: every run
+    # uses whatever model its command's own settings name.
+    models: tuple[ModelChoice, ...] = ()
 
     def team_by_name(self, name: str) -> Team | None:
         for team in self.teams:
@@ -1091,6 +1106,35 @@ def _parse_teams(raw: object) -> tuple[Team, ...]:
     return tuple(teams)
 
 
+def _parse_models(raw: object) -> tuple[ModelChoice, ...]:
+    """``models:`` — a list of model ids, or of ``{id, label}`` mappings."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError("models: expected a list of model ids")
+    out: list[ModelChoice] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(raw):
+        ctx = f"models[{i}]"
+        raw_id, raw_label = (entry.get("id"), entry.get("label")) if isinstance(entry, dict) \
+            else (entry, None)
+        if not isinstance(raw_id, (str, int, float)) or isinstance(raw_id, bool):
+            raise ConfigError(f"{ctx}: missing model id")
+        model_id = str(raw_id).strip()
+        label = str(raw_label).strip() if isinstance(raw_label, (str, int, float)) else ""
+        if not model_id:
+            raise ConfigError(f"{ctx}: missing model id")
+        if any(c.isspace() for c in model_id):
+            raise ConfigError(f"{ctx}: {model_id!r} — a model id has no spaces")
+        if model_id in seen:
+            raise ConfigError(f"{ctx}: {model_id!r} is listed twice")
+        seen.add(model_id)
+        # "fireworks_ai/glm-5p3" reads as "glm-5p3": the provider prefix is the
+        # same on every entry and the picker is narrow.
+        out.append(ModelChoice(id=model_id, label=label or model_id.rsplit("/", 1)[-1]))
+    return tuple(out)
+
+
 def _parse_waive(raw: object) -> WaiveConfig:
     if raw is None:
         return WaiveConfig()
@@ -1399,6 +1443,7 @@ def load_config(path: str | Path) -> Config:
     jenkins = _parse_jenkins(raw.get("jenkins"))
     deslopify = _parse_deslopify(raw.get("deslopify"))
     teams = _parse_teams(raw.get("teams"))
+    models = _parse_models(raw.get("models"))
     gamification = raw.get("gamification") or {}
     if not isinstance(gamification, dict):
         raise ConfigError("gamification: expected a mapping")
@@ -1419,6 +1464,7 @@ def load_config(path: str | Path) -> Config:
         gamification=gamification,
         jenkins=jenkins,
         deslopify=deslopify,
+        models=models,
     )
 
 

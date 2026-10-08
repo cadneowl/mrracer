@@ -79,6 +79,16 @@ waive:
   draft: true
   labels: ["blocked", "do-not-review"]
 
+# Models the board offers for the next AI run. A picker appears in the top bar;
+# whatever it is set to is handed to every run started from the board — each
+# skill, and every step of a pipeline — as ANTHROPIC_MODEL, which Claude Code
+# ranks above the `model` in its settings.json. "settings default" leaves the
+# choice to that settings.json. Each entry is a model id as your gateway names
+# it, or {id, label}. Leave the list out for no picker.
+models:
+  - fireworks_ai/deepseek-v4p1-flash
+  - {id: fireworks_ai/glm-5p3, label: "GLM 5.3"}
+
 # Teams. Each team is a named set of GitLab usernames. The board's VIEW bar
 # then offers two filters per team: "<team> · authored" (MRs opened by a team
 # member) and "<team> · to review" (MRs where a team member is a requested

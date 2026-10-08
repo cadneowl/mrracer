@@ -36,6 +36,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .commands import (
+    PARENT_KEY,
     CommandJob,
     CommandRunner,
     _fail,
@@ -295,7 +296,7 @@ class PipelineRunner(CommandRunner):
                 started = []
                 for name in names:
                     step_job = self.steps[name].start(
-                        ctx,
+                        {**ctx, PARENT_KEY: job.id},
                         on_success=on_success_for(name) if on_success_for else None,
                         stdin_provider=self._stdin_for(name, provider_for, results),
                     )
@@ -374,6 +375,7 @@ class PipelineRunner(CommandRunner):
             _fail(job, f"unexpected error: {exc}")
         finally:
             job.ended_mono = time.monotonic()
+            self._finished(job)
 
     @staticmethod
     def _stdin_for(

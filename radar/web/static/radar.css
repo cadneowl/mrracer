@@ -556,3 +556,29 @@ table.board { width: 100%; border-collapse: collapse; background: var(--panel); 
 .panel-reload { color: var(--muted); font-size: 12px; text-decoration: none; padding: 2px 6px;
   border: 1px solid var(--line); border-radius: 10px; }
 .panel-reload:hover { color: var(--text); border-color: var(--green); }
+/* The model picker in the top bar (see dashboard.html). */
+.model-pick { display: inline-flex; align-items: center; gap: 4px; margin-right: 12px; }
+.model-pick select { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 2px 6px; font: inherit; font-size: 12px; }
+.model-stamp { margin-left: 6px; }
+/* Every run of a skill on one MR (see _run_list.html). */
+.modal-wide { width: min(1080px, 100%); }
+table.run-list { width: 100%; border-collapse: collapse; font-size: 13px; }
+.run-list th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11.5px;
+  text-transform: uppercase; letter-spacing: .03em; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+.run-list td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.run-list .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.run-row[hx-get] { cursor: pointer; }
+.run-row[hx-get]:hover, .run-row[hx-get]:focus { background: var(--panel-2); outline: none; }
+.run-failed td { color: var(--muted); }
+.run-tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; font-size: 11px;
+  color: var(--muted); border: 1px solid var(--line); }
+.run-tag-latest { color: var(--green); border-color: var(--green); }
+.run-verdict { font-size: 12px; }
+.run-verdict-blocked { color: var(--red); }
+.run-verdict-error { color: var(--amber); }
+.run-list-note { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+.back-link { text-decoration: none; }
+.back-link:hover { color: var(--text); }
+/* The run whose answer the board's badge shows. */
+.run-latest { background: rgba(34,197,94,.05); }

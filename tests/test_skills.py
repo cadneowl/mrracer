@@ -247,7 +247,9 @@ def test_custom_stores_result_is_isolated_from_qa(tmp_path):
 
     board = client.get("/").text
     assert "✓ DBA" in board  # dba's own badge (its button text), not "✓ QA plan"
-    assert "/dba/stored/1/7" in board
+    # The badge opens every run of dba on this MR; the saved one still has its route.
+    assert "/dba/runs/1/7" in board
+    assert "🗄 DBA review" in client.get("/dba/runs/1/7").text
 
     stored = client.get("/dba/stored/1/7")
     assert stored.status_code == 200

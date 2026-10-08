@@ -10,7 +10,16 @@
         {# `subject` is "!123" for a merge request and "#128" for a build, so
            this heading reads correctly whichever the job is about. #}
         {{ job.title }} <span class="mrid">{{ job.subject }}</span>
+        {% if job.requested_model %}
+        {# Picked on the board for this run; the stats strip below says which
+           model actually answered, which is the one to believe. #}
+        <span class="stamp model-stamp" title="The model this run was started on">🧠 {{ job.requested_model.rsplit('/', 1)[-1] }}</span>
+        {% endif %}
         {% if generated_at %}<span class="stamp">saved {{ generated_at[:19] }}Z</span>{% endif %}
+        {% if back_url %}
+        <a class="stamp back-link" href="#" hx-get="{{ back_url }}" hx-target="#command-panel"
+           hx-swap="innerHTML" title="Back to every run of this skill on this MR">← all runs</a>
+        {% endif %}
       </span>
       <span class="modal-actions">
         {% if rerun_url and status != 'running' %}

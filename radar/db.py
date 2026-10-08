@@ -114,6 +114,45 @@ CREATE TABLE IF NOT EXISTS deslopified (
     PRIMARY KEY (source_kind, source_a, source_b, kind)
 );
 
+-- Every run of every skill, one row each, never overwritten by the next — the
+-- record to compare models against. `test_plans` keeps the latest answer per
+-- MR for the board; this keeps all of them, and the steps of a pipeline as
+-- rows of their own (`parent_id` is the pipeline's run). Keyed by the job id,
+-- so a pipeline whose step is retried updates its own row rather than adding
+-- a second one for the same run.
+--
+-- `findings` is what the answer found, counted (see findings.py); `metrics`
+-- the run's numbers flattened for comparison; `stats` the whole `RunStats`.
+-- All JSON, so a new measure needs no migration and json_extract reads it.
+CREATE TABLE IF NOT EXISTS runs (
+    id           TEXT PRIMARY KEY,
+    parent_id    TEXT NOT NULL DEFAULT '',
+    kind         TEXT NOT NULL,
+    label        TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL DEFAULT 'live',   -- or 'saved result' (backfilled)
+    project_id   INTEGER,
+    mr_iid       INTEGER,
+    build_number INTEGER,
+    subject      TEXT NOT NULL DEFAULT '',
+    head_sha     TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL,
+    error        TEXT NOT NULL DEFAULT '',
+    started_at   TEXT NOT NULL DEFAULT '',
+    ended_at     TEXT NOT NULL,
+    model        TEXT NOT NULL DEFAULT '',
+    gateway      TEXT NOT NULL DEFAULT '',
+    cli_version  TEXT NOT NULL DEFAULT '',
+    command      TEXT NOT NULL DEFAULT '',
+    session_id   TEXT NOT NULL DEFAULT '',
+    output       TEXT NOT NULL DEFAULT '',
+    findings     TEXT NOT NULL DEFAULT '{}',
+    metrics      TEXT NOT NULL DEFAULT '{}',
+    stats        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_runs_model ON runs (kind, model);
+CREATE INDEX IF NOT EXISTS idx_runs_mr ON runs (project_id, mr_iid);
+CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs (parent_id);
+
 -- Discussion threads, as GitLab currently has them. A cache like mr_snapshots,
 -- not truth: `resolved` is mutable state radar cannot derive, so each poll
 -- replaces an MR's rows outright rather than appending.
@@ -550,6 +589,51 @@ class Database:
             ),
         )
         self.conn.commit()
+
+    # --- runs ----------------------------------------------------------------
+
+    _RUN_COLUMNS = (
+        "id", "parent_id", "kind", "label", "source", "project_id", "mr_iid",
+        "build_number", "subject", "head_sha", "status", "error", "started_at",
+        "ended_at", "model", "gateway", "cli_version", "command", "session_id",
+        "output", "findings", "metrics", "stats",
+    )
+
+    def save_run(self, row: dict, replace: bool = True) -> None:
+        """Record one run; ``replace`` False leaves an existing row alone (for a
+        backfill that must never overwrite what a live run recorded)."""
+        cols = [c for c in self._RUN_COLUMNS if c in row]
+        verb = "INSERT OR REPLACE" if replace else "INSERT OR IGNORE"
+        self.conn.execute(
+            f"{verb} INTO runs ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+            [row[c] for c in cols],
+        )
+        self.conn.commit()
+
+    def runs(self, since: str | None = None) -> list[dict]:
+        """Every recorded run, oldest first."""
+        sql, params = "SELECT * FROM runs", []
+        if since:
+            sql += " WHERE ended_at >= ?"
+            params.append(since)
+        return [dict(r) for r in self.conn.execute(sql + " ORDER BY ended_at, id", params)]
+
+    def runs_for(self, kind: str, project_id: int, mr_iid: int) -> list[dict]:
+        """Every recorded run of one skill on one MR, newest first — as a step
+        of a pipeline too (a QA plan written by a full review is a QA plan)."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM runs WHERE kind = ? AND project_id = ? AND mr_iid = ? "
+            "ORDER BY ended_at DESC, id DESC",
+            (kind, project_id, mr_iid),
+        )]
+
+    def get_run(self, run_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def saved_results(self) -> list[dict]:
+        """Every stored MR result, for backfilling ``runs``."""
+        return [dict(r) for r in self.conn.execute("SELECT * FROM test_plans")]
 
     def get_deslopified(
         self, source_kind: str, source_a: str, source_b: str, kind: str
