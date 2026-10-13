@@ -120,6 +120,20 @@ jira:
 #   url:   the job page exactly as your browser shows it (simplest — paste it)
 #   path:  its job path under base_url, e.g. hub/backend/main
 # `name` is the chip's label and defaults to the job's own last path segment.
+#
+# Watching the same jobs on several release branches? List the version folders
+# under `versions:` (each a `path` or `url`, `name` defaulting to the folder's
+# last segment — quote numeric ones, YAML reads 2026.10 as 2026.1) and give each
+# job's `path` relative to a version folder. Every job is then watched in every
+# version and the strip draws one group per version:
+#   versions:
+#     - name: "2026.7"
+#       path: hub/production/2026.7
+#     - name: master
+#       path: hub/production/master
+#   jobs:
+#     - name: CI
+#       path: Hub - CI
 # Point at a *job*, not at a folder or the top of a multibranch project: those
 # have no builds of their own, and `radar check` says so if you do.
 #
