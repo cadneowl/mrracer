@@ -164,6 +164,38 @@ There's no limit on how many you list. They are fetched concurrently (eight at a
 time), so a pass costs about as long as the slowest job rather than the sum of
 them all, and one job hanging cannot delay the rest of the strip.
 
+#### Watching several versions
+
+When the same jobs exist once per release — `Hub/Production/2026.7/Hub - CI`,
+`Hub/Production/Master/Hub - CI` — list the version folders under `versions:`
+and give each job's `path` *inside* a version folder. Every job is watched in
+every version:
+
+```yaml
+jenkins:
+  base_url: https://jenkins.example.com
+  versions:
+    - name: "2026.7"          # quote it: YAML reads 2026.10 as the number 2026.1
+      path: hub/production/2026.7
+    - name: master            # `url:` works here too; `name` defaults to the
+      path: hub/production/master   # folder's last segment
+  jobs:
+    - name: CI
+      path: Hub - CI
+    - name: Tests
+      path: Hub - Long Running Tests - Default
+```
+
+The strip draws one box per version, in the order listed, each chip labelled
+with the job's own name and the version tag coloured by the worst thing in it —
+green, amber, or red for a real failure — so which release is broken reads
+before any dot does. The summary next to `CI` still counts across all of them.
+
+Inside radar each job is keyed `<version> <name>` ("master CI"): that is what
+`radar check` prints and what a saved analysis is filed under. Adding versions
+therefore re-keys jobs that were configured flat before, and their earlier
+saved analyses stay in the database but no longer light up the ✓ on a chip.
+
 #### Analysing what broke it
 
 A chip whose last completed build did **not** pass carries a 🔎 button. Pressing

@@ -1,10 +1,8 @@
 {# CI strip: one dot per watched Jenkins job, rendered from the monitor's cache
-   (never a live fetch). Swapped in whole by the strip's own htmx tick. #}
-<div class="ci-inner">
-  <span class="ci-label">CI</span>
-  <span class="ci-summary {% if ci.all_green %}is-ok{% endif %}">{{ ci.summary }}</span>
-
-  {% for job in ci.jobs %}
+   (never a live fetch). Swapped in whole by the strip's own htmx tick. With
+   `jenkins.versions` configured the chips are grouped one box per version,
+   each saying on its tag whether that release is healthy. #}
+{% macro chip(job) %}
   <a class="ci-job {% if job.stale %}is-stale{% endif %}"
      href="{{ job.link }}" target="_blank" rel="noopener"
      title="{{ job.name }} — {{ job.detail }} · opens in Jenkins">
@@ -15,7 +13,7 @@
     {% else %}
     <span class="ci-dot dot-{{ job.state }}"></span>
     {% endif %}
-    <span class="ci-name">{{ job.name }}</span>
+    <span class="ci-name">{{ job.label }}</span>
     {% if job.warn %}<span class="ci-warn">!</span>{% endif %}
   </a>
   {# Only where there is something to explain: a build that ran and did not
@@ -25,16 +23,31 @@
     <a class="ci-analyse is-done"
        hx-get="/jenkins/{{ job.name | urlencode }}/analysis/{{ job.analysable_build }}"
        hx-target="#command-panel" hx-swap="innerHTML" href="#"
-       title="Read the saved {{ ci.skill.label }} for build #{{ job.analysable_build }}">✓</a>
+       title="Read the saved {{ ci.skill.label }} for {{ job.name }} build #{{ job.analysable_build }}">✓</a>
     {% else %}
     <button class="ci-analyse"
             hx-post="/jenkins/{{ job.name | urlencode }}/analyze"
             hx-target="#command-panel" hx-swap="innerHTML"
             hx-disabled-elt="this"
-            title="{{ ci.skill.label }}: what changed since this job last passed, and what the log says about build #{{ job.analysable_build }}">{{ ci.skill.icon }}</button>
+            title="{{ ci.skill.label }}: what changed since {{ job.name }} last passed, and what the log says about build #{{ job.analysable_build }}">{{ ci.skill.icon }}</button>
     {% endif %}
   {% endif %}
-  {% endfor %}
+{% endmacro %}
+<div class="ci-inner">
+  <span class="ci-label">CI</span>
+  <span class="ci-summary {% if ci.all_green %}is-ok{% endif %}">{{ ci.summary }}</span>
+
+  {% if ci.groups %}
+    {% for group in ci.groups %}
+    <span class="ci-group tone-{{ group.tone or 'pending' }}"
+          title="{{ group.version }}: {{ group.summary }}">
+      <span class="ci-version">{{ group.version }}</span>
+      {% for job in group.jobs %}{{ chip(job) }}{% endfor %}
+    </span>
+    {% endfor %}
+  {% else %}
+    {% for job in ci.jobs %}{{ chip(job) }}{% endfor %}
+  {% endif %}
 
   <span class="ci-checked">checked {{ ci.checked }}</span>
 </div>

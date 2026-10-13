@@ -202,6 +202,46 @@ def test_the_strip_reads_in_configured_order():
     ]
 
 
+def test_versions_group_the_strip_and_say_which_release_is_broken():
+    """With several releases watched, "1 failed" up top is not enough to act
+    on: each version's group carries its own verdict beside its chips."""
+    jobs = [
+        JenkinsJob("2026.7 CI", "https://j.example.com/job/r7/job/ci", "2026.7", "CI"),
+        JenkinsJob("2026.7 LRT", "https://j.example.com/job/r7/job/lrt", "2026.7", "LRT"),
+        JenkinsJob("master CI", "https://j.example.com/job/m/job/ci", "master", "CI"),
+        JenkinsJob("master LRT", "https://j.example.com/job/m/job/lrt", "master", "LRT"),
+    ]
+    green = _payload(_build(5, "SUCCESS"), _build(5, "SUCCESS"))
+    monitor = JenkinsMonitor(
+        jobs,
+        _client(
+            {
+                "r7/job/ci": green,
+                "r7/job/lrt": _payload(_build(6, building=True), _build(5, "SUCCESS")),
+                "m/job/ci": _payload(_build(9, "FAILURE"), _build(9, "FAILURE")),
+                "m/job/lrt": green,
+            }
+        ),
+    )
+    monitor.refresh()
+    view = strip_view(monitor.snapshot(), NOW)
+
+    release, master = view["groups"]
+    assert [release["version"], master["version"]] == ["2026.7", "master"]
+    assert [j["label"] for j in master["jobs"]] == ["CI", "LRT"]
+    # A build in flight over a green release is still a green release.
+    assert (release["tone"], release["summary"]) == ("ok", "1 running")
+    assert (master["tone"], master["summary"]) == ("bad", "1 failed")
+    assert view["summary"] == "1 failed · 1 running"
+
+
+def test_without_versions_the_strip_stays_one_flat_row():
+    monitor = JenkinsMonitor([JOB, OTHER], _client())
+    view = strip_view(monitor.snapshot(), NOW)
+    assert view["groups"] == []
+    assert [j["label"] for j in view["jobs"]] == ["backend-ci", "nightly-e2e"]
+
+
 def test_a_board_opened_before_the_first_pass_does_not_cry_outage():
     """The chips are unknown for the second before the first pass lands, but
     that is radar not having looked yet — announcing an outage on every freshly

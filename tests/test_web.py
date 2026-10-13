@@ -130,6 +130,47 @@ def test_the_ci_strip_shows_a_dot_per_job_that_opens_the_build(jenkins_config, t
     assert "nightly-e2e" in partial.text
 
 
+def test_versions_draw_one_tagged_group_each(tmp_path):
+    """Two releases of the same jobs: a box per version, its tag coloured by
+    the worst thing in it, and the chips labelled by job rather than by key."""
+    from radar.config import load_config
+    from tests.conftest import _BASE_CONFIG
+
+    path = tmp_path / "versions.yaml"
+    path.write_text(
+        _BASE_CONFIG
+        + """
+jenkins:
+  base_url: https://jenkins.example.com
+  versions:
+    - {name: "2026.7", path: hub/r7}
+    - {name: master, path: hub/master}
+  jobs:
+    - {name: CI, path: ci}
+""",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    answers = {
+        "r7": _payload(_build(3, "SUCCESS"), _build(3, "SUCCESS")),
+        "master": _payload(_build(8, "FAILURE"), _build(8, "FAILURE")),
+    }
+    monitor = JenkinsMonitor(
+        config.jenkins.jobs,
+        JenkinsClient(getter=lambda url: next(p for k, p in answers.items() if k in url)),
+    )
+    monitor.refresh()
+    db_path = tmp_path / "versions.db"
+    Database(db_path).close()
+
+    html = TestClient(create_app(config, str(db_path), jenkins=monitor)).get("/partials/ci").text
+
+    assert 'class="ci-group tone-ok"' in html and 'class="ci-group tone-bad"' in html
+    assert html.index(">2026.7<") < html.index(">master<")
+    assert '<span class="ci-name">CI</span>' in html
+    assert "https://jenkins.example.com/job/hub/job/master/job/ci/8/" in html
+
+
 def test_the_strip_is_served_from_cache_never_a_live_fetch(jenkins_config, tmp_path):
     """The guarantee the whole design rests on: a Jenkins call on the request
     path would make every board render as slow as the slowest Jenkins."""

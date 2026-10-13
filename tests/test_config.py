@@ -388,3 +388,62 @@ def test_a_pipeline_has_no_hold_of_its_own(tmp_path):
     )
     with pytest.raises(ConfigError, match="timeout_grace_seconds"):
         load_config(_write(tmp_path, text))
+
+
+VERSIONED = """
+jenkins:
+  base_url: https://jenkins.example.com
+  versions:
+    - name: "2026.7"
+      path: Hub/Production/2026.7
+    - url: https://jenkins.example.com/job/Hub/job/Production/job/Master/
+  jobs:
+    - name: CI
+      path: Hub - CI
+    - path: Hub - Long Running Tests - Default
+"""
+
+
+def test_versions_watch_every_job_in_every_version_folder(tmp_path):
+    """One entry per release, not one copy of every job per release: the job
+    paths are relative to each version folder, grouped in the order listed."""
+    jobs = load_config(_write(tmp_path, VALID + VERSIONED)).jenkins.jobs
+
+    assert [(j.version, j.chip) for j in jobs] == [
+        ("2026.7", "CI"),
+        ("2026.7", "Hub - Long Running Tests - Default"),
+        # The version's name defaults to the folder's last segment, like a job's.
+        ("Master", "CI"),
+        ("Master", "Hub - Long Running Tests - Default"),
+    ]
+    # Keys stay unique across versions — they route the analyse button.
+    assert [j.name for j in jobs][::2] == ["2026.7 CI", "Master CI"]
+    assert jobs[2].url == (
+        "https://jenkins.example.com/job/Hub/job/Production/job/Master/job/Hub%20-%20CI"
+    )
+
+
+def test_an_unquoted_version_number_is_refused_before_it_loses_a_digit(tmp_path):
+    """YAML reads 2026.10 as 2026.1 — watching the wrong release, silently."""
+    text = VALID + VERSIONED.replace('name: "2026.7"', "name: 2026.10")
+    with pytest.raises(ConfigError, match="quote version numbers"):
+        load_config(_write(tmp_path, text))
+
+
+def test_a_versioned_job_cannot_also_be_an_absolute_url(tmp_path):
+    text = VALID + VERSIONED.replace("path: Hub - CI", "url: https://jenkins.example.com/job/x")
+    with pytest.raises(ConfigError, match="inside each version folder"):
+        load_config(_write(tmp_path, text))
+
+
+def test_two_versions_with_one_name_are_refused(tmp_path):
+    text = VALID + VERSIONED.replace('name: "2026.7"', "name: Master")
+    with pytest.raises(ConfigError, match="duplicate version name 'Master'"):
+        load_config(_write(tmp_path, text))
+
+
+def test_a_version_name_with_a_slash_is_refused(tmp_path):
+    """It ends up in the analyse button's URL path, where it would 404."""
+    text = VALID + VERSIONED.replace('name: "2026.7"', 'name: "release/2026.7"')
+    with pytest.raises(ConfigError, match="cannot contain '/'"):
+        load_config(_write(tmp_path, text))

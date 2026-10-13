@@ -116,6 +116,8 @@ class JobStatus:
     name: str
     url: str  # the job page
     state: str
+    version: str = ""  # the version group it is drawn in (see JenkinsJob)
+    label: str = ""  # the chip's text, when it differs from name
     previous: str | None = None  # RUNNING only: what the last build did
     previous_number: int | None = None  # RUNNING only: which build that was
     build_number: int | None = None
@@ -309,6 +311,11 @@ def _seconds(value: object) -> int | None:
     return int(value / 1000)
 
 
+def _ident(job: JenkinsJob) -> dict:
+    """The fields every status copies from its job, whatever the build said."""
+    return {"name": job.name, "url": job.url, "version": job.version, "label": job.chip}
+
+
 def map_status(payload: dict, job: JenkinsJob) -> JobStatus:
     """One Jenkins ``api/json`` payload as a ``JobStatus``. Pure: no I/O, no clock."""
     klass = str(payload.get("_class", ""))
@@ -321,12 +328,12 @@ def map_status(payload: dict, job: JenkinsJob) -> JobStatus:
             if "Folder" in klass or "MultiBranch" in klass
             else " — that URL does not look like a job"
         )
-        return JobStatus(name=job.name, url=job.url, state=UNKNOWN, message=f"no builds{hint}")
+        return JobStatus(**_ident(job), state=UNKNOWN, message=f"no builds{hint}")
 
     last = payload.get("lastBuild") or None
     completed = payload.get("lastCompletedBuild") or None
     if last is None:
-        return JobStatus(name=job.name, url=job.url, state=NEVER, message="no builds yet")
+        return JobStatus(**_ident(job), state=NEVER, message="no builds yet")
 
     if last.get("building"):
         finished = completed or {}
@@ -351,8 +358,7 @@ def map_status(payload: dict, job: JenkinsJob) -> JobStatus:
 def _status(job: JenkinsJob, state: str, build: dict, **extra) -> JobStatus:
     number = build.get("number") if isinstance(build.get("number"), int) else None
     return JobStatus(
-        name=job.name,
-        url=job.url,
+        **_ident(job),
         state=state,
         build_number=number,
         build_url=f"{job.url}/{number}/" if number else None,
@@ -671,7 +677,7 @@ class JenkinsMonitor:
         self._client = client
         self._lock = threading.Lock()
         self._statuses = {
-            job.name: JobStatus(name=job.name, url=job.url, state=UNKNOWN, message="checking…")
+            job.name: JobStatus(**_ident(job), state=UNKNOWN, message="checking…")
             for job in self._jobs
         }
         self._checked_at: datetime | None = None
@@ -729,7 +735,7 @@ def _stale(previous: JobStatus | None, job: JenkinsJob, reason: str) -> JobStatu
     real outage still says so rather than quietly reading as green.
     """
     if previous is None or previous.state == UNKNOWN:
-        return JobStatus(name=job.name, url=job.url, state=UNKNOWN, message=reason, stale=True)
+        return JobStatus(**_ident(job), state=UNKNOWN, message=reason, stale=True)
     return replace(previous, message=reason, stale=True)
 
 
@@ -820,6 +826,8 @@ def job_view(status: JobStatus, now: datetime) -> dict:
     """One chip, ready for the template."""
     return {
         "name": status.name,
+        "label": status.label or status.name,
+        "version": status.version,
         "link": status.link,
         "state": status.state,
         # A running build spins in the last result's colour, so a red job under
@@ -864,15 +872,76 @@ def strip_view(
         # looked rather than Jenkins being down, and announcing an outage on
         # every freshly started board would train people to ignore the one real
         # outage it is there to report.
-        return {"jobs": jobs, "summary": "checking…", "all_green": False, "checked": "checking…"}
+        groups = [g | {"summary": "checking…", "tone": ""} for g in _groups(snapshot.jobs, jobs)]
+        return {
+            "jobs": jobs,
+            "groups": groups,
+            "summary": "checking…",
+            "all_green": False,
+            "checked": "checking…",
+        }
 
-    # A job radar could not reach counts as unreachable whatever it last said —
-    # otherwise a total outage would leave the summary claiming "all green".
-    counts = Counter(UNKNOWN if s.stale else s.state for s in snapshot.jobs)
-    trouble = [f"{counts[state]} {word}" for state, word in _SUMMARY_WORD if counts[state]]
+    summary, all_green = _summary(snapshot.jobs)
     return {
         "jobs": jobs,
-        "summary": " · ".join(trouble) if trouble else "all green",
-        "all_green": not trouble,
+        "groups": _groups(snapshot.jobs, jobs),
+        "summary": summary,
+        "all_green": all_green,
         "checked": _ago(snapshot.checked_at, now),
     }
+
+
+def _summary(statuses: Iterable[JobStatus]) -> tuple[str, bool]:
+    """"1 failed · 1 running", or "all green" — and whether it is all green."""
+    # A job radar could not reach counts as unreachable whatever it last said —
+    # otherwise a total outage would leave the summary claiming "all green".
+    counts = Counter(UNKNOWN if s.stale else s.state for s in statuses)
+    trouble = [f"{counts[state]} {word}" for state, word in _SUMMARY_WORD if counts[state]]
+    return (" · ".join(trouble) if trouble else "all green"), not trouble
+
+
+def _groups(statuses: tuple[JobStatus, ...], views: list[dict]) -> list[dict]:
+    """The chips per version, in config order, each with a verdict of its own.
+
+    Empty when no versions are configured, and the strip draws one flat row.
+    With several, "2 failed" up top is not enough to act on — the question is
+    *which release* is broken, so every group answers it beside its own chips.
+    """
+    if not any(s.version for s in statuses):
+        return []
+    order: list[str] = []
+    for s in statuses:
+        if s.version not in order:
+            order.append(s.version)
+    groups = []
+    for version in order:
+        members = [(s, v) for s, v in zip(statuses, views, strict=True) if s.version == version]
+        summary, all_green = _summary(s for s, _ in members)
+        groups.append(
+            {
+                "version": version,
+                "jobs": [v for _, v in members],
+                "summary": summary,
+                "all_green": all_green,
+                # The worst thing in the group, for the version tag's colour.
+                "tone": _tone(s for s, _ in members),
+            }
+        )
+    return groups
+
+
+def _tone(statuses: Iterable[JobStatus]) -> str:
+    """ok / warn / bad — red only for a real failure, as on the dots.
+
+    A running build counts as whatever its last one did, as its ring does: a
+    green release with a build in flight is still green, a red one still red.
+    """
+    states = {
+        UNKNOWN if s.stale else (s.previous or UNKNOWN) if s.state == RUNNING else s.state
+        for s in statuses
+    }
+    if FAILED in states:
+        return "bad"
+    if states - {SUCCESS}:
+        return "warn"
+    return "ok"

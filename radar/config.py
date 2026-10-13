@@ -182,8 +182,18 @@ class JiraConfig:
 class JenkinsJob:
     """One watched Jenkins job — a build or test suite shown on the CI strip."""
 
-    name: str  # the chip's label, and the key the strip is keyed by
+    name: str  # the key everything is filed under: chips, routes, saved analyses
     url: str  # absolute job page URL, no trailing slash (what a browser opens)
+    # The version (release branch) this job belongs to, when `jenkins.versions`
+    # is configured — the strip draws one group per version. Empty otherwise.
+    version: str = ""
+    # What the chip says. Defaults to `name`; inside a version group it is the
+    # job's own name ("CI"), since the group already says which version.
+    label: str = ""
+
+    @property
+    def chip(self) -> str:
+        return self.label or self.name
 
 
 @dataclass(frozen=True)
@@ -929,8 +939,17 @@ def _job_name(entry: dict, url: str) -> str:
 # is "analysis" — so a misspelling is the likeliest way to write this block, and
 # an ignored key here reproduces the exact failure this wiring exists to remove.
 _JENKINS_KEYS = frozenset(
-    {"base_url", "poll_interval_seconds", "verify_ssl", "log_tail_lines", "analysis", "jobs"}
+    {
+        "base_url",
+        "poll_interval_seconds",
+        "verify_ssl",
+        "log_tail_lines",
+        "analysis",
+        "versions",
+        "jobs",
+    }
 )
+_VERSION_KEYS = frozenset({"name", "url", "path"})
 _ANALYSIS_KEYS = frozenset({"enabled", "skill"})
 _ANALYSIS_NAME = "analyze"
 
@@ -970,6 +989,92 @@ def _parse_jenkins_analysis(raw: object) -> JenkinsAnalysis:
             "list, or set enabled: false."
         )
     return JenkinsAnalysis(enabled=enabled, skill=skill)
+
+
+def _plain_jobs(jobs_raw: list, base_url: str | None) -> list[JenkinsJob]:
+    """``jenkins.jobs`` with no versions: each entry is one job, as written."""
+    jobs: list[JenkinsJob] = []
+    for i, entry in enumerate(jobs_raw):
+        ctx = f"jenkins.jobs[{i}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{ctx}: expected a mapping with 'url' or 'path'")
+        url = _job_url(entry, base_url, ctx)
+        jobs.append(JenkinsJob(name=_job_name(entry, url), url=url))
+    return jobs
+
+
+def _parse_jenkins_versions(raw: object, base_url: str | None) -> list[tuple[str, str]]:
+    """``jenkins.versions`` as (name, folder URL) pairs, in the order listed.
+
+    A version is a Jenkins folder holding the same jobs as every other version
+    (``Hub/Production/2026.7``, ``Hub/Production/Master``), so watching one more
+    release is one line here rather than a copy of every job entry.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(
+            "jenkins.versions: expected a non-empty list of version folders, e.g. "
+            "- {name: master, path: hub/production/master}"
+        )
+    versions: list[tuple[str, str]] = []
+    for i, entry in enumerate(raw):
+        ctx = f"jenkins.versions[{i}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{ctx}: expected a mapping with 'name' and 'path' or 'url'")
+        _reject_unknown(entry, _VERSION_KEYS, ctx)
+        name_raw = entry.get("name")
+        if name_raw is not None and not isinstance(name_raw, str):
+            # YAML reads `name: 2026.10` as the float 2026.1 — a different
+            # release, silently. Quoting it is the only safe spelling.
+            raise ConfigError(
+                f"{ctx}.name: expected text, got {name_raw!r} — quote version numbers "
+                f'(name: "2026.10"), or YAML reads them as numbers and drops digits'
+            )
+        url = _job_url(entry, base_url, ctx)
+        name = _job_name(entry, url)
+        if "/" in name:
+            # The name becomes part of every job key, and a key travels in the
+            # analyse button's URL path — where a slash is a different route.
+            raise ConfigError(f"{ctx}.name: {name!r} cannot contain '/'")
+        if any(name == seen for seen, _ in versions):
+            raise ConfigError(f"{ctx}: duplicate version name {name!r}")
+        versions.append((name, url))
+    return versions
+
+
+def _expand_jobs(jobs_raw: list, versions: list[tuple[str, str]]) -> list[JenkinsJob]:
+    """Every job under every version: ``path`` is relative to the version folder.
+
+    Grouped by version, in the order the versions are listed, so the strip
+    reads one release at a time. The key is "<version> <job>" — unique across
+    versions, and readable where it surfaces (an analysis panel's heading).
+    """
+    templates: list[tuple[str, str]] = []
+    for i, entry in enumerate(jobs_raw):
+        ctx = f"jenkins.jobs[{i}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{ctx}: expected a mapping with 'path'")
+        if entry.get("url"):
+            raise ConfigError(
+                f"{ctx}.url: with jenkins.versions set, a job is a 'path' inside each "
+                "version folder (e.g. path: Hub - CI), not an absolute URL"
+            )
+        path = entry.get("path")
+        segments = [seg for seg in str(path or "").split("/") if seg]
+        if not segments:
+            raise ConfigError(
+                f"{ctx}: missing 'path' — the job's path inside each version folder, "
+                "e.g. path: Hub - CI"
+            )
+        suffix = "".join(f"/job/{quote(seg)}" for seg in segments)
+        label = _job_name(entry, "https://x" + suffix)
+        templates.append((label, suffix))
+    return [
+        JenkinsJob(name=f"{version} {label}", url=folder + suffix, version=version, label=label)
+        for version, folder in versions
+        for label, suffix in templates
+    ]
 
 
 def _parse_jenkins(raw: object) -> JenkinsConfig:
@@ -1015,26 +1120,22 @@ def _parse_jenkins(raw: object) -> JenkinsConfig:
     jobs_raw = raw.get("jobs") or []
     if not isinstance(jobs_raw, list):
         raise ConfigError("jenkins.jobs: expected a list of job entries")
-    jobs: list[JenkinsJob] = []
+    versions = _parse_jenkins_versions(raw.get("versions"), base_url)
+    jobs = _expand_jobs(jobs_raw, versions) if versions else _plain_jobs(jobs_raw, base_url)
+
     seen: set[str] = set()
-    for i, entry in enumerate(jobs_raw):
-        ctx = f"jenkins.jobs[{i}]"
-        if not isinstance(entry, dict):
-            raise ConfigError(f"{ctx}: expected a mapping with 'url' or 'path'")
-        url = _job_url(entry, base_url, ctx)
-        name = _job_name(entry, url)
-        if name in seen:
+    for i, job in enumerate(jobs):
+        if job.name in seen:
             # Names key the strip's chips, and two chips with one name is a board
             # nobody can read. Say how to fix it: the default name is the job's
             # last path segment, so watching the `main` branch of two
             # multibranch projects collides without either entry looking wrong.
             raise ConfigError(
-                f"{ctx}: duplicate job name {name!r} — give one of them an explicit "
-                "'name:' (the default is the job's last path segment, so two jobs "
-                "ending in the same branch name collide)"
+                f"jenkins.jobs[{i % len(jobs_raw)}]: duplicate job name {job.name!r} — give one of "
+                "them an explicit 'name:' (the default is the job's last path "
+                "segment, so two jobs ending in the same branch name collide)"
             )
-        seen.add(name)
-        jobs.append(JenkinsJob(name=name, url=url))
+        seen.add(job.name)
     return JenkinsConfig(
         jobs=tuple(jobs),
         analysis=analysis,
