@@ -442,6 +442,45 @@ def _skill_context_check(config: Config, skill) -> Check:
     return Check(name, "ok", detail)
 
 
+def _check_checkouts(config: Config) -> list[Check]:
+    """Warn about a skill handed the MR diff but a tree that is not the MR's.
+
+    Such a skill runs in a shared clone, on whatever branch it is sitting on.
+    It reads files there to check what the diff shows, so its findings cite
+    code from another branch, and commits the clone has never fetched do not
+    resolve at all. The agent cannot fetch them itself under a
+    non-interactive permission mode, so it reports the MR's code as missing.
+    Only ``checkout: worktree`` hands it the head commit. A warning rather
+    than a failure, because a diff-only skill that never opens a file is a
+    legitimate setup.
+    """
+    steps = {step for s in config.skills if s.enabled for stage in s.pipeline for step in stage}
+    out: list[Check] = []
+    for skill in config.skills:
+        if skill.pipeline or not (skill.enabled or skill.name in steps):
+            continue
+        if skill is config.analysis_skill or skill is config.deslopify_skill:
+            continue  # handed a build or an answer, not an MR; worktree is refused there
+        if not (skill.include_context and "gitlab_diff" in skill.contexts):
+            continue
+        if skill.checkout == "worktree":
+            continue
+        if skill.working_dir:
+            where = f"runs in {skill.working_dir}"
+        elif skill.source is not None:
+            where = "reads its 'source:' checkout"
+        else:
+            continue  # no tree at all, so no wrong one to read
+        out.append(Check(
+            f"{skill.name}.checkout",
+            "warn",
+            f"gets the MR diff but {where} as it stands, not at the MR's head — it reads "
+            "whatever branch that clone is on, and cannot see commits it has not fetched. "
+            "Set 'source:' and 'checkout: worktree' instead of 'working_dir'",
+        ))
+    return out
+
+
 def _check_note_parsing(config: Config) -> Check | None:
     try:
         with Database(str(config.database_path)) as db:
@@ -486,6 +525,7 @@ def run_checks(config: Config, config_path: str | Path | None = None) -> list[Ch
     checks.extend(_check_commands(config))
     checks.append(_check_deslopify(config))
     checks.extend(_check_skill_context(config))
+    checks.extend(_check_checkouts(config))
     note = _check_note_parsing(config)
     if note is not None:
         checks.append(note)
