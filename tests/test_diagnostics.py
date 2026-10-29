@@ -163,10 +163,20 @@ def _skill(name, **fields):
     return f"  - {{name: {name}, command: '{PY} -c \"print(1)\"', {body}}}\n"
 
 
+def _clone(tmp_path):
+    """A real git repository, since only a clone is said to sit on a branch."""
+    import subprocess
+
+    path = tmp_path / "clone"
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return str(path).replace(chr(92), "/")
+
+
 def test_a_skill_given_the_diff_but_a_shared_clone_is_warned_about(tmp_path):
     from radar.diagnostics import _check_checkouts
 
-    clone = str(tmp_path).replace(chr(92), "/")
+    clone = _clone(tmp_path)
     cfg = _config(tmp_path, extra=(
         "skills:\n"
         + _skill("review", enabled="true", include_context="true", context="gitlab_diff",
@@ -181,15 +191,21 @@ def test_a_skill_given_the_diff_but_a_shared_clone_is_warned_about(tmp_path):
     checks = {c.name: c for c in _check_checkouts(cfg)}
     assert set(checks) == {"review.checkout", "dba.checkout", "synthesize.checkout"}
     assert all(c.status == "warn" for c in checks.values())
-    assert f"runs in {clone}" in checks["review.checkout"].detail
-    assert "checkout: worktree" in checks["review.checkout"].detail
+    review = next(s for s in cfg.skills if s.name == "review")
+    assert f"runs in {review.working_dir}" in checks["review.checkout"].detail
+    assert "'checkout: worktree' instead of 'working_dir'" in checks["review.checkout"].detail
+    # A skill that already has `source:` is told the one thing it lacks.
+    assert checks["dba.checkout"].detail.endswith("add 'checkout: worktree'")
+    assert "working_dir" not in checks["dba.checkout"].detail
     assert any(c.name == "review.checkout" for c in run_checks(cfg))
 
 
-def test_skills_that_read_the_mr_head_or_no_tree_are_not_warned_about(tmp_path):
+def test_skills_that_read_the_mr_head_or_no_clone_are_not_warned_about(tmp_path, monkeypatch):
     from radar.diagnostics import _check_checkouts
 
-    clone = str(tmp_path).replace(chr(92), "/")
+    clone = _clone(tmp_path)
+    folder = str(tmp_path).replace(chr(92), "/")  # a directory, but not a git repository
+    monkeypatch.delenv("RADAR_TEST_UNSET_ROOT", raising=False)
     cfg = _config(tmp_path, extra=(
         "skills:\n"
         + _skill("review", enabled="true", include_context="true", context="gitlab_diff",
@@ -199,5 +215,10 @@ def test_skills_that_read_the_mr_head_or_no_tree_are_not_warned_about(tmp_path):
                  working_dir=f"'{clone}'")
         + _skill("disabled", enabled="false", include_context="true", context="gitlab_diff",
                  working_dir=f"'{clone}'")
+        + _skill("settings", enabled="true", include_context="true", context="gitlab_diff",
+                 working_dir=f"'{folder}'")
+        # Optional and unset: the job gets no tree, so there is no wrong one.
+        + _skill("unset", enabled="true", include_context="true", context="gitlab_diff",
+                 source="{env: RADAR_TEST_UNSET_ROOT}")
     ))
     assert _check_checkouts(cfg) == []

@@ -267,13 +267,16 @@ def _check_jenkins(config: Config) -> list[Check]:
     return out
 
 
+def _pipeline_steps(config: Config) -> set[str]:
+    """Skills an enabled pipeline runs. A step runs whenever its pipeline does,
+    whether or not it has a button of its own — so it is checked even with
+    ``enabled: false``."""
+    return {step for s in config.skills if s.enabled for stage in s.pipeline for step in stage}
+
+
 def _check_commands(config: Config) -> list[Check]:
     out = []
-    # A step runs whenever an enabled pipeline does, whether or not it has a
-    # button of its own, so its command has to resolve even with enabled: false.
-    steps = {
-        step for s in config.skills if s.enabled for stage in s.pipeline for step in stage
-    }
+    steps = _pipeline_steps(config)
     for skill in config.skills:
         name = skill.name
         if skill.pipeline:
@@ -454,29 +457,39 @@ def _check_checkouts(config: Config) -> list[Check]:
     than a failure, because a diff-only skill that never opens a file is a
     legitimate setup.
     """
-    steps = {step for s in config.skills if s.enabled for stage in s.pipeline for step in stage}
+    steps = _pipeline_steps(config)
     out: list[Check] = []
     for skill in config.skills:
         if skill.pipeline or not (skill.enabled or skill.name in steps):
             continue
-        if skill is config.analysis_skill or skill is config.deslopify_skill:
-            continue  # handed a build or an answer, not an MR; worktree is refused there
         if not (skill.include_context and "gitlab_diff" in skill.contexts):
             continue
         if skill.checkout == "worktree":
             continue
+        # The tree the job really runs in: working_dir wins over the source
+        # root, as in the runner. Only a git clone has a "wrong branch" — a
+        # plain folder (a skill's settings, say) is not a checkout of the MR
+        # at any commit, and `checkout: worktree` could not be made from it.
         if skill.working_dir:
-            where = f"runs in {skill.working_dir}"
+            trees = {skill.working_dir}
+            fix = "set 'source:' to it and 'checkout: worktree' instead of 'working_dir'"
         elif skill.source is not None:
-            where = "reads its 'source:' checkout"
+            trees = {
+                root for project in config.gitlab.projects
+                if (root := resolve_source(skill.source, project, "")[0])
+            }
+            fix = "add 'checkout: worktree'"
         else:
             continue  # no tree at all, so no wrong one to read
+        clones = sorted(tree for tree in trees if is_git_repo(tree))
+        if not clones:
+            continue
         out.append(Check(
             f"{skill.name}.checkout",
             "warn",
-            f"gets the MR diff but {where} as it stands, not at the MR's head — it reads "
-            "whatever branch that clone is on, and cannot see commits it has not fetched. "
-            "Set 'source:' and 'checkout: worktree' instead of 'working_dir'",
+            f"gets the MR diff but runs in {', '.join(clones)} as it stands, not at the MR's "
+            "head — it reads whatever branch that clone is on, and cannot see commits it has "
+            f"not fetched. To give it the MR's own code, {fix}",
         ))
     return out
 
