@@ -56,6 +56,36 @@ def build_review_input(source, project_id: int, mr_iid: int) -> str:
     ]
     if refs:
         parts.append("## Commits\n\n" + "\n".join(refs))
+    # Ahead of the diff, not inside it: a reviewer that meets an empty file
+    # with no warning reads it as unchanged and reports its contents missing.
+    # Each names the exact commit to read: a checkout is not necessarily at the
+    # MR's head, and a deleted file exists only at the base.
+    omitted = ctx.get("omitted") or []
+    truncated = ctx.get("truncated")
+    if omitted or truncated:
+        sha = {"head": ctx.get("head_sha"), "base": ctx.get("base_sha")}
+        items = []
+        for o in omitted:
+            at = sha[o["at"]]
+            where = f"`git show {at}:{o['path']}`" if at else f"the MR's {o['at']} commit"
+            deleted = " (the MR deletes it)" if o["at"] == "base" else ""
+            items.append(f"- `{o['path']}` — {o['why']}. Read it with {where}{deleted}")
+        if truncated:
+            listing = (
+                f"`git diff --name-only {sha['base']}..{sha['head']}`"
+                if sha["base"] and sha["head"] else "a diff of the MR's base and head commits"
+            )
+            items.append(
+                f"- GitLab listed only {truncated['shown']} of {truncated['total']} changed "
+                f"files; the rest are absent from the diff entirely. List them with {listing}"
+            )
+        parts.append(
+            "## Incomplete diff\n\nThe diff below does NOT show everything this MR "
+            "changes. Do not treat these as unchanged or report their contents as "
+            "missing — read them at the commit given, which is not necessarily what "
+            "the checkout's working tree shows. If you cannot, say in your coverage "
+            "that they were not reviewed.\n\n" + "\n".join(items)
+        )
     diff = ctx.get("diff") or ""
     parts.append("## Diff\n\n```diff\n" + diff + "\n```")
     return "\n\n".join(parts)
