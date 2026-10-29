@@ -267,13 +267,16 @@ def _check_jenkins(config: Config) -> list[Check]:
     return out
 
 
+def _pipeline_steps(config: Config) -> set[str]:
+    """Skills an enabled pipeline runs. A step runs whenever its pipeline does,
+    whether or not it has a button of its own — so it is checked even with
+    ``enabled: false``."""
+    return {step for s in config.skills if s.enabled for stage in s.pipeline for step in stage}
+
+
 def _check_commands(config: Config) -> list[Check]:
     out = []
-    # A step runs whenever an enabled pipeline does, whether or not it has a
-    # button of its own, so its command has to resolve even with enabled: false.
-    steps = {
-        step for s in config.skills if s.enabled for stage in s.pipeline for step in stage
-    }
+    steps = _pipeline_steps(config)
     for skill in config.skills:
         name = skill.name
         if skill.pipeline:
@@ -442,6 +445,55 @@ def _skill_context_check(config: Config, skill) -> Check:
     return Check(name, "ok", detail)
 
 
+def _check_checkouts(config: Config) -> list[Check]:
+    """Warn about a skill handed the MR diff but a tree that is not the MR's.
+
+    Such a skill runs in a shared clone, on whatever branch it is sitting on.
+    It reads files there to check what the diff shows, so its findings cite
+    code from another branch, and commits the clone has never fetched do not
+    resolve at all. The agent cannot fetch them itself under a
+    non-interactive permission mode, so it reports the MR's code as missing.
+    Only ``checkout: worktree`` hands it the head commit. A warning rather
+    than a failure, because a diff-only skill that never opens a file is a
+    legitimate setup.
+    """
+    steps = _pipeline_steps(config)
+    out: list[Check] = []
+    for skill in config.skills:
+        if skill.pipeline or not (skill.enabled or skill.name in steps):
+            continue
+        if not (skill.include_context and "gitlab_diff" in skill.contexts):
+            continue
+        if skill.checkout == "worktree":
+            continue
+        # The tree the job really runs in: working_dir wins over the source
+        # root, as in the runner. Only a git clone has a "wrong branch" — a
+        # plain folder (a skill's settings, say) is not a checkout of the MR
+        # at any commit, and `checkout: worktree` could not be made from it.
+        if skill.working_dir:
+            trees = {skill.working_dir}
+            fix = "set 'source:' to it and 'checkout: worktree' instead of 'working_dir'"
+        elif skill.source is not None:
+            trees = {
+                root for project in config.gitlab.projects
+                if (root := resolve_source(skill.source, project, "")[0])
+            }
+            fix = "add 'checkout: worktree'"
+        else:
+            continue  # no tree at all, so no wrong one to read
+        clones = sorted(tree for tree in trees if is_git_repo(tree))
+        if not clones:
+            continue
+        out.append(Check(
+            f"{skill.name}.checkout",
+            "warn",
+            f"gets the MR diff but runs in {', '.join(clones)} as it stands, not at the MR's "
+            "head — it reads whatever branch that clone is on, and cannot see commits it has "
+            f"not fetched. To give it the MR's own code, {fix}",
+        ))
+    return out
+
+
 def _check_note_parsing(config: Config) -> Check | None:
     try:
         with Database(str(config.database_path)) as db:
@@ -486,6 +538,7 @@ def run_checks(config: Config, config_path: str | Path | None = None) -> list[Ch
     checks.extend(_check_commands(config))
     checks.append(_check_deslopify(config))
     checks.extend(_check_skill_context(config))
+    checks.extend(_check_checkouts(config))
     note = _check_note_parsing(config)
     if note is not None:
         checks.append(note)
