@@ -54,6 +54,73 @@ def normalize_mr(raw: dict) -> dict:
     }
 
 
+# How much diff text radar inlines. Raw diffs come without GitLab's own limits,
+# so one regenerated lockfile or vendored bundle would otherwise ride along in
+# full and push the review past what the model can be sent. A file over the
+# per-file cap, or one that no longer fits the total, is left out and listed —
+# the same treatment as a file GitLab blanked.
+MAX_FILE_DIFF_CHARS = 200_000
+MAX_DIFF_CHARS = 600_000
+
+
+def _extended_header(c: dict) -> list[str]:
+    """Git's own lines for what a change is, besides its content."""
+    old, new = c.get("old_path"), c.get("new_path")
+    a_mode, b_mode = c.get("a_mode"), c.get("b_mode")
+    if c.get("new_file"):
+        return [f"new file mode {b_mode}"]
+    if c.get("deleted_file"):
+        return [f"deleted file mode {a_mode}"]
+    lines = []
+    if a_mode != b_mode:
+        lines += [f"old mode {a_mode}", f"new mode {b_mode}"]
+    if c.get("renamed_file") and old != new:
+        lines += [f"rename from {old}", f"rename to {new}"]
+    return lines
+
+
+def changes_to_diff(changes: list[dict]) -> tuple[str, list[dict]]:
+    """Join an MR's per-file changes into one unified diff, saying where it has holes.
+
+    A file GitLab lists with no diff text is not evidence the file is
+    unchanged: GitLab blanks a file that is over its size limits, and a bare
+    ``diff --git`` header is indistinguishable from a no-op touch. So each file
+    carries git's extended header (new, deleted, renamed, mode) — which is what
+    an empty diff legitimately means — and a file whose content is missing
+    gets a line saying so and is returned as ``{path, why, at}``, so the
+    context can lead with it. ``at`` is the commit the content lives at:
+    ``base`` for a deleted file, ``head`` for everything else.
+    """
+    blocks, omitted = [], []
+    budget = MAX_DIFF_CHARS
+    for c in changes:
+        old, new = c.get("old_path"), c.get("new_path")
+        lines = [f"diff --git a/{old} b/{new}", *_extended_header(c)]
+        body = c.get("diff") or ""
+        why = None
+        if c.get("too_large") or c.get("collapsed"):
+            flag = "too large" if c.get("too_large") else "collapsed"
+            why = f"GitLab omitted its diff ({flag})"
+        elif len(body) > MAX_FILE_DIFF_CHARS:
+            why = (f"its diff is {len(body):,} characters, over radar's "
+                   f"{MAX_FILE_DIFF_CHARS:,} per file")
+        elif len(body) > budget:
+            why = f"radar's {MAX_DIFF_CHARS:,}-character diff budget was spent on earlier files"
+        elif not body and len(lines) == 1:
+            # Not new, deleted, renamed or re-moded: an empty diff explains nothing.
+            why = "GitLab returned no diff text for it"
+        if why:
+            at = "base" if c.get("deleted_file") else "head"
+            path = old if at == "base" else new
+            omitted.append({"path": path, "why": why, "at": at})
+            lines.append(f"# radar: {why}; its changes are NOT shown here")
+        elif body:
+            budget -= len(body)
+            lines.append(body)
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks), omitted
+
+
 class GitLabSource:
     """Live GitLab source backed by python-gitlab."""
 
@@ -158,11 +225,21 @@ class GitLabSource:
         """Title, description, refs, and unified diff of an MR (backend fetch)."""
         proj = self._gl.projects.get(project_id, lazy=True)
         mr = proj.mergerequests.get(mr_iid)
-        changes = mr.changes().get("changes", [])
-        diff = "\n".join(
-            f"diff --git a/{c.get('old_path')} b/{c.get('new_path')}\n{c.get('diff', '')}"
-            for c in changes
-        )
+        # `access_raw_diffs` reads the diffs from Gitaly instead of the copy
+        # GitLab stores, which is cut to its collapse limits: without it, a
+        # large file — typically the test class that grew the most — comes
+        # back listed with an empty diff, and a reviewer reads "touched, no
+        # changes" where the MR's tests actually are.
+        # Still `/changes`, not the paginated `/diffs` that replaces it: only
+        # `/changes` takes `access_raw_diffs`, and `/diffs` blanks large files.
+        resp = mr.changes(access_raw_diffs="true")
+        changes = resp.get("changes", [])
+        diff, omitted = changes_to_diff(changes)
+        # Past GitLab's file limit the list itself is cut, and those files are
+        # not blanked but absent. `changes_count` is the real total ("1000+").
+        truncated = None
+        if resp.get("overflow"):
+            truncated = {"shown": len(changes), "total": str(resp.get("changes_count") or "more")}
         # diff_refs pins the diff to exact commits, so a skill with a checkout
         # can read the same snapshot the diff was computed against rather than
         # whatever the branch has moved on to.
@@ -171,6 +248,8 @@ class GitLabSource:
             "title": mr.title,
             "description": mr.description or "",
             "diff": diff,
+            "omitted": omitted,
+            "truncated": truncated,
             "base_sha": refs.get("base_sha"),
             "head_sha": refs.get("head_sha") or getattr(mr, "sha", None),
             "start_sha": refs.get("start_sha"),

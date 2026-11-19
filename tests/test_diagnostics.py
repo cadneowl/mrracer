@@ -156,3 +156,69 @@ def test_run_checks_flags_missing_gitlab(tmp_path, monkeypatch):
     assert checks["database"].status == "ok"
     assert checks["gitlab.env"].status == "fail"  # no creds -> clear failure (no network)
     assert checks["jira.env"].status == "skip"    # qa.include_context off
+
+
+def _skill(name, **fields):
+    body = ", ".join(f"{k}: {v}" for k, v in fields.items())
+    return f"  - {{name: {name}, command: '{PY} -c \"print(1)\"', {body}}}\n"
+
+
+def _clone(tmp_path):
+    """A real git repository, since only a clone is said to sit on a branch."""
+    import subprocess
+
+    path = tmp_path / "clone"
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return str(path).replace(chr(92), "/")
+
+
+def test_a_skill_given_the_diff_but_a_shared_clone_is_warned_about(tmp_path):
+    from radar.diagnostics import _check_checkouts
+
+    clone = _clone(tmp_path)
+    cfg = _config(tmp_path, extra=(
+        "skills:\n"
+        + _skill("review", enabled="true", include_context="true", context="gitlab_diff",
+                 working_dir=f"'{clone}'")
+        + _skill("dba", enabled="true", include_context="true", context="gitlab_diff",
+                 source=f"'{clone}'")
+        # Disabled, but a step of an enabled pipeline: it runs all the same.
+        + _skill("synthesize", enabled="false", include_context="true",
+                 context="gitlab_diff", working_dir=f"'{clone}'")
+        + "  - {name: full, enabled: true, pipeline: [{parallel: [review, dba]}, synthesize]}\n"
+    ))
+    checks = {c.name: c for c in _check_checkouts(cfg)}
+    assert set(checks) == {"review.checkout", "dba.checkout", "synthesize.checkout"}
+    assert all(c.status == "warn" for c in checks.values())
+    review = next(s for s in cfg.skills if s.name == "review")
+    assert f"runs in {review.working_dir}" in checks["review.checkout"].detail
+    assert "'checkout: worktree' instead of 'working_dir'" in checks["review.checkout"].detail
+    # A skill that already has `source:` is told the one thing it lacks.
+    assert checks["dba.checkout"].detail.endswith("add 'checkout: worktree'")
+    assert "working_dir" not in checks["dba.checkout"].detail
+    assert any(c.name == "review.checkout" for c in run_checks(cfg))
+
+
+def test_skills_that_read_the_mr_head_or_no_clone_are_not_warned_about(tmp_path, monkeypatch):
+    from radar.diagnostics import _check_checkouts
+
+    clone = _clone(tmp_path)
+    folder = str(tmp_path).replace(chr(92), "/")  # a directory, but not a git repository
+    monkeypatch.delenv("RADAR_TEST_UNSET_ROOT", raising=False)
+    cfg = _config(tmp_path, extra=(
+        "skills:\n"
+        + _skill("review", enabled="true", include_context="true", context="gitlab_diff",
+                 source=f"'{clone}'", checkout="worktree")
+        + _skill("diff-only", enabled="true", include_context="true", context="gitlab_diff")
+        + _skill("qa", enabled="true", include_context="true", context="jira",
+                 working_dir=f"'{clone}'")
+        + _skill("disabled", enabled="false", include_context="true", context="gitlab_diff",
+                 working_dir=f"'{clone}'")
+        + _skill("settings", enabled="true", include_context="true", context="gitlab_diff",
+                 working_dir=f"'{folder}'")
+        # Optional and unset: the job gets no tree, so there is no wrong one.
+        + _skill("unset", enabled="true", include_context="true", context="gitlab_diff",
+                 source="{env: RADAR_TEST_UNSET_ROOT}")
+    ))
+    assert _check_checkouts(cfg) == []
