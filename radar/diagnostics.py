@@ -24,7 +24,7 @@ from .db import Database
 from .dotenv import candidates, load_dotenv
 from .skillcontext import resolve_inputs, resolve_source
 from .tls import ca_trust_state
-from .worktree import is_git_repo
+from .worktree import has_remote, is_git_repo
 
 
 @dataclass
@@ -267,13 +267,22 @@ def _check_jenkins(config: Config) -> list[Check]:
     return out
 
 
-def _check_commands(config: Config) -> list[Check]:
-    out = []
-    # A step runs whenever an enabled pipeline does, whether or not it has a
-    # button of its own, so its command has to resolve even with enabled: false.
+def _runs(config: Config) -> set[str]:
+    """The skills that can run: enabled, or a step of an enabled pipeline.
+
+    A step runs whenever its pipeline does, whether or not it has a button of
+    its own, so everything a check says about a runnable skill holds for it too
+    — even with ``enabled: false``.
+    """
     steps = {
         step for s in config.skills if s.enabled for stage in s.pipeline for step in stage
     }
+    return {s.name for s in config.skills if s.enabled} | steps
+
+
+def _check_commands(config: Config) -> list[Check]:
+    out = []
+    runs = _runs(config)
     for skill in config.skills:
         name = skill.name
         if skill.pipeline:
@@ -285,7 +294,7 @@ def _check_commands(config: Config) -> list[Check]:
                 Check(f"{name}.pipeline", "ok", f"{flow} · up to {skill.timeout_seconds}s")
             )
             continue
-        if not skill.enabled and name not in steps:
+        if name not in runs:
             out.append(Check(f"{name}.command", "skip", "disabled"))
             continue
         exe = _first_token(skill.command)
@@ -337,6 +346,49 @@ def _check_deslopify(config: Config) -> Check:
         "no polish button — set deslopify.skill to the name of a skill that rewrites "
         "an answer for sending",
     )
+
+
+def _check_related_sources(config: Config) -> list[Check]:
+    """Each runnable skill's related sources: there, and pinnable if pinned.
+
+    Paths were checked when the config loaded, but this runs later and on the
+    machine that will press the button. A pinned source also needs git and the
+    remote it fetches from — neither of which shows until a run tries.
+    """
+    out: list[Check] = []
+    runs = _runs(config)
+    for skill in config.skills:
+        if skill.name not in runs or not skill.related_sources:
+            continue
+        problems: list[str] = []
+        shown: list[str] = []
+        for source in skill.related_sources:
+            shown.append(
+                f"{source.name} -> {source.path}" + (f" at {source.ref}" if source.ref else "")
+            )
+            if not Path(source.path).is_dir():
+                problems.append(f"{source.name}: {source.path} is not a directory")
+                continue
+            if not source.ref:
+                continue
+            if shutil.which("git") is None:
+                problems.append(f"{source.name}: pinning to a ref needs git on PATH")
+            elif not is_git_repo(source.path):
+                problems.append(
+                    f"{source.name}: {source.path} is not a git repository, so it cannot "
+                    f"be checked out at {source.ref}"
+                )
+            elif not has_remote(source.path, source.remote):
+                problems.append(
+                    f"{source.name}: {source.path} has no remote '{source.remote}' to fetch "
+                    f"{source.ref} from (set 'remote:' on it)"
+                )
+        name = f"{skill.name}.related"
+        if problems:
+            out.append(Check(name, "fail", "; ".join(problems)))
+        else:
+            out.append(Check(name, "ok", " · ".join(shown)))
+    return out
 
 
 def _check_skill_context(config: Config) -> list[Check]:
@@ -486,6 +538,7 @@ def run_checks(config: Config, config_path: str | Path | None = None) -> list[Ch
     checks.extend(_check_commands(config))
     checks.append(_check_deslopify(config))
     checks.extend(_check_skill_context(config))
+    checks.extend(_check_related_sources(config))
     note = _check_note_parsing(config)
     if note is not None:
         checks.append(note)

@@ -226,6 +226,33 @@ def build_source_section(root: str, worktree: bool = False) -> str:
     )
 
 
+def build_related_section(related: list[tuple[str, str, str, str]]) -> str:
+    """Tell the skill which other repositories it may consult, and when.
+
+    ``related`` is (name, path, about, branch) per source, as this run resolved
+    it — ``path`` is the worktree when the source is pinned. Each says why it
+    matters, because that is what makes an agent open it: access alone does
+    not. And only *when it matters*: most changes never leave their own project,
+    and an agent told to "take these into account" reads all of them on every
+    run. The list costs a few lines; reading is the agent's call. Whether a
+    tree is pinned is said explicitly, as for the main source,
+    since "the UI at 2026.7" and "the UI as checked out" answer different
+    questions.
+    """
+    lines = [
+        "## Related sources",
+        "",
+        "These other repositories are available if you need them. Open one only when "
+        "this change reaches it — the note beside each says when that is. A change "
+        "that stays inside this project needs none of them:",
+        "",
+    ]
+    for name, path, about, branch in related:
+        where = f"`{path}`" + (f", checked out at `{branch}`" if branch else "")
+        lines.append(f"- **{name}** — {where}" + (f". {about}" if about else ""))
+    return "\n".join(lines)
+
+
 def build_inputs_section(shown: dict) -> str:
     """The skill's own declared inputs, each under its declared name."""
     parts = ["## Declared inputs"]

@@ -89,6 +89,25 @@ def is_git_repo(root: str | Path) -> bool:
         return False
 
 
+def has_remote(root: str | Path, remote: str) -> bool:
+    """Whether ``root`` has a remote called ``remote``."""
+    try:
+        _git(["remote", "get-url", remote], root)
+    except WorktreeError:
+        return False
+    return True
+
+
+def repo_prefix(path: str | Path) -> str:
+    """Where ``path`` sits inside its repository, e.g. ``web-ui/``; ``""`` at the top.
+
+    A worktree is always of the whole repository, so a related source that
+    points at a subdirectory has to be found again inside it — otherwise the
+    agent told "the UI is here" is handed the monorepo's root.
+    """
+    return _git(["rev-parse", "--show-prefix"], path)
+
+
 def _resolves(root: str | Path, rev: str) -> bool:
     """Whether `rev` names a commit this repository already has."""
     try:
@@ -222,6 +241,69 @@ def create_mr_worktree(
                 f"'{remote}' failed and {head_sha or 'its head commit'} is not in {root}. "
                 "Check the remote name (skills take 'remote:') and that this checkout is "
                 "of the same project."
+            ) from exc
+
+    try:
+        _git(["worktree", "add", "--detach", str(path), target], root)
+    except WorktreeError:
+        shutil.rmtree(parent, ignore_errors=True)
+        with suppress(WorktreeError):
+            _git(["update-ref", "-d", local_ref], root)
+        raise
+    return Worktree(path=path, root=root, ref=local_ref, _parent=parent)
+
+
+def create_branch_worktree(
+    root: str | Path,
+    branch: str,
+    remote: str = "origin",
+    timeout_s: float | None = None,
+) -> Worktree:
+    """Check out ``branch`` of a *related* repository into a throwaway worktree.
+
+    The sibling of ``create_mr_worktree`` for a repository the merge request
+    does not belong to: a UI read alongside a backend change, pinned to the
+    release that change is going into. Fetched fresh into a ref of this job's
+    own, for the same reason as there — two jobs reading two releases of one
+    repository must not see each other's — and with the same refusal to fall
+    back to "whatever is checked out": a run told it is reading 2026.7 and
+    reading master instead would compare against the wrong release.
+
+    A fetch that fails can still be served from ``<remote>/<branch>`` if the
+    checkout already has it; that is the branch as of the operator's last fetch,
+    which is stale but is the branch that was asked for.
+    """
+    root = Path(root)
+    if not is_git_repo(root):
+        raise WorktreeError(
+            f"{root} is not a git repository, so it cannot be pinned to '{branch}' — "
+            "drop the related source's 'ref', or point its 'path' at a checkout"
+        )
+    prune(root)
+    fetch_timeout = _FETCH_TIMEOUT_S
+    if timeout_s is not None:
+        fetch_timeout = max(1.0, min(_FETCH_TIMEOUT_S, timeout_s))
+
+    parent = Path(tempfile.mkdtemp(prefix="radar-ref-"))
+    path = parent / parent.name
+    local_ref = f"{REF_NS}/{int(time.time())}-{parent.name}"
+    try:
+        _git(
+            ["fetch", "--no-tags", remote, f"refs/heads/{branch}:{local_ref}"],
+            root,
+            timeout=fetch_timeout,
+        )
+        target = local_ref
+    except WorktreeError as exc:
+        log.warning("fetching %s from %s in %s failed: %s", branch, remote, root, exc)
+        fallback = f"refs/remotes/{remote}/{branch}"
+        target = fallback if _resolves(root, fallback) else ""
+        if not target:
+            shutil.rmtree(parent, ignore_errors=True)
+            raise WorktreeError(
+                f"could not check out '{branch}' of {root}: fetching it from '{remote}' "
+                f"failed and {remote}/{branch} is not in the checkout. Does that "
+                "repository have this branch?"
             ) from exc
 
     try:
