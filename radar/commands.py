@@ -52,7 +52,13 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 
-from .config import PLACEHOLDER_KEYS, SECRET_ENV_NAMES, CommandConfig
+from .config import (
+    PLACEHOLDER_KEYS,
+    SECRET_ENV_NAMES,
+    CommandConfig,
+    Gateway,
+    is_claude_command,
+)
 from .context import build_related_section
 from .skillcontext import SkillContextError, job_context
 from .worktree import WorktreeError, create_branch_worktree, create_mr_worktree, repo_prefix
@@ -317,6 +323,30 @@ def _pick_model(argv: list[str], model: str) -> list[str]:
         elif token.startswith("--model="):
             out[i] = f"--model={model}"
     return out
+
+
+def pin_gateway(argv: list[str], gateway: Gateway | None) -> list[str]:
+    """A ``claude`` command held to radar's gateway, whatever its checkout says.
+
+    Claude Code merges the ``env`` of a project's ``.claude/settings.json`` over
+    its user settings *and* over the environment it was started with — so the
+    ANTHROPIC_BASE_URL radar exports is not enough on its own. A merge request
+    that ships one sends the skill, and the token from ``config_dir``, to its
+    own gateway: a 401 at best. Two flags close that:
+
+    * ``--settings`` carries the base URL in the one settings source that
+      outranks project, local and user settings alike;
+    * ``--setting-sources user`` stops the checkout's settings (its hooks,
+      permissions, apiKeyHelper) being loaded at all. Plugins and skills come
+      from ``config_dir``, so they are unaffected.
+
+    Anything that is not ``claude`` is left as written: the flags would mean
+    nothing to it, or something else. It still gets the environment.
+    """
+    if gateway is None or not is_claude_command(argv):
+        return argv
+    pinned = json.dumps({"env": {"ANTHROPIC_BASE_URL": gateway.base_url}})
+    return [argv[0], "--setting-sources", "user", "--settings", pinned, *argv[1:]]
 
 
 _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_]+)\}")
@@ -1433,6 +1463,7 @@ class CommandRunner:
             return
         if job.requested_model:
             argv = _pick_model(argv, job.requested_model)
+        argv = pin_gateway(argv, getattr(self.config, "gateway", None))
         # An explicit working_dir wins; otherwise the checkout is the natural
         # place to run, so the agent's own file tools land on the right tree.
         job.cwd = self.config.working_dir or source_root or None
@@ -1692,7 +1723,23 @@ class CommandRunner:
                     "The run retried until it ran out of attempts and then gave up, "
                     "so nothing it did was ever sent to a model."
                 )
-                if job.stats.last_api_error.startswith("HTTP 401"):
+                gateway = getattr(self.config, "gateway", None)
+                # Pinned only if the flags went on: a wrapper (`bash -c`, a
+                # script) gets the gateway's env, which a checkout's settings
+                # can still override, so it is owed the full checklist.
+                pinned = gateway is not None and is_claude_command(argv)
+                if job.stats.last_api_error.startswith("HTTP 401") and pinned:
+                    # Pinned (see pin_gateway): the checkout cannot have moved
+                    # it, so what is left is the token and the host it went to.
+                    detail += (
+                        "\n\n401 is authentication: "
+                        f"{gateway.host} rejected the token in "
+                        f"{gateway.config_dir}/settings.json. radar pins this skill to "
+                        "that gateway, so no repository's .claude/settings.json can have "
+                        "redirected it — the token itself is expired, revoked, or for a "
+                        "different gateway. Renew it there and run again."
+                    )
+                elif job.stats.last_api_error.startswith("HTTP 401"):
                     # The order here is the order to look, and it is not the
                     # obvious one. A settings file in the working directory
                     # outranks the user-level one the skill's CLAUDE_CONFIG_DIR
@@ -1710,7 +1757,15 @@ class CommandRunner:
                         "skill names, including ANTHROPIC_BASE_URL. A token for one "
                         "gateway sent to another fails exactly like a bad token.\n"
                         "  2. the skill's env: block in radar's config\n"
-                        "  3. the auth token in the CLAUDE_CONFIG_DIR settings.json it names"
+                        "  3. the auth token in the CLAUDE_CONFIG_DIR settings.json it names\n\n"
+                        + (
+                            "radar's gateway reached this command only as environment "
+                            "variables, which that file overrides: run 'claude' directly "
+                            "as the command, not through a wrapper, so radar can pin it."
+                            if gateway is not None else
+                            "A top-level 'gateway:' in radar's config pins every claude "
+                            "skill to one endpoint and rules out the first of these for good."
+                        )
                     )
             noise = stderr_text.strip()
             if noise:
@@ -2399,6 +2454,12 @@ class CommandRunner:
                 env[name] = value
         for name in getattr(self.config, "env_unset", ()) or ():
             _unset_env(env, name)
+        # The gateway after the skill's own env: the config refuses a skill that
+        # names these beside one, and this is where that promise is kept.
+        gateway = getattr(self.config, "gateway", None)
+        if gateway is not None:
+            env["ANTHROPIC_BASE_URL"] = gateway.base_url
+            env["CLAUDE_CONFIG_DIR"] = gateway.config_dir
         # A model picked for this one run outranks the skill's own env: it is
         # the more specific choice, made by the person who pressed the button.
         if model:
