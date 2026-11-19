@@ -249,6 +249,20 @@ jenkins:
 # anywhere else (a top-level `review:` or `qa:` block, as older versions took)
 # is refused with a message telling you to move it here.
 # ---------------------------------------------------------------------------
+
+# Where every `claude` skill sends its model calls, and the Claude config
+# directory (CLAUDE_CONFIG_DIR) whose settings.json holds the token. Set it here
+# rather than in each skill's env: — Claude Code lets a repository's own
+# .claude/settings.json override ANTHROPIC_BASE_URL, so a skill run in a merge
+# request's checkout would otherwise follow that repository to its gateway, with
+# your token (a 401 at best). radar passes `--setting-sources user` and the URL
+# in `--settings` to hold it here; a skill may give its own `gateway:` block, but
+# not ANTHROPIC_BASE_URL/CLAUDE_CONFIG_DIR in env: beside one. `radar check`
+# shows which skills are pinned, and warns about any that are not.
+# gateway:
+#   base_url: https://llm.example.com
+#   config_dir: ~/.claude-gateway
+
 skills:
   - name: review
     enabled: false
@@ -389,6 +403,24 @@ skills:
     # transcript it leaves behind — the skill inherits it from radar's environment
     # instead. `required: true` refuses the job (and fails `radar check`) when the
     # variable is unset, rather than discovering it mid-run.
+    #
+    # related_sources: other repositories this skill MAY need — the UI that calls
+    # this backend's APIs, a repo of shared models. Offered, not read: the agent
+    # is told they exist and opens one only when the change reaches it, so write
+    # `about` as WHEN to look. Each is named:
+    #   related_sources:
+    #     ui:     { path: ~/src/hub-ui, about: "calls this repo's REST APIs", ref: "{target_branch}" }
+    #     common: ~/src/hub-common                 # just a path is fine too
+    # and arrives two ways: a "## Related sources" section on STDIN (path plus
+    # `about`, which is what the agent decides on), and the placeholder
+    # {source_<name>} in `command` — for Claude Code that means
+    #   command: 'claude -p --add-dir {source_ui} --add-dir {source_common} ...'
+    # since its file tools only reach the directories it was given. Paths are
+    # checked at load; a {source_x} that names no related source is refused.
+    # `ref:` pins one to a branch in a worktree of its own for the run — a branch
+    # name, or built from {target_branch} / {source_branch} — so a 2026.7 backend
+    # MR is read against the 2026.7 UI. Fetched from `remote:` (default origin);
+    # a branch that cannot be had fails the job rather than reading another.
 
   # The QA test plan. Extra placeholders: {jira_keys} (space-separated) and
   # {jira_keys_csv}. Inherits context: jira and stores_result: true from its name,

@@ -78,11 +78,13 @@ the job; the row's **Author** column says who still owes it, and the MR counts
 toward their pill in the VIEW bar and their personal view (an MR of yours that
 needs a reviewer *is* waiting on you).
 
-Three cases deliberately produce no chip at all: a **draft** (shown blue and
-waived under the usual `waive:` rules, since it is not expected to have
-reviewers yet), an MR that has **already been approved** (it is waiting to
-merge, not waiting for someone to look at it, even if the approver was later
-removed), and any MR once it is merged or closed. The chip also never reaches
+Two cases deliberately produce no chip: a **draft** (shown blue and waived
+under the usual `waive:` rules, since it is not expected to have reviewers yet),
+and any MR once it is merged or closed. An **approval does not count**: while an
+MR is open it can still change — new commits reset approvals, an approver can
+withdraw — so an open MR with nobody on it carries the chip whether or not
+someone approved it earlier, including drive-by approvals from people who were
+never asked. The chip also never reaches
 the *team · to review* filter or the coach view, both of which are about reviews
 people were actually asked for.
 
@@ -808,6 +810,53 @@ opened nothing and the run would look entirely normal. `radar check` reports the
 same thing ahead of time, per project, with `env:` values shown as `<env:NAME>`
 rather than their contents.
 
+### More than one repository (`related_sources:`)
+
+A backend change can break the UI that calls it, and the model it changes may
+live in a third repository. `source:` is the merge request's own project; list
+the others a skill *may* need under `related_sources:`. They are offered, not
+read: the agent is told they exist and opens one only when the change reaches
+it — most changes never leave their own project.
+
+```yaml
+  - name: review
+    command: 'claude -p --add-dir {source_ui} --add-dir {source_common} ... "/review"'
+    source: { env: HUB_REPO_ROOT }
+    checkout: worktree
+    related_sources:
+      ui:
+        path: ~/src/hub-ui
+        about: Calls this repo's REST APIs — check it when an endpoint or payload changes.
+        ref: "{target_branch}"        # read the UI at the release this MR targets
+      common: ~/src/hub-common         # just a path: read as it is checked out
+```
+
+Each related source reaches the skill two ways:
+
+* a **`## Related sources`** section in its stdin bundle — each name, its path,
+  the branch if pinned, and its `about`, framed as "open one only when this
+  change reaches it". Write the `about` as *when* to look ("check it when an
+  endpoint or payload changes"): it is what the agent decides on. No code from
+  these repositories goes into the prompt.
+* the placeholder **`{source_<name>}`** in `command`. Claude Code's file tools
+  only reach the working directory and what `--add-dir` grants, so
+  `--add-dir {source_ui}` is how the agent *may* read it — a grant, not a read. A `{source_x}` that names
+  no related source is refused at load rather than passed through as a literal.
+
+**`ref:` pins a source to a branch** — a name (`main`), or built from the MR's
+`{target_branch}` / `{source_branch}`. The run gets its own detached worktree of
+that branch, fetched from `remote:` (default `origin`) and removed when the job
+ends, so a 2026.7 backend MR is read against the 2026.7 UI and two runs on two
+releases don't share a checkout. If the branch can't be had, the job fails: a
+review that says it read the UI at 2026.7 and read master is wrong in a way the
+answer can't show. The checkout is made up front on every run, whether the
+agent ends up opening it or not — it's a fetch and a `worktree add`, usually
+seconds. Without `ref:` there is no cost at all: the directory is used as it is.
+
+Paths are checked when the config loads, and `radar check` reports each skill's
+related sources — including, for pinned ones, that the path is a git repository
+with the remote to fetch from.
+
 ### Give each job the MR's own code (`checkout: worktree`)
 
 A `source:` on its own hands the skill whatever the checkout is sitting on —
@@ -1432,7 +1481,7 @@ See [`config.example.yaml`](config.example.yaml) for a fully-commented file.
 | `slas` | Ordered rules; **first match wins**. Each has a `match` (optional `target_branch` glob and/or required `labels`) and `first_response_business_hours` / `approval_business_hours`. The last rule must be the default `match: {}`. |
 | `slas[].assignment_business_hours` | Optional budget for getting **any** reviewer onto an MR that has none — the [NO REVIEWERS](#mrs-with-no-reviewers) chip. Omitted everywhere, the check is off. Set it on **every** rule or none: first match wins outright, so a partial config would silently skip MRs matching the rules that lack it (radar refuses to load one). |
 | `waive` | Obligations are waived (excluded, shown blue) when `draft: true` and the MR is **currently** a draft, or the MR carries any `labels` listed here. (Only the current draft state waives; historical draft periods are not subtracted from the clock.) |
-| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `timeout_grace_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `env`, `env_unset`. The names `review`, `qa` and `analyze` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
+| `skills` | **Every** dashboard button, as a list. Each entry: `name` (url slug, unique), `label`, `button`, `icon`, `enabled`, `command`, `working_dir`, `timeout_seconds`, `timeout_grace_seconds`, `include_context`, `context`, `stores_result`, `source`, `inputs`, `checkout`, `remote`, `related_sources`, `env`, `env_unset`. The names `review`, `qa` and `analyze` inherit defaults (see [Add your own skills](#add-your-own-skills-custom-board-buttons)); top-level `review:`/`qa:` blocks are refused. |
 | `skills[].context` | Which backends radar fetches for the skill and pipes to it on stdin: `gitlab_diff`, `jira`, or a list. Only about merge-request skills — the CI strip's analyser is given the build's commits and log because [`jenkins.analysis.skill`](#analysing-what-broke-it) names it, and setting `context:` on that skill is refused rather than ignored. |
 | `skills[].timeout_grace_seconds` | How long a run that has used up its `timeout_seconds` is **held** — still alive, still spending — for someone to give it more time before it is stopped. Default 300; `0` stops it on its deadline as radar used to. The panel's **＋ 10 min** grants time at any point while a run works, on a plain skill, on each step of a pipeline and on a build analysis. Refused on a `pipeline:` entry: its steps own the clocks. See [Running out of time is a question](#running-out-of-time-is-a-question-not-a-verdict). |
 | `skills[].env` / `skills[].env_unset` | Extra environment for that skill's subprocess, and names it must not inherit. Values export as written; a valueless key is refused (use `env_unset`). radar's own credentials are stripped and refused in both, in any case spelling. radar exports `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` to every skill unless you exported one yourself — the second removes the CLI's own 10-minute background-agent cutoff, leaving `timeout_seconds` as the only clock. See [Headless agents and background work](#headless-agents-and-background-work). |

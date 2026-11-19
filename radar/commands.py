@@ -52,9 +52,16 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 
-from .config import SECRET_ENV_NAMES, CommandConfig
+from .config import (
+    PLACEHOLDER_KEYS,
+    SECRET_ENV_NAMES,
+    CommandConfig,
+    Gateway,
+    is_claude_command,
+)
+from .context import build_related_section
 from .skillcontext import SkillContextError, job_context
-from .worktree import WorktreeError, create_mr_worktree
+from .worktree import WorktreeError, create_branch_worktree, create_mr_worktree, repo_prefix
 
 log = logging.getLogger("radar.commands")
 
@@ -128,26 +135,6 @@ _MAX_SAMPLES = 400       # cap a run's timeline (halved, not truncated, past it)
 # pipeline into a slower one. More than that is waiting on something broken.
 _CONTEXT_ATTEMPTS = 3
 _CONTEXT_RETRY_WAIT_S = 3.0
-
-PLACEHOLDER_KEYS = (
-    "web_url",
-    "mr_iid",
-    "project_id",
-    "source_branch",
-    "target_branch",
-    "title",
-    "author",
-    "jira_keys",       # space-separated, e.g. "PROJ-1 PROJ-2"
-    "jira_keys_csv",   # comma-separated, e.g. "PROJ-1,PROJ-2"
-    "head_sha",        # the MR's head commit, as of the last poll
-    "source_root",     # the checkout for this job (see skillcontext / worktree)
-    # Filled for the skill `jenkins.analysis.skill` names, instead of the MR
-    # fields above. A skill only ever sees one set; the other substitutes to
-    # empty, which is what an absent placeholder has always done.
-    "jenkins_job",
-    "build_number",
-    "build_url",
-)
 
 # Placeholders filled from the MR snapshot; the rest are computed per job.
 SNAPSHOT_KEYS = tuple(k for k in PLACEHOLDER_KEYS if k != "source_root")
@@ -338,6 +325,52 @@ def _pick_model(argv: list[str], model: str) -> list[str]:
     return out
 
 
+def pin_gateway(argv: list[str], gateway: Gateway | None) -> list[str]:
+    """A ``claude`` command held to radar's gateway, whatever its checkout says.
+
+    Claude Code merges the ``env`` of a project's ``.claude/settings.json`` over
+    its user settings *and* over the environment it was started with — so the
+    ANTHROPIC_BASE_URL radar exports is not enough on its own. A merge request
+    that ships one sends the skill, and the token from ``config_dir``, to its
+    own gateway: a 401 at best. Two flags close that:
+
+    * ``--settings`` carries the base URL in the one settings source that
+      outranks project, local and user settings alike;
+    * ``--setting-sources user`` stops the checkout's settings (its hooks,
+      permissions, apiKeyHelper) being loaded at all. Plugins and skills come
+      from ``config_dir``, so they are unaffected.
+
+    Anything that is not ``claude`` is left as written: the flags would mean
+    nothing to it, or something else. It still gets the environment.
+    """
+    if gateway is None or not is_claude_command(argv):
+        return argv
+    pinned = json.dumps({"env": {"ANTHROPIC_BASE_URL": gateway.base_url}})
+    return [argv[0], "--setting-sources", "user", "--settings", pinned, *argv[1:]]
+
+
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_]+)\}")
+
+
+def _fill(match: re.Match, keys: tuple[str, ...], ctx: dict) -> str:
+    """One placeholder's value, or the placeholder itself if it is not one.
+
+    Called once per placeholder *in the template*, by a single ``re.sub`` pass,
+    so a substituted value is never scanned again: an MR titled ``see
+    {source_ui}`` reaches ``--title={title}`` as those literal characters, not
+    as the path of the operator's checkout.
+    """
+    key = match.group(1)
+    if key not in keys:
+        return match.group(0)
+    # A snapshot column is nullable (an MR polled before `head_sha` existed, an
+    # MR with no author), and `str(None)` is the four-letter string "None" —
+    # which a skill would take for a real ref, branch or URL. An absent value
+    # is an empty one.
+    value = ctx.get(key)
+    return "" if value is None else str(value)
+
+
 def build_argv(command: str, ctx: dict) -> list[str]:
     """Split a command template into argv, then substitute placeholders into
     each token (never re-splitting substituted values).
@@ -353,18 +386,17 @@ def build_argv(command: str, ctx: dict) -> list[str]:
     """
     posix = os.name != "nt"
     tokens = shlex.split(command, posix=posix)
+    # Plus `{source_<name>}` for each related source this job resolved — named
+    # by the config, so they cannot be listed up front.
+    keys = PLACEHOLDER_KEYS + tuple(
+        k for k in ctx if k.startswith("source_") and k not in PLACEHOLDER_KEYS
+    )
     argv = []
     for token in tokens:
         if not posix and len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
             token = token[1:-1]
         template_token = token
-        for key in PLACEHOLDER_KEYS:
-            # A snapshot column is nullable (an MR polled before `head_sha`
-            # existed, an MR with no author), and `str(None)` is the four-letter
-            # string "None" — which a skill would take for a real ref, branch or
-            # URL. An absent value is an empty one.
-            value = ctx.get(key)
-            token = token.replace("{" + key + "}", "" if value is None else str(value))
+        token = _PLACEHOLDER_RE.sub(lambda m: _fill(m, keys, ctx), token)
         if token.startswith("-") and not template_token.startswith("-"):
             raise CommandError(
                 "refusing to run: a substituted MR value would start with '-' and "
@@ -1304,6 +1336,7 @@ class CommandRunner:
         # the child would leave the two phases most likely to hang unbounded.
         deadline = time.monotonic() + self.config.timeout_seconds
         worktree = None
+        pinned: list = []  # related sources' worktrees, removed with the job
         scratch = ""
         try:
             # Somewhere for this run's evidence to live. A build log runs to tens
@@ -1325,8 +1358,10 @@ class CommandRunner:
                     timeout_s=deadline - time.monotonic(),
                 )
             source_root = str(worktree.path) if worktree else (resolved.source_root or "")
+            related = self._prepare_related(job, ctx, deadline, pinned)
             self._execute(
-                job, ctx, source_root, resolved, deadline, on_success, stdin_provider, scratch
+                job, ctx, source_root, resolved, deadline, on_success, stdin_provider, scratch,
+                related,
             )
         except WorktreeError as exc:
             _fail(job, str(exc))
@@ -1342,6 +1377,8 @@ class CommandRunner:
                 shutil.rmtree(scratch, ignore_errors=True)
             if worktree is not None:
                 worktree.cleanup()
+            for tree in pinned:
+                tree.cleanup()
             self._finished(job)
 
     def _finished(self, job: CommandJob) -> None:
@@ -1360,6 +1397,42 @@ class CommandRunner:
         except Exception:  # noqa: BLE001 - the run is done; only its record failed
             log.exception("%s: could not record run %s", self.kind, job.id)
 
+    def _prepare_related(
+        self, job: CommandJob, ctx: dict, deadline: float, pinned: list
+    ) -> list[tuple[str, str, str, str]]:
+        """Each related source as (name, path, about, branch) for this run.
+
+        A source with a ``ref`` gets a worktree at that branch, appended to
+        ``pinned`` as soon as it exists so the caller removes it however the
+        run ends. No fallback to the unpinned directory: a run told it is
+        reading the UI at 2026.7 that reads master instead answers the wrong
+        question in a way nobody can tell from the answer.
+        """
+        out = []
+        for source in getattr(self.config, "related_sources", ()):
+            if not source.ref:
+                out.append((source.name, source.path, source.about, ""))
+                continue
+            branch = source.ref
+            for key in ("target_branch", "source_branch"):
+                branch = branch.replace("{" + key + "}", str(ctx.get(key) or ""))
+            branch = branch.strip()
+            if not branch:
+                raise WorktreeError(
+                    f"related source '{source.name}': ref {source.ref!r} names no branch "
+                    "for this run — it has no merge request to take one from"
+                )
+            self._add(job, "log", f"checking out {source.name} at {branch}…")
+            tree = create_branch_worktree(
+                source.path, branch, remote=source.remote, timeout_s=deadline - time.monotonic()
+            )
+            pinned.append(tree)
+            # The same subdirectory of the pinned tree that `path` names in
+            # the checkout: a worktree is of the whole repository.
+            where = tree.path / repo_prefix(source.path)
+            out.append((source.name, str(where), source.about, branch))
+        return out
+
     def _execute(
         self,
         job: CommandJob,
@@ -1370,12 +1443,18 @@ class CommandRunner:
         on_success,
         stdin_provider=None,
         scratch: str = "",
+        related: list[tuple[str, str, str, str]] | None = None,
     ) -> None:
         # Built here, not in `start`, because a worktree's path is only known
         # once the worker has made it — and `{source_root}` must name the tree
-        # the skill will actually read.
+        # the skill will actually read. The same goes for a pinned related
+        # source's `{source_<name>}`.
+        related = related or []
+        placeholders = {f"source_{name}": path for name, path, _, _ in related}
         try:
-            argv = build_argv(self.config.command, {**ctx, "source_root": source_root})
+            argv = build_argv(
+                self.config.command, {**ctx, **placeholders, "source_root": source_root}
+            )
         except CommandError as exc:
             _fail(job, str(exc))
             return
@@ -1384,6 +1463,7 @@ class CommandRunner:
             return
         if job.requested_model:
             argv = _pick_model(argv, job.requested_model)
+        argv = pin_gateway(argv, getattr(self.config, "gateway", None))
         # An explicit working_dir wins; otherwise the checkout is the natural
         # place to run, so the agent's own file tools land on the right tree.
         job.cwd = self.config.working_dir or source_root or None
@@ -1397,6 +1477,13 @@ class CommandRunner:
                 job, lambda: stdin_provider(source_root, resolved.inputs.shown, scratch),
                 deadline,
             )
+        if related:
+            # Added here rather than by each provider: only the runner knows
+            # where a pinned source's worktree landed. A skill that sends
+            # nothing else still gets this — access to a directory without a
+            # reason to open it is access an agent does not use.
+            section = build_related_section(related)
+            stdin_text = f"{stdin_text}\n\n{section}" if stdin_text else section
 
         try:
             proc = subprocess.Popen(
@@ -1636,7 +1723,23 @@ class CommandRunner:
                     "The run retried until it ran out of attempts and then gave up, "
                     "so nothing it did was ever sent to a model."
                 )
-                if job.stats.last_api_error.startswith("HTTP 401"):
+                gateway = getattr(self.config, "gateway", None)
+                # Pinned only if the flags went on: a wrapper (`bash -c`, a
+                # script) gets the gateway's env, which a checkout's settings
+                # can still override, so it is owed the full checklist.
+                pinned = gateway is not None and is_claude_command(argv)
+                if job.stats.last_api_error.startswith("HTTP 401") and pinned:
+                    # Pinned (see pin_gateway): the checkout cannot have moved
+                    # it, so what is left is the token and the host it went to.
+                    detail += (
+                        "\n\n401 is authentication: "
+                        f"{gateway.host} rejected the token in "
+                        f"{gateway.config_dir}/settings.json. radar pins this skill to "
+                        "that gateway, so no repository's .claude/settings.json can have "
+                        "redirected it — the token itself is expired, revoked, or for a "
+                        "different gateway. Renew it there and run again."
+                    )
+                elif job.stats.last_api_error.startswith("HTTP 401"):
                     # The order here is the order to look, and it is not the
                     # obvious one. A settings file in the working directory
                     # outranks the user-level one the skill's CLAUDE_CONFIG_DIR
@@ -1654,7 +1757,15 @@ class CommandRunner:
                         "skill names, including ANTHROPIC_BASE_URL. A token for one "
                         "gateway sent to another fails exactly like a bad token.\n"
                         "  2. the skill's env: block in radar's config\n"
-                        "  3. the auth token in the CLAUDE_CONFIG_DIR settings.json it names"
+                        "  3. the auth token in the CLAUDE_CONFIG_DIR settings.json it names\n\n"
+                        + (
+                            "radar's gateway reached this command only as environment "
+                            "variables, which that file overrides: run 'claude' directly "
+                            "as the command, not through a wrapper, so radar can pin it."
+                            if gateway is not None else
+                            "A top-level 'gateway:' in radar's config pins every claude "
+                            "skill to one endpoint and rules out the first of these for good."
+                        )
                     )
             noise = stderr_text.strip()
             if noise:
@@ -2343,6 +2454,12 @@ class CommandRunner:
                 env[name] = value
         for name in getattr(self.config, "env_unset", ()) or ():
             _unset_env(env, name)
+        # The gateway after the skill's own env: the config refuses a skill that
+        # names these beside one, and this is where that promise is kept.
+        gateway = getattr(self.config, "gateway", None)
+        if gateway is not None:
+            env["ANTHROPIC_BASE_URL"] = gateway.base_url
+            env["CLAUDE_CONFIG_DIR"] = gateway.config_dir
         # A model picked for this one run outranks the skill's own env: it is
         # the more specific choice, made by the person who pressed the button.
         if model:

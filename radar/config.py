@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
@@ -104,6 +105,101 @@ class WaiveConfig:
 
 
 @dataclass(frozen=True)
+class RelatedSource:
+    """Another repository a skill may consult besides its own source, when needed.
+
+    A backend change can break the UI that calls it, and a shared model lives in
+    a third repository; reading only the merge request's own tree misses both.
+    Each one is named, so the command can reach it as ``{source_<name>}`` (for
+    ``--add-dir``, say), and said *why* it matters, because an agent given
+    access to a directory with no reason to open it will not.
+
+    ``ref`` pins it to a branch for the run — a template over the merge
+    request's fields, so ``{target_branch}`` reads the UI at the release the
+    change is going into rather than at whatever the checkout is sitting on.
+    Empty means the directory as it is.
+    """
+
+    name: str
+    path: str  # absolute, expanded at load
+    about: str = ""
+    ref: str = ""
+    remote: str = "origin"  # where a pinned ref is fetched from
+
+    @property
+    def placeholder(self) -> str:
+        return f"source_{self.name}"
+
+
+# What a command template can name, filled per job (see commands.build_argv).
+# Here rather than in `commands` so the config can refuse a related source that
+# would shadow one of them.
+PLACEHOLDER_KEYS = (
+    "web_url",
+    "mr_iid",
+    "project_id",
+    "source_branch",
+    "target_branch",
+    "title",
+    "author",
+    "jira_keys",       # space-separated, e.g. "PROJ-1 PROJ-2"
+    "jira_keys_csv",   # comma-separated, e.g. "PROJ-1,PROJ-2"
+    "head_sha",        # the MR's head commit, as of the last poll
+    "source_root",     # the checkout for this job (see skillcontext / worktree)
+    # Filled for the skill `jenkins.analysis.skill` names, instead of the MR
+    # fields above. A skill only ever sees one set; the other substitutes to
+    # empty, which is what an absent placeholder has always done.
+    "jenkins_job",
+    "build_number",
+    "build_url",
+)
+
+
+@dataclass(frozen=True)
+class Gateway:
+    """Where a skill's model calls go, and the Claude config that signs them.
+
+    Set once, under the top-level ``gateway:``, and held by radar rather than by
+    whatever settings file the child happens to find. That distinction is the
+    reason this exists: Claude Code merges the ``env`` block of a project's
+    ``.claude/settings.json`` over both its user settings and the environment it
+    was started with, so a skill run inside a merge request's checkout goes to
+    whichever gateway *that repository* names — carrying the token from
+    ``config_dir`` with it. The run fails with a 401 that reads exactly like a
+    dead credential, and the token has been handed to a host nobody here chose.
+
+    For a ``claude`` command radar therefore passes the gateway as
+    ``--settings`` (the one source that outranks project and user settings) and
+    loads settings from ``config_dir`` only (``--setting-sources user``); every
+    command, ``claude`` or not, also gets both as environment variables.
+    """
+
+    base_url: str
+    config_dir: str  # absolute, expanded at load
+
+    @property
+    def host(self) -> str:
+        return urlparse(self.base_url).netloc
+
+
+# The variables a gateway sets. A skill naming them in `env:` would be arguing
+# with the gateway, and which one won would depend on code nobody reads.
+GATEWAY_ENV_NAMES = ("ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR")
+
+# The flags radar adds to a `claude` command to pin it to the gateway. A command
+# that brings its own has said something radar would then contradict.
+GATEWAY_FLAGS = ("--settings", "--setting-sources")
+
+
+def is_claude_command(argv: list[str] | tuple[str, ...]) -> bool:
+    """Whether argv runs the Claude Code CLI, the one command radar pins flags on."""
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0].strip("'\"")).lower()
+    return exe in ("claude", "claude.exe", "claude.cmd")
+
+
+@dataclass(frozen=True)
 class SkillConfig:
     """One dashboard skill: an external command run for an MR, launched from a
     board button. The command is a template filled with MR context.
@@ -156,8 +252,14 @@ class SkillConfig:
     inputs: tuple[Input, ...] = ()
     checkout: str = "none"  # "none" | "worktree"
     remote: str = "origin"
+    # Other repositories to take into account, in the order declared — see
+    # RelatedSource. Each is a `{source_<name>}` placeholder and a line in the
+    # "## Related sources" section of the skill's STDIN.
+    related_sources: tuple[RelatedSource, ...] = ()
     env: tuple[tuple[str, str], ...] = ()  # NAME -> value, exported to the child
     env_unset: tuple[str, ...] = ()  # names the child must NOT inherit
+    # The top-level `gateway:` unless this skill names its own — see Gateway.
+    gateway: Gateway | None = None
     # Stages of other skills' names, run in order; the steps of one stage run at
     # once. Set means this entry has no command of its own — see ``pipeline``.
     pipeline: tuple[tuple[str, ...], ...] = ()
@@ -309,6 +411,9 @@ class Config:
     # The models the board's picker offers. Empty means no picker: every run
     # uses whatever model its command's own settings name.
     models: tuple[ModelChoice, ...] = ()
+    # The default gateway every skill inherits (see Gateway). None: each skill's
+    # model calls go wherever its own settings — or its checkout's — say.
+    gateway: Gateway | None = None
 
     def team_by_name(self, name: str) -> Team | None:
         for team in self.teams:
@@ -637,8 +742,86 @@ def _parse_env_unset(raw: object, ctx: str) -> tuple[str, ...]:
 # and ignored.
 _STEP_ONLY_KEYS = (
     "command", "working_dir", "include_context", "context", "source", "inputs",
-    "checkout", "remote", "env", "env_unset", "timeout_grace_seconds",
+    "checkout", "remote", "env", "env_unset", "timeout_grace_seconds", "related_sources",
+    "gateway",
 )
+
+
+_GATEWAY_KEYS = frozenset({"base_url", "config_dir"})
+
+
+def _expand_path(raw: object, base_dir: Path | None) -> str:
+    """A configured path as an absolute one: ``~`` and ``$VARS`` expanded, and a
+    relative path read against the config file's own directory — the way
+    ``file:`` inputs already are — rather than whatever directory radar was
+    started from. ``base_dir`` None keeps the old behaviour, for callers that
+    have no file to be relative to."""
+    path = Path(os.path.expandvars(str(raw))).expanduser()
+    if base_dir is not None and not path.is_absolute():
+        path = base_dir / path
+    return str(path)
+
+
+def _parse_gateway(raw: object, ctx: str, base_dir: Path | None = None) -> Gateway | None:
+    """A ``gateway:`` block, or None when there is none.
+
+    ``config_dir`` must exist now: it is where the token comes from, and a typo
+    there would otherwise surface as the same 401 this block exists to end.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{ctx}: expected a mapping with base_url and config_dir")
+    _reject_unknown(raw, _GATEWAY_KEYS, ctx)
+    base_url = _http_url(_require(raw, "base_url", ctx), f"{ctx}.base_url")
+    raw_dir = str(_require(raw, "config_dir", ctx)).strip()
+    config_dir = _expand_path(raw_dir, base_dir)
+    if not Path(config_dir).is_dir():
+        raise ConfigError(
+            f"{ctx}.config_dir does not exist: {raw_dir} — it is the Claude config "
+            "directory (CLAUDE_CONFIG_DIR) whose settings.json holds this gateway's token"
+        )
+    return Gateway(base_url=base_url, config_dir=config_dir)
+
+
+def _check_gateway_conflicts(
+    gateway: Gateway | None,
+    command: str,
+    env: tuple[tuple[str, str], ...],
+    env_unset: tuple[str, ...],
+    ctx: str,
+) -> None:
+    """Refuse a skill that would contradict its gateway.
+
+    Not quietly resolved in either direction: a skill that names its own
+    ANTHROPIC_BASE_URL beside a gateway is one of two edits half-made, and
+    whichever radar picked, the other one would be the one somebody believes.
+    """
+    if gateway is None:
+        return
+    named = {name.upper() for name, _ in env} | {name.upper() for name in env_unset}
+    for name in GATEWAY_ENV_NAMES:
+        if name in named:
+            raise ConfigError(
+                f"{ctx}: {name} is set by the gateway ({gateway.host}) — remove it from "
+                "this skill's env:/env_unset:, or give the skill its own 'gateway:' "
+                "block if it really goes somewhere else"
+            )
+    try:
+        tokens = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        return  # build_argv reports an unsplittable command, with more context
+    if not is_claude_command(tokens):
+        return
+    for token in tokens[1:]:
+        flag = token.split("=", 1)[0]
+        if flag in GATEWAY_FLAGS:
+            raise ConfigError(
+                f"{ctx}.command: drop {flag} — radar adds '--setting-sources user' and "
+                f"'--settings' itself to keep this skill on {gateway.host}, so a "
+                "repository's .claude/settings.json cannot send it (and its token) "
+                "somewhere else"
+            )
 
 
 def _parse_stage(raw: object, ctx: str) -> tuple[str, ...]:
@@ -709,7 +892,100 @@ def _parse_pipeline(
     )
 
 
-def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfig:
+# A related source's name becomes a placeholder, `{source_<name>}`, so it has to
+# be one: no spaces or dashes for `str.replace` to half-match, and not `root`,
+# which `{source_root}` already is.
+_RELATED_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+_RELATED_KEYS = frozenset({"path", "about", "ref", "remote"})
+# The merge request fields a `ref:` may be built from. Branches only: a ref is
+# fetched from the related repository's remote, where nothing else names one.
+_REF_FIELDS = frozenset({"target_branch", "source_branch"})
+_PLACEHOLDER = re.compile(r"\{(\w+)\}")
+
+
+def _parse_related_sources(
+    raw: object, ctx: str, base_dir: Path | None = None,
+) -> tuple[RelatedSource, ...]:
+    """``related_sources:`` — name → path, or name → {path, about, ref}.
+
+    Every path is checked here, not at the click: a directory that is not there
+    reads to an agent exactly like an empty one, and "found nothing in the UI"
+    from a run that never saw the UI is the confident wrong answer this exists
+    to prevent.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{ctx}.related_sources: expected a mapping of name to path, e.g. "
+            "related_sources: {ui: ~/src/hub-ui}"
+        )
+    out: list[RelatedSource] = []
+    for name, entry in raw.items():
+        where = f"{ctx}.related_sources.{name}"
+        name = str(name)
+        if not _RELATED_NAME.match(name):
+            raise ConfigError(
+                f"{where}: the name becomes the placeholder {{source_<name>}}, so it must "
+                "be lowercase letters, digits and underscores"
+            )
+        if f"source_{name}" in PLACEHOLDER_KEYS:
+            # {source_root} and {source_branch} already mean something, and the
+            # related path would silently win over it in every command.
+            raise ConfigError(
+                f"{where}: {{source_{name}}} is already a placeholder radar fills "
+                "itself — pick another name"
+            )
+        if isinstance(entry, str):
+            entry = {"path": entry}
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where}: expected a path, or a mapping with 'path'")
+        _reject_unknown(entry, _RELATED_KEYS, where)
+        raw_path = entry.get("path")
+        if not raw_path:
+            raise ConfigError(f"{where}: missing 'path'")
+        path = _expand_path(raw_path, base_dir)
+        if not Path(path).is_dir():
+            raise ConfigError(f"{where}.path does not exist: {raw_path}")
+        ref = str(entry.get("ref") or "").strip()
+        unknown = sorted(set(_PLACEHOLDER.findall(ref)) - _REF_FIELDS)
+        if unknown:
+            raise ConfigError(
+                f"{where}.ref: {', '.join('{' + u + '}' for u in unknown)} cannot name a "
+                f"branch — a ref is a branch name or built from "
+                f"{', '.join('{' + f + '}' for f in sorted(_REF_FIELDS))}"
+            )
+        out.append(
+            RelatedSource(
+                name=name, path=path, about=str(entry.get("about") or "").strip(), ref=ref,
+                remote=str(entry.get("remote") or "origin").strip() or "origin",
+            )
+        )
+    return tuple(out)
+
+
+def _check_source_placeholders(command: str, related: tuple[RelatedSource, ...], ctx: str) -> None:
+    """Refuse ``{source_x}`` in a command when no related source is called x.
+
+    An unknown placeholder is left in the argv verbatim, so ``--add-dir
+    {source_iu}`` would hand the agent a directory literally named that, and the
+    run would read the UI it was meant to as absent.
+    """
+    known = {r.placeholder for r in related} | set(PLACEHOLDER_KEYS)
+    stray = sorted(
+        {p for p in _PLACEHOLDER.findall(command) if p.startswith("source_")} - known
+    )
+    if stray:
+        declared = ", ".join(r.name for r in related) or "none"
+        raise ConfigError(
+            f"{ctx}.command uses {', '.join('{' + p + '}' for p in stray)} but no related "
+            f"source has that name (declared: {declared})"
+        )
+
+
+def _parse_skill(
+    raw: object, name: str, ctx: str, base_dir: Path, default_gateway: Gateway | None = None,
+) -> SkillConfig:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -733,10 +1009,10 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
 
     working_dir = raw.get("working_dir")
     if working_dir is not None:
-        # Expand ~ and $VARS so paths like "~/src/repo" work (Path/subprocess
-        # don't expand them on their own); store the resolved absolute path.
+        # ~, $VARS and relative paths resolved once, here (see _expand_path):
+        # Path and subprocess expand none of them on their own.
         raw_dir = str(working_dir)
-        working_dir = str(Path(os.path.expandvars(raw_dir)).expanduser())
+        working_dir = _expand_path(raw_dir, base_dir)
         if not Path(working_dir).is_dir():
             raise ConfigError(f"{ctx}.working_dir does not exist: {raw_dir}")
 
@@ -799,14 +1075,27 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
         )
     remote = str(raw.get("remote", "origin")).strip() or "origin"
 
+    related = _parse_related_sources(raw.get("related_sources"), ctx, base_dir)
+    _check_source_placeholders(command, related, ctx)
+
+    env = _parse_env(raw.get("env"), ctx)
+    env_unset = _parse_env_unset(raw.get("env_unset"), ctx)
+    gateway = (
+        _parse_gateway(raw["gateway"], f"{ctx}.gateway", base_dir)
+        if "gateway" in raw else default_gateway
+    )
+    _check_gateway_conflicts(gateway, command, env, env_unset, ctx)
+
     return SkillConfig(
         name=name, label=label, button=button, icon=icon, enabled=enabled,
         command=command, working_dir=working_dir, timeout_seconds=timeout,
         timeout_grace_seconds=grace,
         include_context=include_context, contexts=contexts, stores_result=stores_result,
         source=source, inputs=inputs, checkout=checkout, remote=remote,
-        env=_parse_env(raw.get("env"), ctx),
-        env_unset=_parse_env_unset(raw.get("env_unset"), ctx),
+        related_sources=related,
+        env=env,
+        env_unset=env_unset,
+        gateway=gateway,
     )
 
 
@@ -816,7 +1105,9 @@ def _parse_skill(raw: object, name: str, ctx: str, base_dir: Path) -> SkillConfi
 _LEGACY_SKILL_BLOCKS = ("review", "qa")
 
 
-def _parse_skills(raw_top: dict, base_dir: Path) -> tuple[SkillConfig, ...]:
+def _parse_skills(
+    raw_top: dict, base_dir: Path, gateway: Gateway | None = None,
+) -> tuple[SkillConfig, ...]:
     """Build the skill list from ``skills:`` — the one place skills are declared.
 
     A skill exists because the config names it, and in the order the config
@@ -864,7 +1155,7 @@ def _parse_skills(raw_top: dict, base_dir: Path) -> tuple[SkillConfig, ...]:
         if name in seen:
             raise ConfigError(f"{ctx}: duplicate skill name {name!r}")
         seen.add(name)
-        out.append(_parse_skill(entry, name, ctx, base_dir))
+        out.append(_parse_skill(entry, name, ctx, base_dir, gateway))
 
     return tuple(out)
 
@@ -1538,8 +1829,11 @@ def load_config(path: str | Path) -> Config:
     calendar = _parse_calendar(_require(raw, "calendar", "config"))
     slas = _parse_slas(_require(raw, "slas", "config"))
     waive = _parse_waive(raw.get("waive"))
-    # A declared `file:` input is written relative to the config that names it.
-    skills = _parse_skills(raw, path.resolve().parent)
+    # Paths in the file (`file:` inputs, working_dir, related sources, the
+    # gateway's config_dir) are written relative to the config that names them.
+    base_dir = path.resolve().parent
+    gateway = _parse_gateway(raw.get("gateway"), "gateway", base_dir)
+    skills = _parse_skills(raw, base_dir, gateway)
     jira = _parse_jira(raw.get("jira"))
     jenkins = _parse_jenkins(raw.get("jenkins"))
     deslopify = _parse_deslopify(raw.get("deslopify"))
@@ -1566,6 +1860,7 @@ def load_config(path: str | Path) -> Config:
         jenkins=jenkins,
         deslopify=deslopify,
         models=models,
+        gateway=gateway,
     )
 
 

@@ -32,6 +32,16 @@ PY = f'"{sys.executable}"'
 # --- argv safety -----------------------------------------------------------
 
 
+def test_a_substituted_value_is_never_substituted_again():
+    """An MR titled "see {source_ui}" must not reach the command as the path of
+    the operator's checkout."""
+    argv = build_argv(
+        "tool --title={title} --ui={source_ui}",
+        {"title": "see {source_ui} and {web_url}", "source_ui": "/home/me/ui", "web_url": "u"},
+    )
+    assert argv == ["tool", "--title=see {source_ui} and {web_url}", "--ui=/home/me/ui"]
+
+
 def test_build_argv_substitutes_into_single_token():
     argv = build_argv('claude -p "/review {web_url}"', {"web_url": "https://x/y"})
     assert argv == ["claude", "-p", "/review https://x/y"]

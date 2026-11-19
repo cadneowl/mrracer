@@ -434,14 +434,15 @@ def _assignment_state(
     """The obligation to put *someone* on an open MR that has no reviewers.
 
     None when the MR has reviewers, is no longer open (a merged MR nobody
-    reviewed is history, not a task), has already been approved, or the
-    matching SLA rule sets no assignment budget.
+    reviewed is history, not a task), or the matching SLA rule sets no
+    assignment budget.
+
+    An approval does *not* exempt it. While an MR is open it can still change —
+    new commits reset GitLab's approvals, and an approver can withdraw — so a
+    past approval says nothing about whether anyone is looking at it now. An
+    open MR with nobody on it is tracked as if it had never been approved.
     """
     if snapshot.get("state", "opened") != "opened" or snapshot.get("reviewers"):
-        return None
-    if any(e.event_type == EventType.APPROVAL_ADDED for e in events):
-        # Somebody did review this and approved it. It is waiting to merge, not
-        # waiting for a reviewer, even if the approver has since been removed.
         return None
     rule = match_sla(config, snapshot.get("target_branch"), snapshot.get("labels", []))
     budget = rule.assignment_business_hours

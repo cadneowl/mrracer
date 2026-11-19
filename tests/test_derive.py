@@ -301,16 +301,30 @@ def test_the_draft_window_is_not_billed_once_the_mr_is_marked_ready(assign_confi
     assert st.requested_at == ny(2026, 3, 9, 10)
 
 
-def test_approved_mr_is_not_asked_for_another_reviewer(assign_config):
-    """It was reviewed and approved; losing the reviewer afterwards leaves it
-    waiting to merge, not waiting for somebody to look at it."""
+def test_an_approval_does_not_take_an_open_mr_off_the_board(assign_config):
+    """While it is open an approved MR can still change, and an approval can be
+    reset or withdrawn — so an open MR with nobody on it is tracked as if it had
+    never been approved, from when its last reviewer went."""
     events = [
         ev(ET.REVIEW_REQUESTED, ny(2026, 3, 2, 9), reviewer="dan"),
         ev(ET.APPROVAL_ADDED, ny(2026, 3, 2, 10), reviewer="dan"),
         ev(ET.REVIEWER_REMOVED, ny(2026, 3, 2, 11), reviewer="dan"),
     ]
-    states = derive_mr(events, snapshot(), assign_config, now=ny(2026, 3, 4, 17))
-    assert [s.kind for s in states] == [KIND_REVIEW]
+    states = derive_mr(events, snapshot(), assign_config, now=ny(2026, 3, 2, 13))
+    unassigned = [s for s in states if s.kind == KIND_ASSIGNMENT]
+    assert len(unassigned) == 1
+    assert unassigned[0].requested_at == ny(2026, 3, 2, 11)
+
+
+def test_approvals_from_people_nobody_asked_still_leave_it_unassigned(assign_config):
+    """The shape of !10675: two drive-by approvals, no reviewer ever requested."""
+    events = [
+        ev(ET.APPROVAL_ADDED, ny(2026, 3, 2, 10), reviewer="szym"),
+        ev(ET.APPROVAL_ADDED, ny(2026, 3, 2, 10, 5), reviewer="cookt"),
+    ]
+    (st,) = derive_mr(events, snapshot(), assign_config, now=ny(2026, 3, 2, 11))
+    assert st.kind == KIND_ASSIGNMENT
+    assert st.status_text == "no reviewers assigned"
 
 
 def test_merged_mr_never_gets_an_assignment_obligation(assign_config):

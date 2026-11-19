@@ -7,7 +7,9 @@ full report. Status is ok / warn / fail / skip.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -16,7 +18,9 @@ from pathlib import Path
 from .config import (
     Config,
     ConfigError,
+    Gateway,
     gitlab_credentials,
+    is_claude_command,
     jenkins_credentials,
     jira_credentials,
 )
@@ -24,7 +28,7 @@ from .db import Database
 from .dotenv import candidates, load_dotenv
 from .skillcontext import resolve_inputs, resolve_source
 from .tls import ca_trust_state
-from .worktree import is_git_repo
+from .worktree import has_remote, is_git_repo
 
 
 @dataclass
@@ -274,9 +278,16 @@ def _pipeline_steps(config: Config) -> set[str]:
     return {step for s in config.skills if s.enabled for stage in s.pipeline for step in stage}
 
 
+def _runs(config: Config) -> set[str]:
+    """The skills that can run: enabled, or a step of an enabled pipeline (see
+    ``_pipeline_steps``) — everything a check says about a runnable skill holds
+    for a step too."""
+    return {s.name for s in config.skills if s.enabled} | _pipeline_steps(config)
+
+
 def _check_commands(config: Config) -> list[Check]:
     out = []
-    steps = _pipeline_steps(config)
+    runs = _runs(config)
     for skill in config.skills:
         name = skill.name
         if skill.pipeline:
@@ -288,7 +299,7 @@ def _check_commands(config: Config) -> list[Check]:
                 Check(f"{name}.pipeline", "ok", f"{flow} · up to {skill.timeout_seconds}s")
             )
             continue
-        if not skill.enabled and name not in steps:
+        if name not in runs:
             out.append(Check(f"{name}.command", "skip", "disabled"))
             continue
         exe = _first_token(skill.command)
@@ -308,6 +319,107 @@ def _check_commands(config: Config) -> list[Check]:
             out.append(Check(f"{name}.command", "ok", f"'{exe}' on PATH{ctx}"))
         else:
             out.append(Check(f"{name}.command", "warn", f"'{exe}' not found on PATH"))
+    return out
+
+
+# What a Claude config directory can authenticate with. Any one will do; none at
+# all is a 401 on the first call, which is worth saying before anyone clicks.
+_TOKEN_ENV_NAMES = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+
+def _gateway_token_problem(gateway: Gateway) -> str:
+    """Why ``config_dir`` cannot sign this gateway's calls, or "" if it can.
+
+    Reads the file for the *presence* of a credential and never repeats one.
+    """
+    path = Path(gateway.config_dir) / "settings.json"
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return f"{path} does not exist, so the CLI there has no token for {gateway.host}"
+    except (OSError, ValueError) as exc:
+        return f"{path} cannot be read: {exc}"
+    env = settings.get("env") if isinstance(settings, dict) else None
+    env = env if isinstance(env, dict) else {}
+    if any(env.get(name) for name in _TOKEN_ENV_NAMES) or settings.get("apiKeyHelper"):
+        return ""
+    return (
+        f"{path} sets none of {', '.join(_TOKEN_ENV_NAMES)} or apiKeyHelper — "
+        f"every call to {gateway.host} will be refused"
+    )
+
+
+_MENTIONS_CLAUDE = re.compile(r"(^|[^A-Za-z0-9_-])claude([^A-Za-z0-9_-]|$)")
+
+
+def _claude_skills(config: Config) -> tuple[list, list]:
+    """Runnable skills that run Claude: ``(direct, wrapped)``.
+
+    *Direct* is a command whose first word is ``claude`` — the one shape radar
+    can pin with flags. *Wrapped* is one that mentions ``claude`` further in
+    (``bash -c 'claude …'``, ``npx claude``): it still talks to a gateway, but
+    only the environment reaches it, and a checkout's settings outrank that.
+    A script that calls claude without naming it cannot be seen from here.
+    """
+    runs = _runs(config)
+    direct, wrapped = [], []
+    for skill in config.skills:
+        if skill.pipeline or skill.name not in runs:
+            continue
+        exe = _first_token(skill.command)
+        if exe and is_claude_command([exe]):
+            direct.append(skill)
+        elif _MENTIONS_CLAUDE.search(skill.command):
+            wrapped.append(skill)
+    return direct, wrapped
+
+
+def _check_gateways(config: Config) -> list[Check]:
+    """Which gateway each claude skill is held to — or that nothing holds it.
+
+    Anything less than pinned is a warning rather than a note because of what
+    it costs when it bites: a skill run in a merge request's checkout follows
+    that repository's .claude/settings.json to whatever gateway it names, and
+    takes the token along. It looks like an expired credential, and it is a
+    leaked one. Every row has its own name, so the report never shows two
+    lines called the same thing saying opposite things.
+    """
+    direct, wrapped = _claude_skills(config)
+    out: list[Check] = []
+    by_gateway: dict[Gateway, list[str]] = {}
+    for skill in direct:
+        if skill.gateway is None:
+            out.append(Check(
+                f"{skill.name}.gateway", "warn",
+                "not pinned: its model calls go wherever the settings in its working "
+                "directory say, so a merge request that ships a .claude/settings.json can "
+                "send it — and its token — to another gateway (a 401 at best). Add a "
+                "top-level 'gateway:' with base_url and config_dir.",
+            ))
+        else:
+            by_gateway.setdefault(skill.gateway, []).append(skill.name)
+    for gateway, names in by_gateway.items():
+        label = "gateway" if gateway == config.gateway else f"gateway[{gateway.host}]"
+        problem = _gateway_token_problem(gateway)
+        if problem:
+            out.append(Check(label, "fail", problem))
+            continue
+        out.append(Check(
+            label, "ok",
+            f"{gateway.host} with the token in {gateway.config_dir} · pinned for "
+            f"{', '.join(names)} — a repository's .claude/settings.json cannot redirect them",
+        ))
+    for skill in wrapped:
+        given = (
+            f"radar passes {skill.gateway.host} only as environment variables"
+            if skill.gateway is not None else "no gateway is set"
+        )
+        out.append(Check(
+            f"{skill.name}.gateway", "warn",
+            f"runs claude through a wrapper, so {given} — a merge request's "
+            ".claude/settings.json can still redirect it and its token. Make 'claude' "
+            "the command's first word so radar can pin it.",
+        ))
     return out
 
 
@@ -340,6 +452,49 @@ def _check_deslopify(config: Config) -> Check:
         "no polish button — set deslopify.skill to the name of a skill that rewrites "
         "an answer for sending",
     )
+
+
+def _check_related_sources(config: Config) -> list[Check]:
+    """Each runnable skill's related sources: there, and pinnable if pinned.
+
+    Paths were checked when the config loaded, but this runs later and on the
+    machine that will press the button. A pinned source also needs git and the
+    remote it fetches from — neither of which shows until a run tries.
+    """
+    out: list[Check] = []
+    runs = _runs(config)
+    for skill in config.skills:
+        if skill.name not in runs or not skill.related_sources:
+            continue
+        problems: list[str] = []
+        shown: list[str] = []
+        for source in skill.related_sources:
+            shown.append(
+                f"{source.name} -> {source.path}" + (f" at {source.ref}" if source.ref else "")
+            )
+            if not Path(source.path).is_dir():
+                problems.append(f"{source.name}: {source.path} is not a directory")
+                continue
+            if not source.ref:
+                continue
+            if shutil.which("git") is None:
+                problems.append(f"{source.name}: pinning to a ref needs git on PATH")
+            elif not is_git_repo(source.path):
+                problems.append(
+                    f"{source.name}: {source.path} is not a git repository, so it cannot "
+                    f"be checked out at {source.ref}"
+                )
+            elif not has_remote(source.path, source.remote):
+                problems.append(
+                    f"{source.name}: {source.path} has no remote '{source.remote}' to fetch "
+                    f"{source.ref} from (set 'remote:' on it)"
+                )
+        name = f"{skill.name}.related"
+        if problems:
+            out.append(Check(name, "fail", "; ".join(problems)))
+        else:
+            out.append(Check(name, "ok", " · ".join(shown)))
+    return out
 
 
 def _check_skill_context(config: Config) -> list[Check]:
@@ -536,9 +691,11 @@ def run_checks(config: Config, config_path: str | Path | None = None) -> list[Ch
     checks.append(_check_jira(config))
     checks.extend(_check_jenkins(config))
     checks.extend(_check_commands(config))
+    checks.extend(_check_gateways(config))
     checks.append(_check_deslopify(config))
     checks.extend(_check_skill_context(config))
     checks.extend(_check_checkouts(config))
+    checks.extend(_check_related_sources(config))
     note = _check_note_parsing(config)
     if note is not None:
         checks.append(note)
